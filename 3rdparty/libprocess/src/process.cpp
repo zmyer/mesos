@@ -2106,6 +2106,7 @@ void SocketManager::swap_implementing_socket(const Socket& from, Socket* to)
   CHECK(sockets.count(to_fd) == 0);
 
   synchronized (mutex) {
+    delete sockets[from_fd];
     sockets.erase(from_fd);
     sockets[to_fd] = to;
 
