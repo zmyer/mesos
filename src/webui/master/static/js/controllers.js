@@ -15,8 +15,18 @@
   // specified window_title.
   function pailer(host, path, window_title) {
     var url = '//' + host + '/files/read?path=' + path;
+
+    // The randomized `storageKey` is removed from `localStorage` once the
+    // pailer window loads the URL into its `sessionStorage`, therefore
+    // the probability of collisions is low and we do not use a uuid.
+    var storageKey = Math.random().toString(36).substr(2, 8);
+
+    // Store the target URL in `localStorage` which is
+    // accessed by the pailer window when opened.
+    localStorage.setItem(storageKey, url);
+
     var pailer =
-      window.open('/static/pailer.html', url, 'width=580px, height=700px');
+      window.open('/static/pailer.html', storageKey, 'width=580px, height=700px');
 
     // Need to use window.onload instead of document.ready to make
     // sure the title doesn't get overwritten.
@@ -47,6 +57,21 @@
     } else {
       return 960000;
     }
+  }
+
+  // Set the task sandbox directory for use by the WebUI.
+  function setTaskSandbox(executor) {
+    _.each(
+        [executor.tasks, executor.queued_tasks, executor.completed_tasks],
+        function(tasks) {
+      _.each(tasks, function(task) {
+        if (executor.type === 'DEFAULT') {
+          task.directory = executor.directory + '/tasks/' + task.id;
+        } else {
+          task.directory = executor.directory;
+        };
+      });
+    });
   }
 
 
@@ -88,6 +113,7 @@
     $scope.offers = {};
     $scope.completed_frameworks = {};
     $scope.active_tasks = [];
+    $scope.unreachable_tasks = [];
     $scope.completed_tasks = [];
     $scope.orphan_tasks = [];
 
@@ -108,6 +134,7 @@
 
     $scope.activated_agents = $scope.state.activated_slaves;
     $scope.deactivated_agents = $scope.state.deactivated_slaves;
+    $scope.unreachable_agents = $scope.state.unreachable_slaves;
 
     _.each($scope.state.slaves, function(agent) {
       $scope.agents[agent.id] = agent;
@@ -139,7 +166,10 @@
           'TASK_FAILED',
           'TASK_FINISHED',
           'TASK_KILLED',
-          'TASK_LOST'
+          'TASK_LOST',
+          'TASK_DROPPED',
+          'TASK_GONE',
+          'TASK_GONE_BY_OPERATOR'
       ];
       return terminalStates.indexOf(taskState) > -1;
     };
@@ -193,9 +223,11 @@
       // TODO(brenden): Remove this once
       // https://issues.apache.org/jira/browse/MESOS-527 is fixed.
       _.each(framework.tasks, setTaskMetadata);
+      _.each(framework.unreachable_tasks, setTaskMetadata);
       _.each(framework.completed_tasks, setTaskMetadata);
 
       $scope.active_tasks = $scope.active_tasks.concat(framework.tasks);
+      $scope.unreachable_tasks = $scope.unreachable_tasks.concat(framework.unreachable_tasks);
       $scope.completed_tasks =
         $scope.completed_tasks.concat(framework.completed_tasks);
     });
@@ -225,16 +257,8 @@
     return true; // Continue polling.
   }
 
-  // Add a filter to convert small float number to decimal string
-  mesosApp.filter('decimalFloat', function() {
-    return function(num) {
-      return num ? parseFloat(num.toFixed(4)).toString() : num;
-    }
-  });
-
   // Update the outermost scope with the metrics/snapshot endpoint.
-  function updateMetrics($scope, $timeout, data) {
-    var metrics = JSON.parse(data);
+  function updateMetrics($scope, $timeout, metrics) {
     $scope.staging_tasks = metrics['master/tasks_staging'];
     $scope.starting_tasks = metrics['master/tasks_starting'];
     $scope.running_tasks = metrics['master/tasks_running'];
@@ -251,10 +275,10 @@
   // Main controller that can be used to handle "global" events. E.g.,:
   //     $scope.$on('$afterRouteChange', function() { ...; });
   //
-  // In addition, the MainCntl encapsulates the "view", allowing the
+  // In addition, the MainCtrl encapsulates the "view", allowing the
   // active controller/view to easily access anything in scope (e.g.,
   // the state).
-  mesosApp.controller('MainCntl', [
+  mesosApp.controller('MainCtrl', [
       '$scope', '$http', '$location', '$timeout', '$modal',
       function($scope, $http, $location, $timeout, $modal) {
     $scope.doneLoading = true;
@@ -317,6 +341,18 @@
       if (!matched) $scope.navbarActiveTab = null;
     });
 
+    var leadingMasterURL = function(path) {
+      // Use current location as address in case we could not find the
+      // leading master.
+      var address = location.hostname + ':' + location.port;
+      if ($scope.state && $scope.state.leader_info) {
+          address = $scope.state.leader_info.hostname + ':' +
+                    $scope.state.leader_info.port;
+      }
+
+      return '//' + address + path;
+    }
+
     var popupErrorModal = function() {
       if ($scope.delay >= 128000) {
         $scope.delay = 2000;
@@ -376,7 +412,7 @@
       // the leading master automatically. This would cause a CORS error if we
       // use XMLHttpRequest here. To avoid the CORS error, we use JSONP as a
       // workaround. Please refer to MESOS-5911 for further details.
-      $http.jsonp('master/state?jsonp=JSON_CALLBACK')
+      $http.jsonp(leadingMasterURL('/master/state?jsonp=JSON_CALLBACK'))
         .success(function(response) {
           if (updateState($scope, $timeout, response)) {
             $scope.delay = updateInterval(_.size($scope.agents));
@@ -391,17 +427,20 @@
     };
 
     var pollMetrics = function() {
-      $http.get('metrics/snapshot',
-                {transformResponse: function(data) { return data; }})
-        .success(function(data) {
-          if (updateMetrics($scope, $timeout, data)) {
+      $http.jsonp(leadingMasterURL('/metrics/snapshot?jsonp=JSON_CALLBACK'))
+        .success(function(response) {
+          if (updateMetrics($scope, $timeout, response)) {
             $scope.delay = updateInterval(_.size($scope.agents));
             $timeout(pollMetrics, $scope.delay);
           }
         })
-        .error(function() {
+        .error(function(message, code) {
           if ($scope.isErrorModalOpen === false) {
-            popupErrorModal();
+            // If return code is 401 or 403 the user is unauthorized to reach
+            // the endpoint, which is not a connection error.
+            if ([401, 403].indexOf(code) < 0) {
+              popupErrorModal();
+            }
           }
         });
     };
@@ -491,7 +530,7 @@
 
       // Set up polling for the monitor if this is the first update.
       if (!$top.started()) {
-        $top.start(host, $scope);
+        $top.start(host, id, $scope);
       }
 
       $http.jsonp('//' + host + '/' + id + '/state?jsonp=JSON_CALLBACK')
@@ -541,18 +580,14 @@
 
       $http.jsonp('//' + host + '/metrics/snapshot?jsonp=JSON_CALLBACK')
         .success(function (response) {
-          if (!$scope.state) {
-            $scope.state = {};
-          }
-
-          $scope.state.staging_tasks = response['slave/tasks_staging'];
-          $scope.state.starting_tasks = response['slave/tasks_starting'];
-          $scope.state.running_tasks = response['slave/tasks_running'];
-          $scope.state.killing_tasks = response['slave/tasks_killing'];
-          $scope.state.finished_tasks = response['slave/tasks_finished'];
-          $scope.state.killed_tasks = response['slave/tasks_killed'];
-          $scope.state.failed_tasks = response['slave/tasks_failed'];
-          $scope.state.lost_tasks = response['slave/tasks_lost'];
+          $scope.staging_tasks = response['slave/tasks_staging'];
+          $scope.starting_tasks = response['slave/tasks_starting'];
+          $scope.running_tasks = response['slave/tasks_running'];
+          $scope.killing_tasks = response['slave/tasks_killing'];
+          $scope.finished_tasks = response['slave/tasks_finished'];
+          $scope.killed_tasks = response['slave/tasks_killed'];
+          $scope.failed_tasks = response['slave/tasks_failed'];
+          $scope.lost_tasks = response['slave/tasks_lost'];
         })
         .error(function(reason) {
           $scope.alert_message = 'Failed to get agent metrics: ' + reason;
@@ -589,7 +624,7 @@
 
       // Set up polling for the monitor if this is the first update.
       if (!$top.started()) {
-        $top.start(host, $scope);
+        $top.start(host, id, $scope);
       }
 
       $http.jsonp('//' + host + '/' + id + '/state?jsonp=JSON_CALLBACK')
@@ -666,7 +701,7 @@
 
       // Set up polling for the monitor if this is the first update.
       if (!$top.started()) {
-        $top.start(host, $scope);
+        $top.start(host, id, $scope);
       }
 
       $http.jsonp('//' + host + '/' + id + '/state?jsonp=JSON_CALLBACK')
@@ -705,6 +740,8 @@
             return;
           }
 
+          setTaskSandbox($scope.executor);
+
           $('#agent').show();
         })
         .error(function (reason) {
@@ -722,15 +759,17 @@
   }]);
 
 
-  // Reroutes a request like
-  // '/agents/:agent_id/frameworks/:framework_id/executors/:executor_id/browse'
-  // to the executor's sandbox. This requires a second request because the
-  // directory to browse is known by the agent but not by the master. Request
-  // the directory from the agent, and then redirect to it.
+  // Reroutes requests like:
+  //   * '/agents/:agent_id/frameworks/:framework_id/executors/:executor_id/browse'
+  //   * '/agents/:agent_id/frameworks/:framework_id/executors/:executor_id/tasks/:task_id/browse'
+  // to the sandbox directory of the executor or the task respectively. This
+  // requires a second request because the directory to browse is known by the
+  // agent but not by the master. Request the directory from the agent, and then
+  // redirect to it.
   //
   // TODO(ssorallen): Add `executor.directory` to the master's state endpoint
   // output so this controller of rerouting is no longer necessary.
-  mesosApp.controller('AgentExecutorRerouterCtrl',
+  mesosApp.controller('AgentTaskAndExecutorRerouterCtrl',
       function($alert, $http, $location, $routeParams, $scope, $window) {
 
     function goBack(flashMessageOrOptions) {
@@ -809,10 +848,37 @@
           );
         }
 
+        var sandboxDirectory = executor.directory;
+
+        function matchTask(task) {
+          return $routeParams.task_id === task.id;
+        }
+
+        // Continue to navigate to the task's sandbox if the task id is
+        // specified in route parameters.
+        if ($routeParams.task_id) {
+          setTaskSandbox(executor);
+
+          var task =
+            _.find(executor.tasks, matchTask) ||
+            _.find(executor.queued_tasks, matchTask) ||
+            _.find(executor.completed_tasks, matchTask);
+
+          if (!task) {
+            return goBack(
+              "Task with ID '" + $routeParams.task_id +
+                "' does not exist on agent with ID '" + $routeParams.agent_id +
+                "'."
+            );
+          }
+
+          sandboxDirectory = task.directory;
+        }
+
         // Navigate to a path like '/agents/:id/browse?path=%2Ftmp%2F', the
         // recognized "browse" endpoint for an agent.
         $location.path('/agents/' + $routeParams.agent_id + '/browse')
-          .search({path: executor.directory})
+          .search({path: sandboxDirectory})
           .replace();
       })
       .error(function(response) {

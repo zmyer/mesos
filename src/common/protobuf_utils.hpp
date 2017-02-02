@@ -18,6 +18,7 @@
 #define __PROTOBUF_UTILS_HPP__
 
 #include <initializer_list>
+#include <set>
 #include <string>
 
 #include <sys/stat.h>
@@ -47,6 +48,12 @@ struct UPID;
 
 namespace mesos {
 namespace internal {
+
+namespace master {
+// Forward declaration (in lieu of an include).
+struct Slave;
+} // namespace master {
+
 namespace protobuf {
 
 bool frameworkHasCapability(
@@ -73,9 +80,10 @@ StatusUpdate createStatusUpdate(
     const Option<TaskStatus::Reason>& reason = None(),
     const Option<ExecutorID>& executorId = None(),
     const Option<bool>& healthy = None(),
+    const Option<CheckStatusInfo>& checkStatus = None(),
     const Option<Labels>& labels = None(),
     const Option<ContainerStatus>& containerStatus = None(),
-    const Option<TimeInfo> unreachableTime = None());
+    const Option<TimeInfo>& unreachableTime = None());
 
 
 StatusUpdate createStatusUpdate(
@@ -91,6 +99,9 @@ Task createTask(
 
 
 Option<bool> getTaskHealth(const Task& task);
+
+
+Option<CheckStatusInfo> getTaskCheckStatus(const Task& task);
 
 
 Option<ContainerStatus> getTaskContainerStatus(const Task& task);
@@ -112,7 +123,33 @@ TimeInfo getCurrentTime();
 // Helper function that creates a `FileInfo` from data returned by `stat()`.
 FileInfo createFileInfo(const std::string& path, const struct stat& s);
 
+
+ContainerID getRootContainerId(const ContainerID& containerId);
+
 namespace slave {
+
+struct Capabilities
+{
+  Capabilities() = default;
+
+  template <typename Iterable>
+  Capabilities(const Iterable& capabilities)
+  {
+    foreach (const SlaveInfo::Capability& capability, capabilities) {
+      switch (capability.type()) {
+        case SlaveInfo::Capability::UNKNOWN:
+          break;
+        case SlaveInfo::Capability::MULTI_ROLE:
+          multiRole = true;
+          break;
+      }
+    }
+  }
+
+  // See mesos.proto for the meaning of agent capabilities.
+  bool multiRole = false;
+};
+
 
 mesos::slave::ContainerLimitation createContainerLimitation(
     const Resources& resources,
@@ -121,7 +158,7 @@ mesos::slave::ContainerLimitation createContainerLimitation(
 
 
 mesos::slave::ContainerState createContainerState(
-    const ExecutorInfo& executorInfo,
+    const Option<ExecutorInfo>& executorInfo,
     const ContainerID& id,
     pid_t pid,
     const std::string& directory);
@@ -166,18 +203,85 @@ mesos::maintenance::Schedule createSchedule(
 namespace master {
 namespace event {
 
-// Helper for creating a `TASK_UPDATED` event from a `Task` with the
-// recently transitioned state of the task.
+// Helper for creating a `TASK_UPDATED` event from a `Task`, its
+// latest state according to the agent, and its status corresponding
+// to the last status update acknowledged from the scheduler.
 mesos::master::Event createTaskUpdated(
     const Task& task,
-    const TaskState& state);
+    const TaskState& state,
+    const TaskStatus& status);
 
 
 // Helper for creating a `TASK_ADDED` event from a `Task`.
 mesos::master::Event createTaskAdded(const Task& task);
 
+
+// Helper for creating an `Agent` response.
+mesos::master::Response::GetAgents::Agent createAgentResponse(
+    const mesos::internal::master::Slave& slave);
+
+
+// Helper for creating an `AGENT_ADDED` event from a `Slave`.
+mesos::master::Event createAgentAdded(
+    const mesos::internal::master::Slave& slave);
+
+
+// Helper for creating an `AGENT_REMOVED` event from a `SlaveID`.
+mesos::master::Event createAgentRemoved(const SlaveID& slaveId);
+
 } // namespace event {
 } // namespace master {
+
+namespace framework {
+
+struct Capabilities
+{
+  Capabilities() = default;
+
+  template <typename Iterable>
+  Capabilities(const Iterable& capabilities)
+  {
+    foreach (const FrameworkInfo::Capability& capability, capabilities) {
+      switch (capability.type()) {
+        case FrameworkInfo::Capability::UNKNOWN:
+          break;
+        case FrameworkInfo::Capability::REVOCABLE_RESOURCES:
+          revocableResources = true;
+          break;
+        case FrameworkInfo::Capability::TASK_KILLING_STATE:
+          taskKillingState = true;
+          break;
+        case FrameworkInfo::Capability::GPU_RESOURCES:
+          gpuResources = true;
+          break;
+        case FrameworkInfo::Capability::SHARED_RESOURCES:
+          sharedResources = true;
+          break;
+        case FrameworkInfo::Capability::PARTITION_AWARE:
+          partitionAware = true;
+          break;
+        case FrameworkInfo::Capability::MULTI_ROLE:
+          multiRole = true;
+          break;
+      }
+    }
+  }
+
+  // See mesos.proto for the meaning of these capabilities.
+  bool revocableResources = false;
+  bool taskKillingState = false;
+  bool gpuResources = false;
+  bool sharedResources = false;
+  bool partitionAware = false;
+  bool multiRole = false;
+};
+
+
+// Helper to get roles from FrameworkInfo based on the
+// presence of the MULTI_ROLE capability.
+std::set<std::string> getRoles(const FrameworkInfo& frameworkInfo);
+
+} // namespace framework {
 
 } // namespace protobuf {
 } // namespace internal {

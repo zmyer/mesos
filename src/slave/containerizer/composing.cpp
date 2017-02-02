@@ -20,12 +20,15 @@
 #include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
+#include <process/http.hpp>
 #include <process/id.hpp>
 
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
 #include <stout/lambda.hpp>
 #include <stout/os.hpp>
+
+#include "common/protobuf_utils.hpp"
 
 #include "slave/state.hpp"
 
@@ -39,6 +42,7 @@ using std::map;
 using std::string;
 using std::vector;
 
+using mesos::slave::ContainerClass;
 using mesos::slave::ContainerTermination;
 
 namespace mesos {
@@ -69,6 +73,17 @@ public:
       const SlaveID& slaveId,
       const map<string, string>& environment,
       bool checkpoint);
+
+  Future<bool> launch(
+      const ContainerID& containerId,
+      const CommandInfo& commandInfo,
+      const Option<ContainerInfo>& containerInfo,
+      const Option<string>& user,
+      const SlaveID& slaveId,
+      const Option<ContainerClass>& containerClass);
+
+  Future<http::Connection> attach(
+      const ContainerID& containerId);
 
   Future<Nothing> update(
       const ContainerID& containerId,
@@ -105,6 +120,10 @@ private:
       const map<string, string>& environment,
       bool checkpoint,
       vector<Containerizer*>::iterator containerizer,
+      bool launched);
+
+  Future<bool> _launch(
+      const ContainerID& containerId,
       bool launched);
 
   vector<Containerizer*> containerizers_;
@@ -184,6 +203,25 @@ Future<bool> ComposingContainerizer::launch(
 }
 
 
+Future<bool> ComposingContainerizer::launch(
+    const ContainerID& containerId,
+    const CommandInfo& commandInfo,
+    const Option<ContainerInfo>& containerInfo,
+    const Option<string>& user,
+    const SlaveID& slaveId,
+    const Option<ContainerClass>& containerClass)
+{
+  return dispatch(process,
+                  &ComposingContainerizerProcess::launch,
+                  containerId,
+                  commandInfo,
+                  containerInfo,
+                  user,
+                  slaveId,
+                  containerClass);
+}
+
+
 Future<Nothing> ComposingContainerizer::update(
     const ContainerID& containerId,
     const Resources& resources)
@@ -192,6 +230,15 @@ Future<Nothing> ComposingContainerizer::update(
                   &ComposingContainerizerProcess::update,
                   containerId,
                   resources);
+}
+
+
+Future<http::Connection> ComposingContainerizer::attach(
+    const ContainerID& containerId)
+{
+    return dispatch(process,
+                    &ComposingContainerizerProcess::attach,
+                    containerId);
 }
 
 
@@ -306,31 +353,63 @@ Future<bool> ComposingContainerizerProcess::_launch(
     vector<Containerizer*>::iterator containerizer,
     bool launched)
 {
-  // The container struct will not be cleaned up by destroy
-  // when the container is in the LAUNCHING state.
-  CHECK(containers_.contains(containerId));
+  if (!containers_.contains(containerId)) {
+    // If we are here a destroy started and finished in the interim.
+    return launched;
+  }
+
   Container* container = containers_.at(containerId);
 
-  // A destroy arrived in the interim.
-  if (container->state == DESTROYING) {
-    container->destroyed.set(true);
-    containers_.erase(containerId);
-    delete container;
-    return Failure("Container was destroyed while launching");
-  }
-
   if (launched) {
-    container->state = LAUNCHED;
+    // Note that we don't update the state if a destroy is in progress.
+    if (container->state == LAUNCHING) {
+      container->state = LAUNCHED;
+    }
+
+    // Note that the return value is not impacted
+    // by whether a destroy is currently in progress.
     return true;
   }
+
+  // If we are here, the launch is not supported by `containerizer`.
 
   // Try the next containerizer.
   ++containerizer;
 
   if (containerizer == containerizers_.end()) {
+    // If we are here none of the containerizers support the launch.
+
+    // We set this to `false` because the container has no chance of
+    // getting launched by any containerizer. This is similar to what
+    // would happen if the destroy "started" after launch returned false.
+    container->destroyed.set(false);
+
+    // We destroy the container irrespective whether
+    // a destroy is already in progress, for simplicity.
     containers_.erase(containerId);
     delete container;
+
+    // We return false here because none of the
+    // containerizers support the launch.
     return false;
+  }
+
+  if (container->state == DESTROYING) {
+    // If we are here there is at least one more containerizer that could
+    // potentially launch this container. But since a destroy is in progress
+    // we do not try any other containerizers.
+
+    // We set this to `true` because the destroy-in-progress stopped an
+    // launch-in-progress (using the next containerizer).
+    container->destroyed.set(true);
+
+    containers_.erase(containerId);
+    delete container;
+
+    // We return failure here because there is a chance some other
+    // containerizer might be able to launch this container but
+    // we are not trying it because a destroy is in progress.
+    return Failure("Container was destroyed while launching");
   }
 
   container->containerizer = *containerizer;
@@ -371,8 +450,7 @@ Future<bool> ComposingContainerizerProcess::launch(
     bool checkpoint)
 {
   if (containers_.contains(containerId)) {
-    return Failure("Container '" + stringify(containerId) +
-                   "' is already launching");
+    return Failure("Duplicate container found");
   }
 
   // Try each containerizer. If none of them handle the
@@ -408,12 +486,100 @@ Future<bool> ComposingContainerizerProcess::launch(
 }
 
 
+Future<bool> ComposingContainerizerProcess::launch(
+          const ContainerID& containerId,
+          const CommandInfo& commandInfo,
+          const Option<ContainerInfo>& containerInfo,
+          const Option<std::string>& user,
+          const SlaveID& slaveId,
+          const Option<ContainerClass>& containerClass)
+{
+  ContainerID rootContainerId = protobuf::getRootContainerId(containerId);
+
+  if (!containers_.contains(rootContainerId)) {
+    return Failure(
+        "Root container " + stringify(rootContainerId) + " not found");
+  }
+
+  // Use the containerizer that launched the root container to launch
+  // the nested container.
+  Containerizer* containerizer = containers_.at(rootContainerId)->containerizer;
+
+  Container* container = new Container();
+  container->state = LAUNCHING;
+  container->containerizer = containerizer;
+  containers_[containerId] = container;
+
+  return containerizer->launch(
+      containerId,
+      commandInfo,
+      containerInfo,
+      user,
+      slaveId,
+      containerClass)
+    .then(defer(self(),
+                &Self::_launch,
+                containerId,
+                lambda::_1));
+}
+
+
+Future<bool> ComposingContainerizerProcess::_launch(
+    const ContainerID& containerId,
+    bool launched)
+{
+  if (!containers_.contains(containerId)) {
+    // If we are here a destroy started and finished in the interim.
+    return launched;
+  }
+
+  Container* container = containers_.at(containerId);
+
+  if (launched) {
+    // Note that we don't update the state if a destroy is in progress.
+    if (container->state == LAUNCHING) {
+      container->state = LAUNCHED;
+    }
+
+    // Note that the return value is not impacted
+    // by whether a destroy is currently in progress.
+    return true;
+  }
+
+  // If we are here, the launch is not supported by the containerizer.
+
+  // We set this to `false` because the container has no chance of
+  // getting launched. This is similar to what would happen if the
+  // destroy "started" after launch returned false.
+  container->destroyed.set(false);
+
+  // We destroy the container irrespective whether
+  // a destroy is already in progress, for simplicity.
+  containers_.erase(containerId);
+  delete container;
+
+  // We return false here because the launch is not supported.
+  return false;
+}
+
+
+Future<http::Connection> ComposingContainerizerProcess::attach(
+    const ContainerID& containerId)
+{
+  if (!containers_.contains(containerId)) {
+    return Failure("Container not found");
+  }
+
+  return containers_[containerId]->containerizer->attach(containerId);
+}
+
+
 Future<Nothing> ComposingContainerizerProcess::update(
     const ContainerID& containerId,
     const Resources& resources)
 {
   if (!containers_.contains(containerId)) {
-    return Failure("Container '" + containerId.value() + "' not found");
+    return Failure("Container not found");
   }
 
   return containers_[containerId]->containerizer->update(
@@ -425,7 +591,7 @@ Future<ResourceStatistics> ComposingContainerizerProcess::usage(
     const ContainerID& containerId)
 {
   if (!containers_.contains(containerId)) {
-    return Failure("Container '" + containerId.value() + "' not found");
+    return Failure("Container not found");
   }
 
   return containers_[containerId]->containerizer->usage(containerId);
@@ -436,7 +602,7 @@ Future<ContainerStatus> ComposingContainerizerProcess::status(
     const ContainerID& containerId)
 {
   if (!containers_.contains(containerId)) {
-    return Failure("Container " + containerId.value() + " not found");
+    return Failure("Container not found");
   }
 
   return containers_[containerId]->containerizer->status(containerId);
@@ -493,10 +659,12 @@ Future<bool> ComposingContainerizerProcess::destroy(
           // `Container.destroy` in `_launch()` will be a no-op;
           // this might result in users waiting on the future
           // incorrectly thinking that the destroy failed when in
-          // fact the destory is implicitly successful because the
+          // fact the destroy is implicitly successful because the
           // launch failed.
           if (containers_.contains(containerId)) {
             containers_.at(containerId)->destroyed.associate(destroy);
+            delete containers_.at(containerId);
+            containers_.erase(containerId);
           }
         }));
 

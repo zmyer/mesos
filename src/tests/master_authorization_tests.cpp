@@ -108,7 +108,7 @@ TEST_F(MasterAuthorizationTest, AuthorizedTask)
   ASSERT_SOME(master);
 
   // Create an authorized executor.
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "exit 1");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "exit 1");
   executor.mutable_command()->set_user("foo");
 
   MockExecutor exec(executor.executor_id());
@@ -182,7 +182,7 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTask)
   ASSERT_SOME(master);
 
   // Create an unauthorized executor.
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "exit 1");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "exit 1");
   executor.mutable_command()->set_user("foo");
 
   MockExecutor exec(executor.executor_id());
@@ -226,6 +226,17 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTask)
   AWAIT_READY(status);
   EXPECT_EQ(TASK_ERROR, status.get().state());
   EXPECT_EQ(TaskStatus::REASON_TASK_UNAUTHORIZED, status.get().reason());
+
+  // Make sure the task is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
 
   driver.stop();
   driver.join();
@@ -326,13 +337,24 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTaskGroup)
   EXPECT_EQ(TASK_ERROR, task2Status->state());
   EXPECT_EQ(TaskStatus::REASON_TASK_GROUP_UNAUTHORIZED, task2Status->reason());
 
+  // Make sure the task group is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
+
   driver.stop();
   driver.join();
 }
 
 
 // This test verifies that a 'killTask()' that comes before
-// '_launchTasks()' is called results in TASK_KILLED.
+// '_accept()' is called results in TASK_KILLED.
 TEST_F(MasterAuthorizationTest, KillTask)
 {
   MockAuthorizer authorizer;
@@ -397,6 +419,17 @@ TEST_F(MasterAuthorizationTest, KillTask)
   // No task launch should happen resulting in all resources being
   // returned to the allocator.
   AWAIT_READY(recoverResources);
+
+  // Make sure the task is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
 
   driver.stop();
   driver.join();
@@ -517,14 +550,26 @@ TEST_F(MasterAuthorizationTest, KillPendingTaskInTaskGroup)
   // returned to the allocator.
   AWAIT_READY(recoverResources);
 
+  // Make sure the task group is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
+
   driver.stop();
   driver.join();
 }
 
 
 // This test verifies that a slave removal that comes before
-// '_launchTasks()' is called results in TASK_LOST.
-TEST_F(MasterAuthorizationTest, SlaveRemoved)
+// '_accept()' is called results in TASK_LOST for a framework that is
+// not partition-aware.
+TEST_F(MasterAuthorizationTest, SlaveRemovedLost)
 {
   MockAuthorizer authorizer;
   Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
@@ -602,21 +647,31 @@ TEST_F(MasterAuthorizationTest, SlaveRemoved)
 
   // Check metrics.
   JSON::Object stats = Metrics();
-  EXPECT_EQ(1u, stats.values.count("master/tasks_lost"));
-  EXPECT_EQ(1u, stats.values.count(
-                    "master/task_lost/source_master/reason_slave_removed"));
+  EXPECT_EQ(0u, stats.values["master/tasks_dropped"]);
   EXPECT_EQ(1u, stats.values["master/tasks_lost"]);
   EXPECT_EQ(
       1u, stats.values["master/task_lost/source_master/reason_slave_removed"]);
+
+  // Make sure the task is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
 
   driver.stop();
   driver.join();
 }
 
 
-// This test verifies that a slave disconnection that comes before
-// '_launchTasks()' is called results in TASK_LOST.
-TEST_F(MasterAuthorizationTest, SlaveDisconnected)
+// This test verifies that a slave removal that comes before
+// '_accept()' is called results in TASK_DROPPED for a framework that
+// is partition-aware.
+TEST_F(MasterAuthorizationTest, SlaveRemovedDropped)
 {
   MockAuthorizer authorizer;
   Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
@@ -629,9 +684,13 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
   ASSERT_SOME(slave);
 
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_capabilities()->set_type(
+      FrameworkInfo::Capability::PARTITION_AWARE);
+
   MockScheduler sched;
   MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
 
   EXPECT_CALL(sched, registered(&driver, _, _))
     .Times(1);
@@ -664,12 +723,11 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
   EXPECT_CALL(sched, slaveLost(&driver, _))
     .WillOnce(FutureSatisfy(&slaveLost));
 
-  // Stop the slave with explicit shutdown message so that the master
-  // does not wait for it to reconnect.
+  // Stop the slave with explicit shutdown as otherwise with
+  // checkpointing the master will wait for the slave to reconnect.
   slave.get()->shutdown();
   slave->reset();
 
-  // Wait for the slave to be removed by the master.
   AWAIT_READY(slaveLost);
 
   Future<TaskStatus> status;
@@ -682,10 +740,10 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
   // Now complete authorization.
   promise.set(true);
 
-  // Framework should get a TASK_LOST.
+  // Framework should get a TASK_DROPPED.
   AWAIT_READY(status);
 
-  EXPECT_EQ(TASK_LOST, status.get().state());
+  EXPECT_EQ(TASK_DROPPED, status.get().state());
   EXPECT_EQ(TaskStatus::SOURCE_MASTER, status.get().source());
   EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status.get().reason());
 
@@ -695,14 +753,22 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
 
   // Check metrics.
   JSON::Object stats = Metrics();
-  EXPECT_EQ(1u, stats.values.count("master/tasks_lost"));
-  EXPECT_EQ(1u, stats.values["master/tasks_lost"]);
-  EXPECT_EQ(1u,
-            stats.values.count(
-                "master/task_lost/source_master/reason_slave_removed"));
+  EXPECT_EQ(0u, stats.values["master/tasks_lost"]);
+  EXPECT_EQ(1u, stats.values["master/tasks_dropped"]);
   EXPECT_EQ(
       1u,
-      stats.values["master/task_lost/source_master/reason_slave_removed"]);
+      stats.values["master/task_dropped/source_master/reason_slave_removed"]);
+
+  // Make sure the task is not known to master anymore.
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(0);
+
+  driver.reconcileTasks({});
+
+  // We settle the clock here to ensure any updates sent by the master
+  // are received. There shouldn't be any updates in this case.
+  Clock::pause();
+  Clock::settle();
 
   driver.stop();
   driver.join();
@@ -710,7 +776,7 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
 
 
 // This test verifies that a framework removal that comes before
-// '_launchTasks()' is called results in recovery of resources.
+// '_accept()' is called results in recovery of resources.
 TEST_F(MasterAuthorizationTest, FrameworkRemoved)
 {
   MockAuthorizer authorizer;
@@ -1254,9 +1320,11 @@ class MasterAuthorizerTest : public MesosTest {};
 
 
 typedef ::testing::Types<
-  LocalAuthorizer,
-  tests::Module<Authorizer, TestLocalAuthorizer>>
-  AuthorizerTypes;
+// TODO(josephw): Modules are not supported on Windows (MESOS-5994).
+#ifndef __WINDOWS__
+    tests::Module<Authorizer, TestLocalAuthorizer>,
+#endif // __WINDOWS__
+    LocalAuthorizer> AuthorizerTypes;
 
 
 TYPED_TEST_CASE(MasterAuthorizerTest, AuthorizerTypes);
@@ -1432,7 +1500,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterStateEndpoint)
   frameworkInfo.set_user(user);
 
   // Create an executor with user "bar".
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "sleep 2");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "sleep 2");
   executor.mutable_command()->set_user(user);
 
   MockExecutor exec(executor.executor_id());
@@ -1621,7 +1689,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterFrameworksEndpoint)
   frameworkInfo.set_user("bar");
 
   // Create an executor with user "bar".
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "sleep 2");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "sleep 2");
   executor.mutable_command()->set_user("bar");
 
   MockExecutor exec(executor.executor_id());
@@ -1812,7 +1880,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterTasksEndpoint)
   frameworkInfo.set_user(user);
 
   // Create an executor with user "bar".
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "sleep 2");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "sleep 2");
   executor.mutable_command()->set_user(user);
 
   MockExecutor exec(executor.executor_id());
@@ -1927,7 +1995,7 @@ TYPED_TEST(MasterAuthorizerTest, ViewFlags)
   }
 
   {
-    // Second default principal can not see the flags.
+    // Second default principal cannot see the flags.
     mesos::ACL::ViewFlags* acl = acls.add_view_flags();
     acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL_2.principal());
     acl->mutable_flags()->set_type(ACL::Entity::NONE);
@@ -2079,9 +2147,11 @@ TYPED_TEST(MasterAuthorizerTest, FilterRolesEndpoint)
 
 
 // This test verifies that authorization based endpoint filtering
-// works correctly on the /state endpoint with orphaned tasks.
-// Both default users are allowed to to view high level frameworks, but only
-// one is allowed to view the tasks.
+// works correctly on the /state endpoint with orphaned tasks.  Both
+// default users are allowed to to view high level frameworks, but
+// only one is allowed to view the tasks. Although the tasks are
+// "orphaned" (in the sense that their framework has not yet
+// re-registered), they are now reported under the "tasks" key.
 TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
 {
   ACLs acls;
@@ -2174,7 +2244,7 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
 
-    // Wait until TASK_RUNNING of the task is received.
+  // Wait until TASK_RUNNING of the task is received.
   AWAIT_READY(statusUpdate);
 
   Future<SlaveReregisteredMessage> slaveReregisteredMessage =
@@ -2211,8 +2281,18 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
     ASSERT_SOME(parse);
 
     JSON::Object tasks = parse.get();
+
+    // The "orphan_tasks" array should be empty, regardless of authorization.
     ASSERT_TRUE(tasks.values["orphan_tasks"].is<JSON::Array>());
-    EXPECT_EQ(1u, tasks.values["orphan_tasks"].as<JSON::Array>().values.size());
+    EXPECT_TRUE(tasks.values["orphan_tasks"].as<JSON::Array>().values.empty());
+
+    ASSERT_TRUE(tasks.values["frameworks"].is<JSON::Array>());
+
+    JSON::Array frameworks = tasks.values["frameworks"].as<JSON::Array>();
+    EXPECT_EQ(1u, frameworks.values.size());
+
+    JSON::Object framework = frameworks.values.front().as<JSON::Object>();
+    EXPECT_EQ(1u, framework.values["tasks"].as<JSON::Array>().values.size());
   }
 
   // Retrieve endpoint with the user allowed to view the framework,
@@ -2231,8 +2311,18 @@ TYPED_TEST(MasterAuthorizerTest, FilterOrphanedTasks)
     ASSERT_SOME(parse);
 
     JSON::Object tasks = parse.get();
+
+    // The "orphan_tasks" array should be empty, regardless of authorization.
     ASSERT_TRUE(tasks.values["orphan_tasks"].is<JSON::Array>());
     EXPECT_TRUE(tasks.values["orphan_tasks"].as<JSON::Array>().values.empty());
+
+    ASSERT_TRUE(tasks.values["frameworks"].is<JSON::Array>());
+
+    JSON::Array frameworks = tasks.values["frameworks"].as<JSON::Array>();
+    EXPECT_EQ(1u, frameworks.values.size());
+
+    JSON::Object framework = frameworks.values.front().as<JSON::Object>();
+    EXPECT_TRUE(framework.values["tasks"].as<JSON::Array>().values.empty());
   }
 
   EXPECT_CALL(exec, shutdown(_))

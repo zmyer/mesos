@@ -74,7 +74,6 @@ using process::Clock;
 using process::Future;
 using process::Owned;
 using process::PID;
-using process::Queue;
 using process::Time;
 
 using process::http::BadRequest;
@@ -100,7 +99,7 @@ namespace tests {
 JSON::Array createMachineList(std::initializer_list<MachineID> _ids)
 {
   RepeatedPtrField<MachineID> ids =
-    internal::protobuf::maintenance::createMachineList(_ids);
+    mesos::internal::protobuf::maintenance::createMachineList(_ids);
 
   return JSON::protobuf(ids);
 }
@@ -147,38 +146,7 @@ public:
   // Default unavailability.  Used when the test does not care
   // about the value of the unavailability.
   Unavailability unavailability;
-
-protected:
-  // Helper class for using EXPECT_CALL since the Mesos scheduler API
-  // is callback based.
-  class Callbacks
-  {
-  public:
-    MOCK_METHOD0(connected, void());
-    MOCK_METHOD0(disconnected, void());
-    MOCK_METHOD1(received, void(const std::queue<Event>&));
-  };
 };
-
-
-// Enqueues all received events into a libprocess queue.
-// TODO(jmlvanre): Factor this common code out of tests into V1
-// helper.
-ACTION_P(Enqueue, queue)
-{
-  std::queue<Event> events = arg0;
-  while (!events.empty()) {
-    // Note that we currently drop HEARTBEATs because most of these tests
-    // are not designed to deal with heartbeats.
-    // TODO(vinod): Implement DROP_HTTP_CALLS that can filter heartbeats.
-    if (events.front().type() == Event::HEARTBEAT) {
-      VLOG(1) << "Ignoring HEARTBEAT event";
-    } else {
-      queue->put(events.front());
-    }
-    events.pop();
-  }
-}
 
 
 // Posts valid and invalid schedules to the maintenance schedule endpoint.
@@ -385,15 +353,17 @@ TEST_F(MasterMaintenanceTest, PendingUnavailabilityTest)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
   ASSERT_SOME(slave);
 
-  auto scheduler = std::make_shared<MockV1HTTPScheduler>();
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
     .WillOnce(FutureSatisfy(&connected))
     .WillRepeatedly(Return()); // Ignore future invocations.
 
-  scheduler::TestV1Mesos mesos(
-      master.get()->pid, ContentType::PROTOBUF, scheduler);
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(connected);
 
@@ -413,7 +383,7 @@ TEST_F(MasterMaintenanceTest, PendingUnavailabilityTest)
     call.set_type(Call::SUBSCRIBE);
 
     Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(DEFAULT_V1_FRAMEWORK_INFO);
+    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
 
     mesos.send(call);
   }
@@ -1076,11 +1046,6 @@ TEST_F(MasterMaintenanceTest, MachineStatus)
 // in the maintenance status endpoint.
 TEST_F(MasterMaintenanceTest, InverseOffers)
 {
-  // NOTE: The callbacks and event queue must be stack allocated below
-  // the master, as the master may send heartbeats during destruction.
-  Callbacks callbacks;
-  Queue<Event> events;
-
   master::Flags masterFlags = CreateMasterFlags();
 
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
@@ -1138,59 +1103,70 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
   ASSERT_EQ(0, statuses.get().draining_machines(0).statuses().size());
 
   // Now start a framework.
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
   Future<Nothing> connected;
-  EXPECT_CALL(callbacks, connected())
+  EXPECT_CALL(*scheduler, connected(_))
     .WillOnce(FutureSatisfy(&connected))
     .WillRepeatedly(Return()); // Ignore future invocations.
 
-  Mesos mesos(
+  v1::scheduler::TestMesos mesos(
       master.get()->pid,
       ContentType::PROTOBUF,
-      lambda::bind(&Callbacks::connected, lambda::ref(callbacks)),
-      lambda::bind(&Callbacks::disconnected, lambda::ref(callbacks)),
-      lambda::bind(&Callbacks::received, lambda::ref(callbacks), lambda::_1),
-      DEFAULT_V1_CREDENTIAL);
+      scheduler);
 
   AWAIT_READY(connected);
 
-  EXPECT_CALL(callbacks, received(_))
-    .WillRepeatedly(Enqueue(&events));
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Future<Event::InverseOffers> inverseOffers;
+  EXPECT_CALL(*scheduler, inverseOffers(_, _))
+    .WillOnce(FutureArg<1>(&inverseOffers));
 
   {
     Call call;
     call.set_type(Call::SUBSCRIBE);
 
     Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(DEFAULT_V1_FRAMEWORK_INFO);
+    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
 
     mesos.send(call);
   }
 
-  Future<Event> event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::SUBSCRIBED, event.get().type());
+  AWAIT_READY(subscribed);
 
-  v1::FrameworkID id(event.get().subscribed().framework_id());
+  v1::FrameworkID id(subscribed->framework_id());
 
   // Ensure we receive some regular resource offers.
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::OFFERS, event.get().type());
-  EXPECT_NE(0, event.get().offers().offers().size());
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
 
   // All the offers should have unavailability.
-  foreach (const v1::Offer& offer, event.get().offers().offers()) {
+  foreach (const v1::Offer& offer, offers->offers()) {
     EXPECT_TRUE(offer.has_unavailability());
   }
 
   // Just work with a single offer to simplify the rest of the test.
-  v1::Offer offer = event.get().offers().offers(0);
+  v1::Offer offer = offers->offers(0);
 
   EXPECT_CALL(exec, registered(_, _, _, _))
     .Times(1);
 
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<Event::Update> update;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&update));
 
   // A dummy task just for confirming that the offer is accepted.
   // TODO(josephw): Replace with v1 API createTask helper.
@@ -1214,20 +1190,15 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
   }
 
   // Expect an inverse offer.
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
-  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
+  AWAIT_READY(inverseOffers);
+  ASSERT_EQ(1, inverseOffers->inverse_offers().size());
 
   // Save this inverse offer so we can decline it later.
-  v1::InverseOffer inverseOffer =
-    event.get().inverse_offers().inverse_offers(0);
+  v1::InverseOffer inverseOffer = inverseOffers->inverse_offers(0);
 
   // Wait for the task to start running.
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::UPDATE, event.get().type());
-  EXPECT_EQ(v1::TASK_RUNNING, event.get().update().status().state());
+  AWAIT_READY(update);
+  EXPECT_EQ(v1::TASK_RUNNING, update->status().state());
 
   {
     // Acknowledge TASK_RUNNING update.
@@ -1238,7 +1209,7 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
     Call::Acknowledge* acknowledge = call.mutable_acknowledge();
     acknowledge->mutable_task_id()->CopyFrom(taskInfo.task_id());
     acknowledge->mutable_agent_id()->CopyFrom(offer.agent_id());
-    acknowledge->set_uuid(event.get().update().status().uuid());
+    acknowledge->set_uuid(update->status().uuid());
 
     mesos.send(call);
   }
@@ -1268,18 +1239,19 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
 
   AWAIT_READY(updateInverseOffer);
 
+  EXPECT_CALL(*scheduler, inverseOffers(_, _))
+    .WillOnce(FutureArg<1>(&inverseOffers));
+
   Clock::pause();
   Clock::settle();
   Clock::advance(masterFlags.allocation_interval);
 
   // Expect another inverse offer.
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
+  AWAIT_READY(inverseOffers);
   Clock::resume();
 
-  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
-  inverseOffer = event.get().inverse_offers().inverse_offers(0);
+  ASSERT_EQ(1, inverseOffers->inverse_offers().size());
+  inverseOffer = inverseOffers->inverse_offers(0);
 
   // Check that the status endpoint shows the inverse offer as declined.
   response = process::http::get(
@@ -1332,17 +1304,18 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
 
   AWAIT_READY(updateInverseOffer);
 
+  EXPECT_CALL(*scheduler, inverseOffers(_, _))
+    .WillOnce(FutureArg<1>(&inverseOffers));
+
   Clock::pause();
   Clock::settle();
   Clock::advance(masterFlags.allocation_interval);
 
   // Expect yet another inverse offer.
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
+  AWAIT_READY(inverseOffers);
   Clock::resume();
 
-  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
+  ASSERT_EQ(1, inverseOffers->inverse_offers().size());
 
   // Check that the status endpoint shows the inverse offer as accepted.
   response = process::http::get(
@@ -1375,27 +1348,19 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
-
-  EXPECT_CALL(callbacks, disconnected())
-    .Times(AtMost(1));
 }
 
 
 // Test ensures that inverse offers support filters.
 TEST_F(MasterMaintenanceTest, InverseOffersFilters)
 {
-  // NOTE: The callbacks and event queue must be stack allocated below
-  // the master, as the master may send heartbeats during destruction.
-  Callbacks callbacks;
-  Queue<Event> events;
-
   master::Flags flags = CreateMasterFlags();
 
   Try<Owned<cluster::Master>> master = StartMaster(flags);
   ASSERT_SOME(master);
 
-  ExecutorInfo executor1 = CREATE_EXECUTOR_INFO("executor-1", "exit 1");
-  ExecutorInfo executor2 = CREATE_EXECUTOR_INFO("executor-2", "exit 2");
+  ExecutorInfo executor1 = createExecutorInfo("executor-1", "exit 1");
+  ExecutorInfo executor2 = createExecutorInfo("executor-2", "exit 2");
 
   MockExecutor exec1(executor1.executor_id());
   MockExecutor exec2(executor2.executor_id());
@@ -1474,23 +1439,34 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
   // Now start a framework.
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
   Future<Nothing> connected;
-  EXPECT_CALL(callbacks, connected())
+  EXPECT_CALL(*scheduler, connected(_))
     .WillOnce(FutureSatisfy(&connected))
     .WillRepeatedly(Return()); // Ignore future invocations.
 
-  Mesos mesos(
+  v1::scheduler::TestMesos mesos(
       master.get()->pid,
       ContentType::PROTOBUF,
-      lambda::bind(&Callbacks::connected, lambda::ref(callbacks)),
-      lambda::bind(&Callbacks::disconnected, lambda::ref(callbacks)),
-      lambda::bind(&Callbacks::received, lambda::ref(callbacks), lambda::_1),
-      DEFAULT_V1_CREDENTIAL);
+      scheduler);
 
   AWAIT_READY(connected);
 
-  EXPECT_CALL(callbacks, received(_))
-    .WillRepeatedly(Enqueue(&events));
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Future<Event::InverseOffers> inverseOffers;
+  EXPECT_CALL(*scheduler, inverseOffers(_, _))
+    .WillOnce(FutureArg<1>(&inverseOffers));
 
   // Pause the clock before subscribing the framework.
   // This ensures deterministic offer-ing behavior during the test.
@@ -1501,33 +1477,29 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
     call.set_type(Call::SUBSCRIBE);
 
     Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(DEFAULT_V1_FRAMEWORK_INFO);
+    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
 
     mesos.send(call);
   }
 
-  Future<Event> event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::SUBSCRIBED, event.get().type());
+  AWAIT_READY(subscribed);
 
-  v1::FrameworkID id(event.get().subscribed().framework_id());
+  v1::FrameworkID id(subscribed->framework_id());
 
   // Trigger a batch allocation.
   Clock::advance(flags.allocation_interval);
 
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::OFFERS, event.get().type());
-  EXPECT_EQ(2, event.get().offers().offers().size());
+  AWAIT_READY(offers);
+  EXPECT_EQ(2, offers->offers().size());
 
   // All the offers should have unavailability.
-  foreach (const v1::Offer& offer, event.get().offers().offers()) {
+  foreach (const v1::Offer& offer, offers->offers()) {
     EXPECT_TRUE(offer.has_unavailability());
   }
 
   // Save both offers.
-  v1::Offer offer1 = event.get().offers().offers(0);
-  v1::Offer offer2 = event.get().offers().offers(1);
+  v1::Offer offer1 = offers->offers(0);
+  v1::Offer offer2 = offers->offers(1);
 
   // Spawn dummy tasks using both offers.
   v1::TaskInfo taskInfo1 =
@@ -1535,6 +1507,12 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
 
   v1::TaskInfo taskInfo2 =
     evolve(createTask(devolve(offer2), "exit 2", executor2.executor_id()));
+
+  Future<Event::Update> update1;
+  Future<Event::Update> update2;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&update1))
+    .WillOnce(FutureArg<1>(&update2));
 
   {
     // Accept the first offer.
@@ -1569,17 +1547,12 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   }
 
   // Expect two inverse offers.
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
-  EXPECT_EQ(2, event.get().inverse_offers().inverse_offers().size());
+  AWAIT_READY(inverseOffers);
+  ASSERT_EQ(2, inverseOffers->inverse_offers().size());
 
   // Save these inverse offers.
-  v1::InverseOffer inverseOffer1 =
-    event.get().inverse_offers().inverse_offers(0);
-
-  v1::InverseOffer inverseOffer2 =
-    event.get().inverse_offers().inverse_offers(1);
+  v1::InverseOffer inverseOffer1 = inverseOffers->inverse_offers(0);
+  v1::InverseOffer inverseOffer2 = inverseOffers->inverse_offers(1);
 
   // We want to acknowledge TASK_RUNNING updates for the two tasks we
   // have launched. We don't know which task will be launched first,
@@ -1587,12 +1560,9 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   // events we receive. We track which task ids we acknowledge, and
   // then verify them with the expected task ids.
   hashset<v1::TaskID> acknowledgedTaskIds;
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::UPDATE, event.get().type());
 
-  v1::TaskStatus updateStatus = event.get().update().status();
-  EXPECT_EQ(v1::TASK_RUNNING, updateStatus.state());
+  AWAIT_READY(update1);
+  EXPECT_EQ(v1::TASK_RUNNING, update1->status().state());
 
   {
     Call call;
@@ -1600,22 +1570,18 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
     call.set_type(Call::ACKNOWLEDGE);
 
     Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-    acknowledge->mutable_task_id()->CopyFrom(updateStatus.task_id());
-    acknowledge->mutable_agent_id()->CopyFrom(updateStatus.agent_id());
-    acknowledge->set_uuid(updateStatus.uuid());
+    acknowledge->mutable_task_id()->CopyFrom(update1->status().task_id());
+    acknowledge->mutable_agent_id()->CopyFrom(update1->status().agent_id());
+    acknowledge->set_uuid(update1->status().uuid());
 
-    EXPECT_FALSE(acknowledgedTaskIds.contains(updateStatus.task_id()));
-    acknowledgedTaskIds.insert(updateStatus.task_id());
+    EXPECT_FALSE(acknowledgedTaskIds.contains(update1->status().task_id()));
+    acknowledgedTaskIds.insert(update1->status().task_id());
 
     mesos.send(call);
   }
 
-  event = events.get();
-  AWAIT_READY(event);
-  EXPECT_EQ(Event::UPDATE, event.get().type());
-
-  updateStatus = event.get().update().status();
-  EXPECT_EQ(v1::TASK_RUNNING, updateStatus.state());
+  AWAIT_READY(update2);
+  EXPECT_EQ(v1::TASK_RUNNING, update2->status().state());
 
   {
     Call call;
@@ -1623,12 +1589,12 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
     call.set_type(Call::ACKNOWLEDGE);
 
     Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-    acknowledge->mutable_task_id()->CopyFrom(updateStatus.task_id());
-    acknowledge->mutable_agent_id()->CopyFrom(updateStatus.agent_id());
-    acknowledge->set_uuid(updateStatus.uuid());
+    acknowledge->mutable_task_id()->CopyFrom(update2->status().task_id());
+    acknowledge->mutable_agent_id()->CopyFrom(update2->status().agent_id());
+    acknowledge->set_uuid(update2->status().uuid());
 
-    EXPECT_FALSE(acknowledgedTaskIds.contains(updateStatus.task_id()));
-    acknowledgedTaskIds.insert(updateStatus.task_id());
+    EXPECT_FALSE(acknowledgedTaskIds.contains(update2->status().task_id()));
+    acknowledgedTaskIds.insert(update2->status().task_id());
 
     mesos.send(call);
   }
@@ -1685,20 +1651,22 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   }
 
   AWAIT_READY(updateInverseOffer);
+
+  EXPECT_CALL(*scheduler, inverseOffers(_, _))
+    .WillOnce(FutureArg<1>(&inverseOffers));
+
   Clock::settle();
   Clock::advance(flags.allocation_interval);
 
   // Expect one inverse offer in this batch allocation.
-  event = events.get();
-  AWAIT_READY(event);
+  AWAIT_READY(inverseOffers);
 
-  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
-  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
+  ASSERT_EQ(1, inverseOffers->inverse_offers().size());
   EXPECT_EQ(
       inverseOffer1.agent_id(),
-      event.get().inverse_offers().inverse_offers(0).agent_id());
+      inverseOffers->inverse_offers(0).agent_id());
 
-  inverseOffer1 = event.get().inverse_offers().inverse_offers(0);
+  inverseOffer1 = inverseOffers->inverse_offers(0);
 
   updateInverseOffer =
     FUTURE_DISPATCH(_, &MesosAllocatorProcess::updateInverseOffer);
@@ -1720,26 +1688,25 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   }
 
   AWAIT_READY(updateInverseOffer);
+
+  EXPECT_CALL(*scheduler, inverseOffers(_, _))
+    .WillOnce(FutureArg<1>(&inverseOffers));
+
   Clock::settle();
   Clock::advance(flags.allocation_interval);
 
   // Expect the same inverse offer in this batch allocation.
-  event = events.get();
-  AWAIT_READY(event);
+  AWAIT_READY(inverseOffers);
 
-  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
-  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
+  ASSERT_EQ(1, inverseOffers->inverse_offers().size());
   EXPECT_EQ(
       inverseOffer1.agent_id(),
-      event.get().inverse_offers().inverse_offers(0).agent_id());
+      inverseOffers->inverse_offers(0).agent_id());
 
   EXPECT_CALL(exec1, shutdown(_))
     .Times(AtMost(1));
 
   EXPECT_CALL(exec2, shutdown(_))
-    .Times(AtMost(1));
-
-  EXPECT_CALL(callbacks, disconnected())
     .Times(AtMost(1));
 }
 

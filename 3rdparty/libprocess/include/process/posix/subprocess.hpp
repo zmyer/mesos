@@ -27,6 +27,7 @@
 #include <stout/check.hpp>
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
+#include <stout/hashset.hpp>
 #include <stout/nothing.hpp>
 #include <stout/lambda.hpp>
 #include <stout/none.hpp>
@@ -40,11 +41,6 @@
 #include <stout/os/fcntl.hpp>
 #include <stout/os/signals.hpp>
 #include <stout/os/strerror.hpp>
-
-using std::map;
-using std::string;
-using std::vector;
-
 
 namespace process {
 
@@ -70,6 +66,15 @@ inline pid_t defaultClone(const lambda::function<int()>& func)
 
 namespace internal {
 
+inline void close(const hashset<int>& fds)
+{
+  foreach (int fd, fds) {
+    if (fd >= 0) {
+      os::close(fd);
+    }
+  }
+}
+
 // This function will invoke `os::close` on all specified file
 // descriptors that are valid (i.e., not `None` and >= 0).
 inline void close(
@@ -77,17 +82,14 @@ inline void close(
     const OutputFileDescriptors& stdoutfds,
     const OutputFileDescriptors& stderrfds)
 {
-  int fds[6] = {
-    stdinfds.read, stdinfds.write.getOrElse(-1),
-    stdoutfds.read.getOrElse(-1), stdoutfds.write,
-    stderrfds.read.getOrElse(-1), stderrfds.write
-  };
-
-  foreach (int fd, fds) {
-    if (fd >= 0) {
-      os::close(fd);
-    }
-  }
+  close({
+    stdinfds.read,
+    stdinfds.write.getOrElse(-1),
+    stdoutfds.read.getOrElse(-1),
+    stdoutfds.write,
+    stderrfds.read.getOrElse(-1),
+    stderrfds.write
+  });
 }
 
 
@@ -98,10 +100,13 @@ inline Try<Nothing> cloexec(
     const OutputFileDescriptors& stdoutfds,
     const OutputFileDescriptors& stderrfds)
 {
-  int fds[6] = {
-    stdinfds.read, stdinfds.write.getOrElse(-1),
-    stdoutfds.read.getOrElse(-1), stdoutfds.write,
-    stderrfds.read.getOrElse(-1), stderrfds.write
+  hashset<int> fds = {
+    stdinfds.read,
+    stdinfds.write.getOrElse(-1),
+    stdoutfds.read.getOrElse(-1),
+    stdoutfds.write,
+    stderrfds.read.getOrElse(-1),
+    stderrfds.write
   };
 
   foreach (int fd, fds) {
@@ -130,7 +135,7 @@ inline void signalHandler(int signal)
 //
 // NOTE: This function has to be async signal safe.
 inline int childMain(
-    const string& path,
+    const std::string& path,
     char** argv,
     char** envp,
     const InputFileDescriptors& stdinfds,
@@ -138,7 +143,7 @@ inline int childMain(
     const OutputFileDescriptors& stderrfds,
     bool blocking,
     int pipes[2],
-    const vector<Subprocess::ChildHook>& child_hooks)
+    const std::vector<Subprocess::ChildHook>& child_hooks)
 {
   // Close parent's end of the pipes.
   if (stdinfds.write.isSome()) {
@@ -167,6 +172,10 @@ inline int childMain(
   // parent has closed stdin/stdout/stderr when calling this
   // function (in that case, a dup'ed file descriptor may have the
   // same file descriptor number as stdin/stdout/stderr).
+  //
+  // We also need to ensure that we don't "double close" any file
+  // descriptors in the case where one of stdinfds.read,
+  // stdoutfds.write, or stdoutfds.write are equal.
   if (stdinfds.read != STDIN_FILENO &&
       stdinfds.read != STDOUT_FILENO &&
       stdinfds.read != STDERR_FILENO) {
@@ -174,12 +183,15 @@ inline int childMain(
   }
   if (stdoutfds.write != STDIN_FILENO &&
       stdoutfds.write != STDOUT_FILENO &&
-      stdoutfds.write != STDERR_FILENO) {
+      stdoutfds.write != STDERR_FILENO &&
+      stdoutfds.write != stdinfds.read) {
     ::close(stdoutfds.write);
   }
   if (stderrfds.write != STDIN_FILENO &&
       stderrfds.write != STDOUT_FILENO &&
-      stderrfds.write != STDERR_FILENO) {
+      stderrfds.write != STDERR_FILENO &&
+      stderrfds.write != stdinfds.read &&
+      stderrfds.write != stdoutfds.write) {
     ::close(stderrfds.write);
   }
 
@@ -216,13 +228,13 @@ inline int childMain(
 
 
 inline Try<pid_t> cloneChild(
-    const string& path,
-    vector<string> argv,
-    const Option<map<string, string>>& environment,
+    const std::string& path,
+    std::vector<std::string> argv,
+    const Option<std::map<std::string, std::string>>& environment,
     const Option<lambda::function<
         pid_t(const lambda::function<int()>&)>>& _clone,
-    const vector<Subprocess::ParentHook>& parent_hooks,
-    const vector<Subprocess::ChildHook>& child_hooks,
+    const std::vector<Subprocess::ParentHook>& parent_hooks,
+    const std::vector<Subprocess::ChildHook>& child_hooks,
     const InputFileDescriptors stdinfds,
     const OutputFileDescriptors stdoutfds,
     const OutputFileDescriptors stderrfds)
@@ -246,8 +258,10 @@ inline Try<pid_t> cloneChild(
     envp = new char*[environment.get().size() + 1];
 
     size_t index = 0;
-    foreachpair (const string& key, const string& value, environment.get()) {
-      string entry = key + "=" + value;
+    foreachpair (
+        const std::string& key,
+        const std::string& value, environment.get()) {
+      std::string entry = key + "=" + value;
       envp[index] = new char[entry.size() + 1];
       strncpy(envp[index], entry.c_str(), entry.size() + 1);
       ++index;
@@ -313,6 +327,10 @@ inline Try<pid_t> cloneChild(
     return error;
   }
 
+  // Close the child-ends of the file descriptors that are created by
+  // this function.
+  internal::close({stdinfds.read, stdoutfds.write, stderrfds.write});
+
   if (blocking) {
     os::close(pipes[0]);
 
@@ -328,12 +346,6 @@ inline Try<pid_t> cloneChild(
           << pid << "': " << parentSetup.error();
 
         os::close(pipes[1]);
-
-        // Close the child-ends of the file descriptors that are created
-        // by this function.
-        os::close(stdinfds.read);
-        os::close(stdoutfds.write);
-        os::close(stderrfds.write);
 
         // Ensure the child is killed.
         ::kill(pid, SIGKILL);
@@ -357,11 +369,6 @@ inline Try<pid_t> cloneChild(
       // Ensure the child is killed.
       ::kill(pid, SIGKILL);
 
-      // Close the child-ends of the file descriptors that are created
-      // by this function.
-      os::close(stdinfds.read);
-      os::close(stdoutfds.write);
-      os::close(stderrfds.write);
       return Error("Failed to synchronize child process");
     }
   }

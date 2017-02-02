@@ -102,6 +102,12 @@ Try<std::string> shell(const std::string& fmt, const T&... t)
 //
 // The returned value from `_spawnlp` represents child exit code when
 // `_P_WAIT` is used.
+//
+// Note: Be cautious about shell injection
+// (https://en.wikipedia.org/wiki/Code_injection#Shell_injection)
+// when using this method and use proper validation and sanitization
+// on the `command`. For this reason in general `os::spawn` is
+// preferred if a shell is not required.
 inline int system(const std::string& command)
 {
   return static_cast<int>(::_spawnlp(
@@ -145,6 +151,20 @@ inline int execlp(const char* file, T... t)
 inline int execvp(const char* file, char* const argv[])
 {
   exit(static_cast<int>(::_spawnvp(_P_WAIT, file, argv)));
+  return 0;
+}
+
+
+// On Windows, the `_spawnvpe` call creates a new process.
+// In order to emulate the semantics of `execvpe`, we spawn with `_P_WAIT`,
+// which forces the parent process to block on the child. When the child exits,
+// the exit code is propagated back through the parent via `exit()`.
+//
+// The returned value from `_spawnvpe` represents child exit code when
+// `_P_WAIT` is used.
+inline int execvpe(const char* file, char* const argv[], char* const envp[])
+{
+  exit(static_cast<int>(::_spawnvpe(_P_WAIT, file, argv, envp)));
   return 0;
 }
 

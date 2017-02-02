@@ -384,7 +384,7 @@ String formatting is provided via `strings::format`. The `strings::format` funct
 One frustration with existing command line flags libraries was the burden they put on writing tests that attempted to have many different instantiations of the flags. For example, running two instances of the same component within a test where each instance was started with different command line flags. To solve this, we provide a command line flags abstraction called `Flags` (in the `flags` namespace) that you can extend to define your own flags:
 
 ~~~{.cpp}
-    struct MyFlags : flags::Flags
+    struct MyFlags : virtual flags::Flags // Use `virtual` for composition!
     {
       MyFlags()
       {
@@ -394,7 +394,7 @@ One frustration with existing command line flags libraries was the burden they p
             "Some information about foo",
             DEFAULT_VALUE_FOR_FOO);
 
-        // A flag with out a default value,
+        // A flag without a default value,
         // defined below with an `Option`.
         add(&MyFlags::bar,
             "bar",
@@ -435,17 +435,15 @@ There are various ways to deal with unknown flags (i.e., `--baz` in our example 
 
 ## Collections
 
-Many of the collections and containers provided either by Boost or the C++ standard are cumbersome to use or yield brittle, hard to maintain code. For many of the standard data structures we provide wrappers with modified interfaces often simplified or enhanced using types like `Try` and `Option`.
+Many of the collections and containers provided either by Boost or the C++ standard are cumbersome to use or yield brittle, hard to maintain code. For many of the standard data structures we provide wrappers with modified interfaces often simplified or enhanced using types like `Try` and `Option`. These wrappers include `hashmap`, `hashset`, `multihashmap`, and `multimap`.
 
 > NOTE: The collections are not namespaced.
 
-Some of these wrappers use the Boost implementations of these data structures, including: `hashmap`, `hashset`, `linkedhashmap`, `multihashmap`, `multimap`.
+`LinkedHashMap` is a hashmap that maintains the order in which the keys have been inserted. This allows both constant-time access to a particular key-value pair, as well as iteration over key-value pairs according to the insertion order.
 
-There is a `Set` abstraction for working with a `std::set` as well as some overloaded operators for doing set union (`|`), set intersection (`&`), and set appending (`+`).
+There is also a `Cache` implementation that provides a templated implementation of a least-recently used (LRU) cache. Note that the key type must be compatible with `std::unordered_map`.
 
-Finally, there is a `cache` implementation (also requires Boost) that provides a templated implementation of a least-recently used (LRU) cache. Note that the key type must be compatible with `boost::unordered_map`.
-
-
+Finally, we provide some overloaded operators for doing set union (`|`), set intersection (`&`), and set appending (`+`) using `std::set`.
 
 <a href="miscellaneous"></a>
 
@@ -565,7 +563,7 @@ Converts arbitrary types into strings by attempting to use an overloaded `std::o
 
 *Requires pthreads.*
 
-You can give every thread it's own copy of some data using the `ThreadLocal` abstraction:
+You can give every thread its own copy of some data using the `ThreadLocal` abstraction:
 
 ~~~{.cpp}
     ThreadLocal<std::string> local;

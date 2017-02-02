@@ -16,6 +16,11 @@ layout: documentation
   Scheduler Library</a></td>
   <td>C++</td>
 </tr>
+<tr>
+  <td><a href="https://github.com/apache/mesos/tree/master/src/java/src/org/apache/mesos/v1/scheduler">
+  Scheduler Adapter (depends on native libmesos)</a></td>
+  <td>Java</td>
+</tr>
 </table>
 
 ### User Contributed
@@ -46,6 +51,11 @@ run into any issues, file them with the library maintainers.*
   <td><a href="https://github.com/nokia/mesos-scala-api">
   mesos-scala-api</a></td>
   <td>Scala</td>
+</tr>
+<tr>
+  <td><a href="https://github.com/douban/pymesos">
+  PyMesos</a></td>
+  <td>Python</td>
 </tr>
 </table>
 
@@ -82,5 +92,10 @@ run into any issues, file them with the library maintainers.*
   <td><a href="https://github.com/mesos/mesos-go">
   mesos-go</a></td>
   <td>Go</td>
+</tr>
+<tr>
+  <td><a href="https://github.com/douban/pymesos">
+  PyMesos</a></td>
+  <td>Python</td>
 </tr>
 </table>

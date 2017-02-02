@@ -33,6 +33,8 @@
 using std::list;
 using std::string;
 
+using google::protobuf::RepeatedPtrField;
+
 using process::Failure;
 using process::Future;
 using process::Owned;
@@ -40,8 +42,6 @@ using process::PID;
 
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
-using mesos::slave::ContainerLimitation;
-using mesos::slave::ContainerState;
 using mesos::slave::Isolator;
 
 namespace mesos {
@@ -54,6 +54,12 @@ AppcRuntimeIsolatorProcess::AppcRuntimeIsolatorProcess(const Flags& _flags)
 
 
 AppcRuntimeIsolatorProcess::~AppcRuntimeIsolatorProcess() {}
+
+
+bool AppcRuntimeIsolatorProcess::supportsNesting()
+{
+  return true;
+}
 
 
 Try<Isolator*> AppcRuntimeIsolatorProcess::create(const Flags& flags)
@@ -69,13 +75,11 @@ Future<Option<ContainerLaunchInfo>> AppcRuntimeIsolatorProcess::prepare(
     const ContainerID& containerId,
     const mesos::slave::ContainerConfig& containerConfig)
 {
-  const ExecutorInfo& executorInfo = containerConfig.executor_info();
-
-  if (!executorInfo.has_container()) {
+  if (!containerConfig.has_container_info()) {
     return None();
   }
 
-  if (executorInfo.container().type() != ContainerInfo::MESOS) {
+  if (containerConfig.container_info().type() != ContainerInfo::MESOS) {
     return Failure("Can only prepare Appc runtime for a MESOS container");
   }
 
@@ -104,20 +108,13 @@ Future<Option<ContainerLaunchInfo>> AppcRuntimeIsolatorProcess::prepare(
   }
 
   // If working directory or command exists, operation has to be
-  // distinguished for either custom executor or command task. For
-  // custom executor case, info will be included in 'launchInfo', and
-  // will be passed back to containerizer. For command task case, info
-  // will be passed to command executor as flags.
-  if (!containerConfig.has_task_info()) {
-    // Custom executor case.
-    if (workingDirectory.isSome()) {
-      launchInfo.set_working_directory(workingDirectory.get());
-    }
-
-    if (command.isSome()) {
-      launchInfo.mutable_command()->CopyFrom(command.get());
-    }
-  } else {
+  // handled specially for the command task. For the command task,
+  // the working directory and task command will be passed to
+  // command executor as flags. For custom executor, default
+  // executor and nested container cases, these information will
+  // be included in 'ContainerLaunchInfo', and will be passed back
+  // to containerizer.
+  if (containerConfig.has_task_info()) {
     // Command task case. The 'executorCommand' below is the
     // command with value as 'mesos-executor'.
     CommandInfo executorCommand = containerConfig.executor_info().command();
@@ -137,6 +134,15 @@ Future<Option<ContainerLaunchInfo>> AppcRuntimeIsolatorProcess::prepare(
     }
 
     launchInfo.mutable_command()->CopyFrom(executorCommand);
+  } else {
+    // The custom executor, default executor and nested container cases.
+    if (workingDirectory.isSome()) {
+      launchInfo.set_working_directory(workingDirectory.get());
+    }
+
+    if (command.isSome()) {
+      launchInfo.mutable_command()->CopyFrom(command.get());
+    }
   }
 
   return launchInfo;
@@ -171,7 +177,7 @@ Option<Environment> AppcRuntimeIsolatorProcess::getLaunchEnvironment(
 }
 
 
-// This method reads the CommandInfo from ExecutorInfo and optional
+// This method reads the CommandInfo from ContainerConfig and optional
 // TaskInfo, and merge them with Appc image default 'exec'.
 Result<CommandInfo> AppcRuntimeIsolatorProcess::getLaunchCommand(
     const ContainerID& containerId,
@@ -182,22 +188,22 @@ Result<CommandInfo> AppcRuntimeIsolatorProcess::getLaunchCommand(
   }
 
   // We may or may not mutate the CommandInfo for executor depending
-  // on the logic table below. For custom executor case, we make
-  // changes to the command directly. For command task case, if no
-  // need to change the launch command for the user task, we do not do
-  // anything and return the CommandInfo from ExecutorInfo. We only
-  // add a flag `--task_command` to carry command as a JSON object if
-  // it is neccessary to mutate.
+  // on the logic table below. For custom executor, default executor
+  // and nested container cases, we make changes to the command
+  // directly. For command task case, if no need to change the launch
+  // command for the user task, we do not do anything and return the
+  // CommandInfo from ContainerConfig. We only add a flag
+  // `--task_command` to carry command as a JSON object if it is
+  // necessary to mutate.
   CommandInfo command;
 
-  if (!containerConfig.has_task_info()) {
-    // Custom executor case.
-    CHECK(containerConfig.executor_info().has_command());
-    command = containerConfig.executor_info().command();
-  } else {
+  if (containerConfig.has_task_info()) {
     // Command task case.
     CHECK(containerConfig.task_info().has_command());
     command = containerConfig.task_info().command();
+  } else {
+    // Custom executor, default executor or nested container case.
+    command = containerConfig.command_info();
   }
 
   // We merge the CommandInfo following the logic:
@@ -266,16 +272,10 @@ Result<CommandInfo> AppcRuntimeIsolatorProcess::getLaunchCommand(
   if (app.exec_size() > 0) {
     command.set_value(app.exec(0));
 
+    const RepeatedPtrField<string> arguments = command.arguments();
     command.clear_arguments();
     command.add_arguments(app.exec(0));
-
-    if (!containerConfig.has_task_info()) {
-      command.mutable_arguments()->MergeFrom(
-          containerConfig.executor_info().command().arguments());
-    } else {
-      command.mutable_arguments()->MergeFrom(
-          containerConfig.task_info().command().arguments());
-    }
+    command.mutable_arguments()->MergeFrom(arguments);
 
     if (command.arguments_size() == 1) {
       for (int i = 1; i < app.exec_size(); i++) {

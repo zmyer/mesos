@@ -30,15 +30,17 @@ inline Try<Nothing> write(int fd, const std::string& message);
 
 inline ssize_t write(int fd, const void* data, size_t size)
 {
+  CHECK_LE(size, INT_MAX);
+
   if (net::is_socket(fd)) {
-    return ::send(fd, (const char*) data, size, 0);
+    return net::send(fd, (const char*) data, size, 0);
   }
 
-  return ::_write(fd, data, size);
+  return ::_write(fd, data, static_cast<unsigned int>(size));
 }
 
 
-inline ssize_t read(HANDLE handle, const void* data, size_t size)
+inline ssize_t write(HANDLE handle, const void* data, size_t size)
 {
   return ::os::write(
       _open_osfhandle(reinterpret_cast<intptr_t>(handle), O_RDWR),

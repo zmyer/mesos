@@ -121,12 +121,16 @@ public:
    *
    * @param used Resources used by this framework. The allocator should
    *     account for these resources when updating the allocation of this
-   *     framework.
+   *     framework. The allocator should avoid double accounting when yet
+   *     unknown agents are added later in `addSlave()`.
+   *
+   * @param active Whether the framework is initially activated.
    */
   virtual void addFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
-      const hashmap<SlaveID, Resources>& used) = 0;
+      const hashmap<SlaveID, Resources>& used,
+      bool active) = 0;
 
   /**
    * Removes a framework from the Mesos cluster. It is up to an allocator to
@@ -174,7 +178,9 @@ public:
    * @param total The `total` resources are passed explicitly because it
    *     includes resources that are dynamically "checkpointed" on the agent
    *     (e.g. persistent volumes, dynamic reservations, etc).
-   * @param used Resources that are allocated on the current agent.
+   * @param used Resources that are allocated on the current agent. The
+   *     allocator should avoid double accounting when yet unknown frameworks
+   *     are added later in `addFramework()`.
    */
   virtual void addSlave(
       const SlaveID& slaveId,

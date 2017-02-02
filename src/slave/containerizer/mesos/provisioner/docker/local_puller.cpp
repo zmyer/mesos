@@ -59,12 +59,14 @@ public:
 
   Future<vector<string>> pull(
       const spec::ImageReference& reference,
-      const string& directory);
+      const string& directory,
+      const string& backend);
 
 private:
   Future<vector<string>> _pull(
       const spec::ImageReference& reference,
-      const string& directory);
+      const string& directory,
+      const string& backend);
 
   Result<string> getParentLayerId(
       const string& directory,
@@ -72,11 +74,13 @@ private:
 
   Future<Nothing> extractLayers(
       const string& directory,
-      const vector<string>& layerIds);
+      const vector<string>& layerIds,
+      const string& backend);
 
   Future<Nothing> extractLayer(
       const string& directory,
-      const string& layerId);
+      const string& layerId,
+      const string& backend);
 
   const string archivesDir;
 };
@@ -115,19 +119,22 @@ LocalPuller::~LocalPuller()
 
 Future<vector<string>> LocalPuller::pull(
     const spec::ImageReference& reference,
-    const string& directory)
+    const string& directory,
+    const string& backend)
 {
   return dispatch(
       process.get(),
       &LocalPullerProcess::pull,
       reference,
-      directory);
+      directory,
+      backend);
 }
 
 
 Future<vector<string>> LocalPullerProcess::pull(
     const spec::ImageReference& reference,
-    const string& directory)
+    const string& directory,
+    const string& backend)
 {
   // TODO(jieyu): We need to handle the case where the image reference
   // contains a slash '/'.
@@ -146,13 +153,14 @@ Future<vector<string>> LocalPullerProcess::pull(
           << "' to '" << directory << "'";
 
   return command::untar(Path(tarPath), Path(directory))
-    .then(defer(self(), &Self::_pull, reference, directory));
+    .then(defer(self(), &Self::_pull, reference, directory, backend));
 }
 
 
 Future<vector<string>> LocalPullerProcess::_pull(
     const spec::ImageReference& reference,
-    const string& directory)
+    const string& directory,
+    const string& backend)
 {
   // We first parse the 'repositories' JSON file to get the top most
   // layer id for the image.
@@ -226,7 +234,7 @@ Future<vector<string>> LocalPullerProcess::_pull(
         "': " + parentLayerId.error());
   }
 
-  return extractLayers(directory, layerIds)
+  return extractLayers(directory, layerIds, backend)
     .then([layerIds]() -> vector<string> { return layerIds; });
 }
 
@@ -269,11 +277,12 @@ Result<string> LocalPullerProcess::getParentLayerId(
 
 Future<Nothing> LocalPullerProcess::extractLayers(
     const string& directory,
-    const vector<string>& layerIds)
+    const vector<string>& layerIds,
+    const string& backend)
 {
   list<Future<Nothing>> futures;
   foreach (const string& layerId, layerIds) {
-    futures.push_back(extractLayer(directory, layerId));
+    futures.push_back(extractLayer(directory, layerId, backend));
   }
 
   return collect(futures)
@@ -283,11 +292,12 @@ Future<Nothing> LocalPullerProcess::extractLayers(
 
 Future<Nothing> LocalPullerProcess::extractLayer(
     const string& directory,
-    const string& layerId)
+    const string& layerId,
+    const string& backend)
 {
   const string layerPath = path::join(directory, layerId);
   const string tar = paths::getImageLayerTarPath(layerPath);
-  const string rootfs = paths::getImageLayerRootfsPath(layerPath);
+  const string rootfs = paths::getImageLayerRootfsPath(layerPath, backend);
 
   VLOG(1) << "Extracting layer tar ball '" << tar
           << " to rootfs '" << rootfs << "'";

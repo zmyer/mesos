@@ -19,8 +19,14 @@
               tooltip-placement="right"></i>
           </span>
         </dd>
-        <dt>Server:</dt>
-        <dd>{{state.pid.split("@")[1]}}</dd>
+        <dt>Leader:</dt>
+        <dd>
+          <a ng-show="state.leader_info"
+             href="//{{state.leader_info.hostname}}:{{state.leader_info.port}}">
+            {{state.leader_info.hostname + ':' + state.leader_info.port}}
+          </a>
+          <span ng-show="!state.leader_info">(Unknown)</span>
+        </dd>
         <dt>Version:</dt>
         <dd>{{state.version}}</dd>
         <dt>Built:</dt>
@@ -52,12 +58,15 @@
             <td>Deactivated</td>
             <td class="text-right">{{deactivated_agents | number}}</td>
           </tr>
+          <tr>
+            <td>Unreachable</td>
+            <td class="text-right">{{unreachable_agents | number}}</td>
+          </tr>
         </tbody>
       </table>
 
       <h4>Tasks</h4>
       <table class="table table-condensed">
-
         <tbody>
           <tr>
             <td>Staging</td>
@@ -70,6 +79,10 @@
           <tr>
             <td>Running</td>
             <td class="text-right">{{running_tasks | number}}</td>
+          </tr>
+          <tr>
+            <td>Unreachable</td>
+            <td class="text-right">{{unreachable_tasks.length | number}}</td>
           </tr>
           <tr>
             <td>Killing</td>
@@ -149,8 +162,9 @@
       class="table table-striped table-bordered table-condensed">
       <thead>
         <tr>
-          <th data-key="id">ID</th>
-          <th data-key="name">Name</th>
+          <th data-key="framework_id">Framework ID</th>
+          <th data-key="id">Task ID</th>
+          <th data-key="name">Task Name</th>
           <th data-key="state">State</th>
           <th data-key="start_time" data-sort>Started</th>
           <th data-key="host">Host</th>
@@ -159,9 +173,14 @@
       </thead>
       <tbody>
         <tr data-ng-if="active_tasks.length === 0">
-          <td colspan="6">No active tasks.</td>
+          <td colspan="7">No active tasks.</td>
         </tr>
         <tr ng-repeat="task in $data">
+          <td>
+            <a href="#/frameworks/{{task.framework_id}}/">
+              {{task.framework_id}}
+            </a>
+          </td>
           <td>
             <a href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}">
               {{task.id}}
@@ -181,7 +200,7 @@
             </span>
           </td>
           <td>
-            <a data-ng-show="agents[task.slave_id]" href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}/browse">
+            <a data-ng-show="agents[task.slave_id]" href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}/tasks/{{task.id}}/browse">
               Sandbox
             </a>
             <span class="text-muted" data-ng-show="!agents[task.slave_id]">
@@ -192,12 +211,44 @@
       </tbody>
     </table>
 
+    <table m-table table-content="unreachable_tasks" title="Unreachable Tasks"
+      class="table table-striped table-bordered table-condensed">
+      <thead>
+        <tr>
+          <th data-key="framework_id">Framework ID</th>
+          <th data-key="id">Task ID</th>
+          <th data-key="name">Task Name</th>
+          <th data-key="start_time" data-sort>Started</th>
+          <th data-key="agent_id">Agent ID</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr data-ng-if="unreachable_tasks.length === 0">
+          <td colspan="8">No unreachable tasks.</td>
+        </tr>
+        <tr ng-repeat="task in $data">
+          <td>
+            <a href="#/frameworks/{{task.framework_id}}/">
+              {{task.framework_id}}
+            </a>
+          </td>
+          <td>{{task.id}}</td>
+          <td>{{task.name}}</td>
+          <td>
+            <m-timestamp value="{{task.start_time}}"></m-timestamp>
+          </td>
+          <td>{{task.slave_id}}</td>
+        </tr>
+      </tbody>
+    </table>
+
     <table m-table table-content="completed_tasks" title="Completed Tasks"
       class="table table-striped table-bordered table-condensed">
       <thead>
         <tr>
-          <th data-key="id">ID</th>
-          <th data-key="name">Name</th>
+          <th data-key="framework_id">Framework ID</th>
+          <th data-key="id">Task ID</th>
+          <th data-key="name">Task Name</th>
           <th data-key="state">State</th>
           <th data-key="start_time" data-sort>Started</th>
           <th data-key="finish_time">Stopped</th>
@@ -207,9 +258,10 @@
       </thead>
       <tbody>
         <tr data-ng-if="completed_tasks.length === 0">
-          <td colspan="7">No completed tasks.</td>
+          <td colspan="8">No completed tasks.</td>
         </tr>
         <tr ng-repeat="task in $data">
+          <td>{{task.framework_id}}</td>
           <td>{{task.id}}</td>
           <td>{{task.name}}</td>
           <td>{{task.state | truncateMesosState}}</td>
@@ -229,7 +281,7 @@
             </span>
           </td>
           <td>
-            <a data-ng-show="agents[task.slave_id]" href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}/browse">
+            <a data-ng-show="agents[task.slave_id]" href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}/tasks/{{task.id}}/browse">
               Sandbox
             </a>
             <span class="text-muted" data-ng-show="!agents[task.slave_id]">
@@ -238,53 +290,56 @@
           </td>
         </tr>
       </tbody>
+    </table>
 
-      <table m-table table-content="orphan_tasks" title="Orphan Tasks"
-        class="table table-striped table-bordered table-condensed">
-        <thead>
-          <tr>
-            <th data-key="id">ID</th>
-            <th data-key="name">Name</th>
-            <th data-key="state">State</th>
-            <th data-key="start_time" data-sort>Started</th>
-            <th data-key="finish_time">Stopped</th>
-            <th data-key="host">Host</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr data-ng-if="orphan_tasks.length === 0">
-            <td colspan="7">No orphan tasks.</td>
-          </tr>
-          <tr ng-repeat="task in $data">
-            <td>{{task.id}}</td>
-            <td>{{task.name}}</td>
-            <td>{{task.state | truncateMesosState}}</td>
-            <td>
-              <m-timestamp value="{{task.start_time}}"></m-timestamp>
-            </td>
-            <td>
-              <m-timestamp value="{{task.finish_time}}"></m-timestamp>
-            </td>
-            <td>
-              <a data-ng-show="_.has(agents, task.slave_id)"
-                  href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}">
-                {{agents[task.slave_id].hostname}}
-              </a>
-              <span class="text-muted" data-ng-show="!_.has(agents, task.slave_id)">
-                Agent offline
-              </span>
-            </td>
-            <td>
-              <a data-ng-show="agents[task.slave_id]" href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}/browse">
-                Sandbox
-              </a>
-              <span class="text-muted" data-ng-show="!agents[task.slave_id]">
-                Agent offline
-              </span>
-            </td>
-          </tr>
-        </tbody>
+    <table m-table table-content="orphan_tasks" title="Orphan Tasks"
+      class="table table-striped table-bordered table-condensed">
+      <thead>
+        <tr>
+          <th data-key="framework_id">Framework ID</th>
+          <th data-key="id">Task ID</th>
+          <th data-key="name">Task Name</th>
+          <th data-key="state">State</th>
+          <th data-key="start_time" data-sort>Started</th>
+          <th data-key="finish_time">Stopped</th>
+          <th data-key="host">Host</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr data-ng-if="orphan_tasks.length === 0">
+          <td colspan="8">No orphan tasks.</td>
+        </tr>
+        <tr ng-repeat="task in $data">
+          <td>{{task.framework_id}}</td>
+          <td>{{task.id}}</td>
+          <td>{{task.name}}</td>
+          <td>{{task.state | truncateMesosState}}</td>
+          <td>
+            <m-timestamp value="{{task.start_time}}"></m-timestamp>
+          </td>
+          <td>
+            <m-timestamp value="{{task.finish_time}}"></m-timestamp>
+          </td>
+          <td>
+            <a data-ng-show="_.has(agents, task.slave_id)"
+               href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}">
+              {{agents[task.slave_id].hostname}}
+            </a>
+            <span class="text-muted" data-ng-show="!_.has(agents, task.slave_id)">
+              Agent offline
+            </span>
+          </td>
+          <td>
+            <a data-ng-show="agents[task.slave_id]" href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}/tasks/{{task.id}}/browse">
+              Sandbox
+            </a>
+            <span class="text-muted" data-ng-show="!agents[task.slave_id]">
+              Agent offline
+            </span>
+          </td>
+        </tr>
+      </tbody>
     </table>
   </div>
 </div>

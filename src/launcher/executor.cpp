@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "launcher/executor.hpp"
+
 #include <signal.h>
 #include <stdio.h>
 
@@ -27,7 +29,6 @@
 #include <vector>
 
 #include <mesos/mesos.hpp>
-
 #include <mesos/type_utils.hpp>
 
 #include <process/clock.hpp>
@@ -42,10 +43,6 @@
 #include <process/reap.hpp>
 #include <process/time.hpp>
 #include <process/timer.hpp>
-
-#ifdef __WINDOWS__
-#include <process/windows/winsock.hpp> // WSAStartup code.
-#endif // __WINDOWS__
 
 #include <stout/duration.hpp>
 #include <stout/flags.hpp>
@@ -64,32 +61,23 @@
 #include <stout/os/kill.hpp>
 #include <stout/os/killtree.hpp>
 
+#include "checks/health_checker.hpp"
+
 #include "common/http.hpp"
+#include "common/parse.hpp"
 #include "common/protobuf_utils.hpp"
 #include "common/status_utils.hpp"
 
-#include "internal/devolve.hpp"
-#include "internal/evolve.hpp"
-
-#ifdef __linux__
-#include "linux/fs.hpp"
-#endif
-
 #include "executor/v0_v1executor.hpp"
 
-#include "health-check/health_checker.hpp"
-
-#include "launcher/executor.hpp"
+#include "internal/devolve.hpp"
+#include "internal/evolve.hpp"
 
 #include "logging/logging.hpp"
 
 #include "messages/messages.hpp"
 
 #include "slave/constants.hpp"
-
-#ifdef __linux__
-namespace fs = mesos::internal::fs;
-#endif
 
 using namespace mesos::internal::slave;
 
@@ -127,6 +115,7 @@ public:
       const Option<string>& _workingDirectory,
       const Option<string>& _user,
       const Option<string>& _taskCommand,
+      const Option<CapabilityInfo>& _capabilities,
       const FrameworkID& _frameworkId,
       const ExecutorID& _executorId,
       const Duration& _shutdownGracePeriod)
@@ -146,6 +135,7 @@ public:
       workingDirectory(_workingDirectory),
       user(_user),
       taskCommand(_taskCommand),
+      capabilities(_capabilities),
       frameworkId(_frameworkId),
       executorId(_executorId),
       task(None())
@@ -256,12 +246,6 @@ public:
 protected:
   virtual void initialize()
   {
-    install<TaskHealthStatus>(
-        &CommandExecutor::taskHealthUpdated,
-        &TaskHealthStatus::task_id,
-        &TaskHealthStatus::healthy,
-        &TaskHealthStatus::kill_task);
-
     Option<string> value = os::getenv("MESOS_HTTP_COMMAND_EXECUTOR");
 
     // We initialize the library here to ensure that callbacks are only invoked
@@ -294,19 +278,22 @@ protected:
     }
   }
 
-  void taskHealthUpdated(
-      const TaskID& _taskId,
-      const bool healthy,
-      const bool initiateTaskKill)
+  void taskHealthUpdated(const TaskHealthStatus& healthStatus)
   {
+    // This check prevents us from sending `TASK_RUNNING` updates
+    // after the task has been transitioned to `TASK_KILLING`.
+    if (killed || terminated) {
+      return;
+    }
+
     cout << "Received task health update, healthy: "
-         << stringify(healthy) << endl;
+         << stringify(healthStatus.healthy()) << endl;
 
-    update(_taskId, TASK_RUNNING, healthy);
+    update(healthStatus.task_id(), TASK_RUNNING, healthStatus.healthy());
 
-    if (initiateTaskKill) {
+    if (healthStatus.kill_task()) {
       killedByHealthCheck = true;
-      kill(_taskId);
+      kill(healthStatus.task_id());
     }
   }
 
@@ -325,7 +312,7 @@ protected:
     Call::Subscribe* subscribe = call.mutable_subscribe();
 
     // Send all unacknowledged updates.
-    foreach (const Call::Update& update, updates.values()) {
+    foreachvalue (const Call::Update& update, updates) {
       subscribe->add_unacknowledged_updates()->MergeFrom(update);
     }
 
@@ -410,7 +397,8 @@ protected:
         user,
         rootfs,
         sandboxDirectory,
-        workingDirectory);
+        workingDirectory,
+        capabilities);
 #else
     // A Windows process is started using the `CREATE_SUSPENDED` flag
     // and is part of a job object. While the process handle is kept
@@ -440,10 +428,11 @@ protected:
         namespaces.push_back("mnt");
       }
 
-      Try<Owned<health::HealthChecker>> _checker =
-        health::HealthChecker::create(
+      Try<Owned<checks::HealthChecker>> _checker =
+        checks::HealthChecker::create(
             task->health_check(),
-            self(),
+            launcherDir,
+            defer(self(), &Self::taskHealthUpdated, lambda::_1),
             task->task_id(),
             pid,
             namespaces);
@@ -454,14 +443,6 @@ protected:
              << _checker.error() << endl;
       } else {
         checker = _checker.get();
-
-        checker->healthCheck()
-          .onAny([](const Future<Nothing>& future) {
-            // Only possible to be a failure.
-            if (future.isFailed()) {
-              cerr << "Health check failed" << endl;
-            }
-          });
       }
     }
 
@@ -591,6 +572,11 @@ private:
         update(taskId.get(), TASK_KILLING);
       }
 
+      // Stop health checking the task.
+      if (checker.get() != nullptr) {
+        checker->stop();
+      }
+
       // Now perform signal escalation to begin killing the task.
       CHECK_GT(pid, 0);
 
@@ -626,6 +612,11 @@ private:
   {
     terminated = true;
 
+    // Stop health checking the task.
+    if (checker.get() != nullptr) {
+      checker->stop();
+    }
+
     TaskState taskState;
     string message;
 
@@ -643,9 +634,10 @@ private:
       message = "Failed to get exit status for Command";
     } else {
       int status = status_.get().get();
-      CHECK(WIFEXITED(status) || WIFSIGNALED(status)) << status;
+      CHECK(WIFEXITED(status) || WIFSIGNALED(status))
+        << "Unexpected wait status " << status;
 
-      if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+      if (WSUCCEEDED(status)) {
         taskState = TASK_FINISHED;
       } else if (killed) {
         // Send TASK_KILLED if the task was killed as a result of
@@ -727,6 +719,7 @@ private:
     status.set_state(state);
     status.set_source(TaskStatus::SOURCE_EXECUTOR);
     status.set_uuid(uuid.toBytes());
+    status.set_timestamp(Clock::now().secs());
 
     if (healthy.isSome()) {
       status.set_healthy(healthy.get());
@@ -798,48 +791,53 @@ private:
   Option<string> workingDirectory;
   Option<string> user;
   Option<string> taskCommand;
+  Option<CapabilityInfo> capabilities;
   const FrameworkID frameworkId;
   const ExecutorID executorId;
   Owned<MesosBase> mesos;
   LinkedHashMap<UUID, Call::Update> updates; // Unacknowledged updates.
   Option<TaskInfo> task; // Unacknowledged task.
-  Owned<health::HealthChecker> checker;
+  Owned<checks::HealthChecker> checker;
 };
 
 } // namespace internal {
 } // namespace mesos {
 
 
-class Flags : public flags::FlagsBase
+class Flags : public virtual flags::FlagsBase
 {
 public:
   Flags()
   {
-    add(&rootfs,
+    add(&Flags::rootfs,
         "rootfs",
         "The path to the root filesystem for the task");
 
     // The following flags are only applicable when a rootfs is
     // provisioned for this command.
-    add(&sandbox_directory,
+    add(&Flags::sandbox_directory,
         "sandbox_directory",
         "The absolute path for the directory in the container where the\n"
         "sandbox is mapped to");
 
-    add(&working_directory,
+    add(&Flags::working_directory,
         "working_directory",
         "The working directory for the task in the container.");
 
-    add(&user,
+    add(&Flags::user,
         "user",
         "The user that the task should be running as.");
 
-    add(&task_command,
+    add(&Flags::task_command,
         "task_command",
         "If specified, this is the overrided command for launching the\n"
         "task (instead of the command from TaskInfo).");
 
-    add(&launcher_dir,
+    add(&Flags::capabilities,
+        "capabilities",
+        "Capabilities the command can use.");
+
+    add(&Flags::launcher_dir,
         "launcher_dir",
         "Directory path of Mesos binaries.",
         PKGLIBEXECDIR);
@@ -853,6 +851,7 @@ public:
   Option<string> working_directory;
   Option<string> user;
   Option<string> task_command;
+  Option<mesos::CapabilityInfo> capabilities;
   string launcher_dir;
 };
 
@@ -863,9 +862,7 @@ int main(int argc, char** argv)
   mesos::FrameworkID frameworkId;
   mesos::ExecutorID executorId;
 
-#ifdef __WINDOWS__
-  process::Winsock winsock;
-#endif
+  process::initialize();
 
   // Load flags from command line.
   Try<flags::Warnings> load = flags.load(None(), &argc, &argv);
@@ -926,12 +923,18 @@ int main(int argc, char** argv)
           flags.working_directory,
           flags.user,
           flags.task_command,
+          flags.capabilities,
           frameworkId,
           executorId,
           shutdownGracePeriod));
 
   process::spawn(executor.get());
   process::wait(executor.get());
+  executor.reset();
 
+  // NOTE: We need to finalize libprocess, on Windows especially,
+  // as any binary that uses the networking stack on Windows must
+  // also clean up the networking stack before exiting.
+  process::finalize(true);
   return EXIT_SUCCESS;
 }

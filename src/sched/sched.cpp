@@ -14,14 +14,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __WINDOWS__
 #include <dlfcn.h>
+#endif // __WINDOWS__
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef __WINDOWS__
 #include <unistd.h>
+#endif // __WINDOWS__
 
+#ifndef __WINDOWS__
 #include <arpa/inet.h>
+#endif // __WINDOWS__
 
 #include <cmath>
 #include <iostream>
@@ -330,6 +336,11 @@ protected:
       LOG(INFO) << "New master detected at " << master.get().pid();
       link(master.get().pid());
 
+      // Cancel the pending registration timer to avoid spurious attempts
+      // at reregistration. `Clock::cancel` is idempotent, so this call
+      // is safe even if no timer is active or pending.
+      Clock::cancel(frameworkRegistrationTimer);
+
 #ifdef HAS_AUTHENTICATION
       if (credential.isSome()) {
         // Authenticate with the master.
@@ -554,6 +565,11 @@ protected:
         }
 
         const FrameworkID& frameworkId = event.subscribed().framework_id();
+
+        // Cancel the pending registration timer to avoid spurious attempts
+        // at reregistration. `Clock::cancel` is idempotent, so this call
+        // is safe even if no timer is active or pending.
+        Clock::cancel(frameworkRegistrationTimer);
 
         // We match the existing registration semantics of the
         // driver, except for the 3rd case in MESOS-786 (since
@@ -853,7 +869,7 @@ protected:
     VLOG(1) << "Will retry registration in " << delay << " if necessary";
 
     // Backoff.
-    process::delay(
+    frameworkRegistrationTimer = process::delay(
         delay, self(), &Self::doReliableRegistration, maxBackoff * 2);
   }
 
@@ -1300,8 +1316,15 @@ protected:
     if (!connected) {
       VLOG(1) << "Ignoring accept offers message as master is disconnected";
 
-      // NOTE: Reply to the framework with TASK_LOST messages for each
-      // task launch. See details from notes in launchTasks.
+      // Reply to the framework with TASK_DROPPED messages for each
+      // task launch. If the framework is not partition-aware, we send
+      // TASK_LOST instead. See details from notes in `launchTasks`.
+      TaskState newTaskState = TASK_DROPPED;
+      if (!protobuf::frameworkHasCapability(
+              framework, FrameworkInfo::Capability::PARTITION_AWARE)) {
+        newTaskState = TASK_LOST;
+      }
+
       foreach (const Offer::Operation& operation, operations) {
         if (operation.type() != Offer::Operation::LAUNCH) {
           continue;
@@ -1312,7 +1335,7 @@ protected:
               framework.id(),
               None(),
               task.task_id(),
-              TASK_LOST,
+              newTaskState,
               TaskStatus::SOURCE_MASTER,
               None(),
               "Master disconnected",
@@ -1641,6 +1664,9 @@ private:
   MasterDetector* detector;
 
   const internal::scheduler::Flags flags;
+
+  // Timer for triggering registration of the framework with the master.
+  process::Timer frameworkRegistrationTimer;
 
   hashmap<OfferID, hashmap<SlaveID, UPID>> savedOffers;
   hashmap<SlaveID, UPID> savedSlavePids;

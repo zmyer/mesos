@@ -13,6 +13,22 @@
 # Makefile for libprocess. Note that 3rdparty needs to be built
 # first (see 3rdparty/Makefile.am).
 
+# Enable common (and some language specific) warnings.
+AM_CXXFLAGS = -Wall
+# Warn when a comparison is made between signed and unsigned values.
+AM_CXXFLAGS += -Wsign-compare
+# Warn about use of format functions that can produce security issues.
+AM_CXXFLAGS += -Wformat-security
+
+# We will also have much more hardened/secured binaries and libraries.
+if ENABLE_HARDENING
+# Protect many of the functions with stack guards
+# (either -fstack-protector-strong or -fstack-protector depending on compiler support).
+AM_CXXFLAGS += @STACK_PROTECTOR@
+# Produce position independent code when appropriate.
+AM_CXXFLAGS += -fPIC -fPIE
+endif
+
 ACLOCAL_AMFLAGS = -I m4
 
 AUTOMAKE_OPTIONS = foreign
@@ -149,6 +165,7 @@ libprocess_la_SOURCES =		\
   src/latch.cpp			\
   src/logging.cpp		\
   src/metrics/metrics.cpp	\
+  src/mime.cpp			\
   src/pid.cpp			\
   src/poll_socket.cpp		\
   src/poll_socket.hpp		\
@@ -224,6 +241,7 @@ libprocess_tests_SOURCES =					\
   src/tests/http_tests.cpp					\
   src/tests/io_tests.cpp					\
   src/tests/limiter_tests.cpp					\
+  src/tests/loop_tests.cpp					\
   src/tests/main.cpp						\
   src/tests/metrics_tests.cpp					\
   src/tests/mutex_tests.cpp					\
@@ -232,6 +250,7 @@ libprocess_tests_SOURCES =					\
   src/tests/profiler_tests.cpp					\
   src/tests/queue_tests.cpp					\
   src/tests/reap_tests.cpp					\
+  src/tests/socket_tests.cpp					\
   src/tests/sequence_tests.cpp					\
   src/tests/shared_tests.cpp					\
   src/tests/statistics_tests.cpp				\
@@ -304,10 +323,10 @@ BUILT_SOURCES = $(BUNDLED_DEPS)
 # See the following discussion for the workaround:
 # http://lists.gnu.org/archive/html/automake/2013-01/msg00051.html
 check-local: tests
-	./libprocess-tests
+	$(TEST_DRIVER) ./libprocess-tests
 
 tests: all $(BUNDLED_DEPS)
-	$(MAKE) $(AM_MAKEFLAGS) libprocess-tests benchmarks
+	$(MAKE) $(AM_MAKEFLAGS) $(check_PROGRAMS)
 
 # TODO(benh): Fix shared builds (tests need libglog, libev, etc).
 

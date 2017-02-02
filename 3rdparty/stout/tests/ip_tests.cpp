@@ -31,7 +31,9 @@ using std::string;
 using std::vector;
 
 
-TEST(NetTest, LinkDevice)
+// TODO(hausdorff): Look into enabling this test on Windows. Currently `links`
+// is not implemented on Windows. See MESOS-5938.
+TEST_TEMP_DISABLED_ON_WINDOWS(NetTest, LinkDevice)
 {
   Try<set<string>> links = net::links();
   ASSERT_SOME(links);
@@ -44,12 +46,12 @@ TEST(NetTest, LinkDevice)
 
     if (network.isSome()) {
       string addr = stringify(network.get());
-      string prefix = addr.substr(addr.find("/") + 1);
-      ASSERT_SOME(numify<size_t>(prefix));
-      EXPECT_EQ(network.get().prefix(), numify<size_t>(prefix).get());
+      string prefix = addr.substr(addr.find('/') + 1);
+      ASSERT_SOME(numify<int>(prefix));
+      EXPECT_EQ(network.get().prefix(), numify<int>(prefix).get());
 
       vector<string> tokens =
-        strings::split(addr.substr(0, addr.find("/")), ".");
+        strings::split(addr.substr(0, addr.find('/')), ".");
 
       EXPECT_EQ(4u, tokens.size());
 

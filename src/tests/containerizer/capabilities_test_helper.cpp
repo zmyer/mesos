@@ -35,8 +35,6 @@
 
 #include "tests/containerizer/capabilities_test_helper.hpp"
 
-namespace capabilities = mesos::internal::capabilities;
-
 using std::cerr;
 using std::set;
 using std::endl;
@@ -56,11 +54,11 @@ const char CapabilitiesTestHelper::NAME[] = "Capabilities";
 
 CapabilitiesTestHelper::Flags::Flags()
 {
-  add(&user,
+  add(&Flags::user,
       "user",
       "User to be used for the test.");
 
-  add(&capabilities,
+  add(&Flags::capabilities,
       "capabilities",
       "Capabilities to be set for the process.");
 }

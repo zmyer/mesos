@@ -25,6 +25,7 @@
 #include <mesos/slave/containerizer.hpp>
 
 #include <process/future.hpp>
+#include <process/http.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
 
@@ -92,11 +93,24 @@ public:
 
   // Launch a nested container.
   // TODO(jieyu): Consider combining with the 'launch' above.
-  virtual process::Future<Nothing> launch(
+  //
+  // TODO(gilbert): Remove the 'slaveId' once the fetcher does
+  // not rely on SlaveID.
+  virtual process::Future<bool> launch(
       const ContainerID& containerId,
       const CommandInfo& commandInfo,
       const Option<ContainerInfo>& containerInfo,
-      const Resources& resources)
+      const Option<std::string>& user,
+      const SlaveID& slaveId,
+      const Option<mesos::slave::ContainerClass>& containerClass = None())
+  {
+    return process::Failure("Unsupported");
+  }
+
+  // Create an HTTP connection that can be used to "attach" (i.e.,
+  // stream input to or stream output from) a container.
+  virtual process::Future<process::http::Connection> attach(
+      const ContainerID& containerId)
   {
     return process::Failure("Unsupported");
   }

@@ -15,8 +15,6 @@
 
 #include <mesos/mesos.hpp>
 
-#include <mesos/v1/mesos.hpp>
-
 #include <mesos/authorizer/acls.hpp>
 
 #include <mesos/module/module.hpp>
@@ -87,20 +85,6 @@ inline Try<mesos::ContainerInfo> parse(const std::string& value)
 
   // Convert from JSON to Protobuf.
   return protobuf::parse<mesos::ContainerInfo>(json.get());
-}
-
-
-template <>
-inline Try<mesos::v1::TaskGroupInfo> parse(const std::string& value)
-{
-  // Convert from string or file to JSON.
-  Try<JSON::Object> json = parse<JSON::Object>(value);
-  if (json.isError()) {
-    return Error(json.error());
-  }
-
-  // Convert from JSON to Protobuf.
-  return protobuf::parse<mesos::v1::TaskGroupInfo>(json.get());
 }
 
 
@@ -188,6 +172,48 @@ inline Try<mesos::CapabilityInfo> parse(const std::string& value)
   }
 
   return protobuf::parse<mesos::CapabilityInfo>(json.get());
+}
+
+
+template <>
+inline Try<mesos::RLimitInfo> parse(const std::string& value)
+{
+  Try<JSON::Object> json = parse<JSON::Object>(value);
+  if (json.isError()) {
+    return Error(json.error());
+  }
+
+  return protobuf::parse<mesos::RLimitInfo>(json.get());
+}
+
+
+template <>
+inline Try<mesos::FrameworkID> parse(const std::string& value)
+{
+  mesos::FrameworkID frameworkId;
+  frameworkId.set_value(value);
+
+  return frameworkId;
+}
+
+
+template <>
+inline Try<mesos::ExecutorID> parse(const std::string& value)
+{
+  mesos::ExecutorID executorId;
+  executorId.set_value(value);
+
+  return executorId;
+}
+
+
+template <>
+inline Try<mesos::SlaveID> parse(const std::string& value)
+{
+  mesos::SlaveID slaveId;
+  slaveId.set_value(value);
+
+  return slaveId;
 }
 
 } // namespace flags {

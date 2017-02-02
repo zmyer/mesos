@@ -52,6 +52,44 @@ Option<Error> validate(
 } // namespace call {
 } // namespace master {
 
+
+namespace framework {
+namespace internal {
+
+// Validates the roles in given FrameworkInfo. Role, roles and
+// MULTI_ROLE should be set according to following matrix. Also,
+// roles should not contain duplicate entries.
+//
+// -- MULTI_ROLE is NOT set --
+// +-------+-------+---------+
+// |       |Roles  |No Roles |
+// +-------+-------+---------+
+// |Role   | Error |  None   |
+// +-------+-------+---------+
+// |No Role| Error |  None   |
+// +-------+-------+---------+
+//
+// ---- MULTI_ROLE is set ----
+// +-------+-------+---------+
+// |       |Roles  |No Roles |
+// +-------+-------+---------+
+// |Role   | Error |  Error  |
+// +-------+-------+---------+
+// |No Role| None  |  None   |
+// +-------+-------+---------+
+Option<Error> validateRoles(const mesos::FrameworkInfo& frameworkInfo);
+
+} // namespace internal {
+
+// Validate a FrameworkInfo.
+//
+// TODO(jay_guo): This currently only validates
+// the role(s), validate more fields!
+Option<Error> validate(const mesos::FrameworkInfo& frameworkInfo);
+
+} // namespace framework {
+
+
 namespace scheduler {
 namespace call {
 
@@ -63,6 +101,7 @@ Option<Error> validate(
 
 } // namespace call {
 } // namespace scheduler {
+
 
 namespace resource {
 
@@ -79,6 +118,8 @@ namespace executor {
 
 // Functions in this namespace are only exposed for testing.
 namespace internal {
+
+Option<Error> validateExecutorID(const ExecutorInfo& executor);
 
 // Validates that fields are properly set depending on the type of the executor.
 Option<Error> validateType(const ExecutorInfo& executor);
@@ -113,6 +154,9 @@ Option<Error> validateTaskAndExecutorResources(const TaskInfo& task);
 
 // Validates the kill policy of the task.
 Option<Error> validateKillPolicy(const TaskInfo& task);
+
+// Validates the check of the task.
+Option<Error> validateCheck(const TaskInfo& task);
 
 // Validates the health check of the task.
 Option<Error> validateHealthCheck(const TaskInfo& task);
@@ -184,7 +228,8 @@ namespace operation {
 // Validates the RESERVE operation.
 Option<Error> validate(
     const Offer::Operation::Reserve& reserve,
-    const Option<std::string>& principal);
+    const Option<std::string>& principal,
+    const Option<std::string>& role);
 
 
 // Validates the UNRESERVE operation.
@@ -194,10 +239,14 @@ Option<Error> validate(const Offer::Operation::Unreserve& unreserve);
 // Validates the CREATE operation. We need slave's checkpointed resources so
 // that we can validate persistence ID uniqueness, and we need the principal to
 // verify that it's equal to the one in `DiskInfo.Persistence.principal`.
+// We need the FrameworkInfo (unless the operation is requested by the
+// operator) to ensure shared volumes are created by frameworks with the
+// appropriate capability.
 Option<Error> validate(
     const Offer::Operation::Create& create,
     const Resources& checkpointedResources,
-    const Option<std::string>& principal);
+    const Option<std::string>& principal,
+    const Option<FrameworkInfo>& frameworkInfo = None());
 
 
 // Validates the DESTROY operation. We need slave's checkpointed

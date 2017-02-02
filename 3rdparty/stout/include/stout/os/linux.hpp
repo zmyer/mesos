@@ -10,13 +10,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef __STOUT_OS_POSIX_HPP__
-#define __STOUT_OS_POSIX_HPP__
+#ifndef __STOUT_OS_LINUX_HPP__
+#define __STOUT_OS_LINUX_HPP__
 
 // This file contains Linux-only OS utilities.
 #ifndef __linux__
 #error "stout/os/linux.hpp is only available on Linux systems."
-#endif
+#endif // __linux__
 
 #include <sys/types.h> // For pid_t.
 
@@ -49,32 +49,94 @@ static int childMain(void* _func)
 }
 
 
-inline pid_t clone(const lambda::function<int()>& func, int flags)
+// Helper that captures information about a stack to be used when
+// invoking clone.
+class Stack
+{
+public:
+  // 8 MiB is the default for "ulimit -s" on OSX and Linux.
+  static constexpr size_t DEFAULT_SIZE = 8 * 1024 * 1024;
+
+  // Allocate a stack.
+  static Try<Stack> create(size_t size)
+  {
+    Stack stack(size);
+
+    // Allocate and align the memory to 16 bytes.
+    // x86, x64, and AArch64/ARM64 all expect a 16 byte aligned stack.
+    // ARM64/aarch64 enforces the alignment where x86/x64 does not.
+    // Without this alignment Mesos will crash with a SIGBUS on ARM64/aarch64.
+    int err = ::posix_memalign(
+                reinterpret_cast<void**>(&stack.address),
+                os::pagesize(),
+                stack.size);
+    if (err) {
+      return ErrnoError("Failed to allocate and align stack");
+    }
+
+    return stack;
+  }
+
+  // Explicitly free the stack.
+  // The destructor won't free the allocated stack.
+  void deallocate()
+  {
+    ::free(address);
+    address = nullptr;
+    size = 0;
+  }
+
+  // Stack grows down, return the first usable address.
+  char* start()
+  {
+    return address + size;
+  }
+
+private:
+  explicit Stack(size_t size_) : size(size_) {}
+
+  size_t size;
+  char* address;
+};
+
+
+inline pid_t clone(
+    const lambda::function<int()>& func,
+    int flags,
+    Option<Stack> stack = None())
 {
   // Stack for the child.
-  // - unsigned long long used for best alignment.
-  // - 8 MiB appears to be the default for "ulimit -s" on OSX and Linux.
   //
   // NOTE: We need to allocate the stack dynamically. This is because
   // glibc's 'clone' will modify the stack passed to it, therefore the
   // stack must NOT be shared as multiple 'clone's can be invoked
   // simultaneously.
-  int stackSize = 8 * 1024 * 1024;
-  unsigned long long *stack =
-    new unsigned long long[stackSize/sizeof(unsigned long long)];
 
-  pid_t pid = ::clone(
-      childMain,
-      &stack[stackSize/sizeof(stack[0]) - 1],  // stack grows down.
-      flags,
-      (void*) &func);
+  bool cleanup = false;
+  if (stack.isNone()) {
+    Try<Stack> _stack = Stack::create(Stack::DEFAULT_SIZE);
+    if (_stack.isError()) {
+        return -1;
+    }
+    stack = _stack.get();
+    cleanup = true;
+  }
 
-  // If CLONE_VM is not set, ::clone would create a process which runs in a
-  // separate copy of the memory space of the calling process. So we destroy the
-  // stack here to avoid memory leak. If CLONE_VM is set, ::clone would create a
-  // thread which runs in the same memory space with the calling process.
-  if (!(flags & CLONE_VM)) {
-    delete[] stack;
+  pid_t pid = ::clone(childMain, stack->start(), flags, (void*) &func);
+
+  // Given we allocated the stack ourselves, there are two
+  // circumstances where we need to delete the allocated stack to
+  // avoid a memory leak:
+  //
+  // (1) Failed to clone.
+  //
+  // (2) CLONE_VM is not set implying ::clone will create a process
+  //     which runs in its own copy of the memory space of the
+  //     calling process. If CLONE_VM is set ::clone will create a
+  //     thread which runs in the same memory space with the calling
+  //     process, in which case we don't want to call delete!
+  if (cleanup && (pid < 0 || !(flags & CLONE_VM))) {
+    stack->deallocate();
   }
 
   return pid;
@@ -164,4 +226,4 @@ inline Try<Memory> memory()
 
 } // namespace os {
 
-#endif // __STOUT_OS_POSIX_HPP__
+#endif // __STOUT_OS_LINUX_HPP__

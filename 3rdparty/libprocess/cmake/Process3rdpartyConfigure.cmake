@@ -62,6 +62,7 @@ set(NVML_INCLUDE_DIR        ${NVML_ROOT})
 set(PICOJSON_INCLUDE_DIR    ${PICOJSON_ROOT})
 
 if (WIN32)
+  set(APR_INCLUDE_DIR      ${LIBAPR_ROOT}/include ${LIBAPR_ROOT}-build)
   set(CURL_INCLUDE_DIR     ${CURL_ROOT}/include)
   set(GLOG_INCLUDE_DIR     ${GLOG_ROOT}/src/windows)
   set(PROTOBUF_INCLUDE_DIR ${PROTOBUF_ROOT}/src)
@@ -128,41 +129,3 @@ endif (NOT WIN32)
 #######################################################################
 include(StoutConfigure)
 include(ProcessConfigure)
-
-# DEFINE MESOS BUILD TARGETS.
-#############################
-
-# Define target for agent.
-set(
-  AGENT_TARGET mesos-agent
-  CACHE STRING "Target we use to refer to agent executable")
-
-# Define target for containerizer.
-set(
-  MESOS_CONTAINERIZER mesos-containerizer
-  CACHE STRING "Target for containerizer")
-
-# Define target for command executor.
-set(
-  MESOS_EXECUTOR mesos-executor
-  CACHE STRING "Target for executor")
-
-# Define target for fetcher.
-set(
-  MESOS_FETCHER mesos-fetcher
-  CACHE STRING "Target for fetcher")
-
-# Define target for master.
-set(
-  MESOS_MASTER mesos-master
-  CACHE STRING "Target for master")
-
-# Define target for usage.
-set(
-  MESOS_USAGE mesos-usage
-  CACHE STRING "Target for usage")
-
-# Define target for docker executor.
-set(
-  MESOS_DOCKER_EXECUTOR mesos-docker-executor
-  CACHE STRING "Target for docker executor")

@@ -67,8 +67,9 @@ constexpr double GC_DISK_HEADROOM = 0.1;
 // Maximum number of completed frameworks to store in memory.
 constexpr size_t MAX_COMPLETED_FRAMEWORKS = 50;
 
-// Maximum number of completed executors per framework to store in memory.
-constexpr size_t MAX_COMPLETED_EXECUTORS_PER_FRAMEWORK = 150;
+// Default maximum number of completed executors per framework
+// to store in memory.
+constexpr size_t DEFAULT_MAX_COMPLETED_EXECUTORS_PER_FRAMEWORK = 150;
 
 // Maximum number of completed tasks per executor to store in memory.
 constexpr size_t MAX_COMPLETED_TASKS_PER_EXECUTOR = 200;
@@ -136,11 +137,6 @@ constexpr Bytes DEFAULT_FETCHER_CACHE_SIZE = Gigabytes(2);
 // If no pings received within this timeout, then the slave will
 // trigger a re-detection of the master to cause a re-registration.
 Duration DEFAULT_MASTER_PING_TIMEOUT();
-
-// Default path of the agent runtime directory. This is where runtime
-// data is stored by an agent that it needs to persist across crashes
-// (but not across reboots). This directory will be cleared on reboot.
-constexpr char DEFAULT_RUNTIME_DIRECTORY[] = "/var/run/mesos";
 
 // Name of the executable for default executor.
 constexpr char MESOS_DEFAULT_EXECUTOR[] = "mesos-default-executor";

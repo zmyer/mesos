@@ -48,8 +48,23 @@ constexpr char DEFAULT_HTTP_AUTHENTICATOR[] = "basic";
 
 extern hashset<std::string> AUTHORIZABLE_ENDPOINTS;
 
+
+// Contains the media types corresponding to some of the "Content-*",
+// "Accept-*" and "Message-*" prefixed request headers in our internal
+// representation.
+struct RequestMediaTypes
+{
+  ContentType content; // 'Content-Type' header.
+  ContentType accept; // 'Accept' header.
+  Option<ContentType> messageContent; // 'Message-Content-Type' header.
+  Option<ContentType> messageAccept; // 'Message-Accept' header.
+};
+
+
 // Serializes a protobuf message for transmission
 // based on the HTTP content type.
+// NOTE: For streaming `contentType`, `message` would not
+// be serialized in "Record-IO" format.
 std::string serialize(
     ContentType contentType,
     const google::protobuf::Message& message);
@@ -78,10 +93,18 @@ Try<Message> deserialize(
 
       return ::protobuf::parse<Message>(value.get());
     }
+    case ContentType::RECORDIO: {
+      return Error("Deserializing a RecordIO stream is not supported");
+    }
   }
 
   UNREACHABLE();
 }
+
+
+// Returns true if the media type can be used for
+// streaming requests/responses.
+bool streamingMediaType(ContentType contentType);
 
 
 JSON::Object model(const Resources& resources);
@@ -180,7 +203,7 @@ bool approveViewRole(
  */
 Try<Nothing> initializeHttpAuthenticators(
     const std::string& realm,
-    const std::vector<std::string>& authenticatorNames,
+    const std::vector<std::string>& httpAuthenticatorNames,
     const Option<Credentials>& credentials);
 
 } // namespace mesos {

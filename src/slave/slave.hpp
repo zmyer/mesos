@@ -38,6 +38,7 @@
 
 #include <mesos/module/authenticatee.hpp>
 
+#include <mesos/slave/containerizer.hpp>
 #include <mesos/slave/qos_controller.hpp>
 #include <mesos/slave/resource_estimator.hpp>
 
@@ -51,6 +52,7 @@
 #include <process/protobuf.hpp>
 #include <process/shared.hpp>
 
+#include <stout/boundedhashmap.hpp>
 #include <stout/bytes.hpp>
 #include <stout/linkedhashmap.hpp>
 #include <stout/hashmap.hpp>
@@ -63,6 +65,7 @@
 
 #include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
+#include "common/recordio.hpp"
 
 #include "files/files.hpp"
 
@@ -92,8 +95,6 @@ class Authorizer;
 namespace internal {
 
 namespace slave {
-
-using namespace process;
 
 // Some forward declarations.
 class StatusUpdateManager;
@@ -145,7 +146,7 @@ public:
       const ExecutorInfo& executorInfo,
       Option<TaskInfo> task,
       Option<TaskGroupInfo> taskGroup,
-      const UPID& pid);
+      const process::UPID& pid);
 
   // Made 'virtual' for Slave mocking.
   virtual void _run(
@@ -157,7 +158,7 @@ public:
 
   // Made 'virtual' for Slave mocking.
   virtual void runTaskGroup(
-      const process::UPID& upid,
+      const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
       const ExecutorInfo& executorInfo,
       const TaskGroupInfo& taskGroupInfo);
@@ -243,12 +244,12 @@ public:
       StatusUpdate update,
       const Option<process::UPID>& pid,
       const ExecutorID& executorId,
-      const Future<ContainerStatus>& containerStatus);
+      const process::Future<ContainerStatus>& future);
 
   // Continue handling the status update after optionally updating the
   // container's resources.
   void __statusUpdate(
-      const Option<Future<Nothing>>& future,
+      const Option<process::Future<Nothing>>& future,
       const StatusUpdate& update,
       const Option<process::UPID>& pid,
       const ExecutorID& executorId,
@@ -305,7 +306,7 @@ public:
 
   // Invoked whenever the detector detects a change in masters.
   // Made public for testing purposes.
-  void detected(const process::Future<Option<MasterInfo>>& pid);
+  void detected(const process::Future<Option<MasterInfo>>& _master);
 
   enum State
   {
@@ -314,6 +315,19 @@ public:
     RUNNING,      // Slave has (re-)registered.
     TERMINATING,  // Slave is shutting down.
   } state;
+
+  // Describes information about agent recovery.
+  struct RecoveryInfo
+  {
+    // Flag to indicate if recovery, including reconciling
+    // (i.e., reconnect/kill) with executors is finished.
+    process::Promise<Nothing> recovered;
+
+    // Flag to indicate that HTTP based executors can
+    // subscribe with the agent. We allow them to subscribe
+    // after the agent recovers the containerizer.
+    bool reconnect = false;
+  } recoveryInfo;
 
   // TODO(benh): Clang requires members to be public in order to take
   // their address which we do in tests (for things like
@@ -353,6 +367,8 @@ public:
       const FrameworkID& frameworkId,
       const ExecutorID& executorId);
 
+  Executor* getExecutor(const ContainerID& containerId) const;
+
   // Returns an ExecutorInfo for a TaskInfo (possibly
   // constructing one if the task has a CommandInfo).
   ExecutorInfo getExecutorInfo(
@@ -376,7 +392,7 @@ public:
   void checkDiskUsage();
 
   // Recovers the slave, status update manager and isolator.
-  process::Future<Nothing> recover(const Result<state::State>& state);
+  process::Future<Nothing> recover(const Try<state::State>& state);
 
   // This is called after 'recover()'. If 'flags.reconnect' is
   // 'reconnect', the slave attempts to reconnect to any old live
@@ -404,7 +420,7 @@ public:
   virtual void removeFramework(Framework* framework);
 
   // Schedules a 'path' for gc based on its modification time.
-  Future<Nothing> garbageCollect(const std::string& path);
+  process::Future<Nothing> garbageCollect(const std::string& path);
 
   // Called when the slave was signaled from the specified user.
   void signaled(int signal, int uid);
@@ -448,7 +464,7 @@ private:
   process::Future<bool> authorizeLogAccess(
       const Option<std::string>& principal);
 
-  Future<bool> authorizeSandboxAccess(
+  process::Future<bool> authorizeSandboxAccess(
       const Option<std::string>& principal,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId);
@@ -459,7 +475,8 @@ private:
   {
   public:
     explicit Http(Slave* _slave)
-    : slave(_slave), statisticsLimiter(new RateLimiter(2, Seconds(1))) {}
+      : slave(_slave),
+        statisticsLimiter(new process::RateLimiter(2, Seconds(1))) {}
 
     // Logs the request, route handlers can compose this with the
     // desired request handler to get consistent request logging.
@@ -510,6 +527,16 @@ private:
   private:
     JSON::Object _flags() const;
 
+    // Continuation for `/api` endpoint that handles streaming and non-streaming
+    // requests. In case of a streaming request, `call` would be the first
+    // record and additional records can be read using the `reader`. For
+    // non-streaming requests, `reader` would be set to `None()`.
+    process::Future<process::http::Response> _api(
+        const agent::Call& call,
+        Option<process::Owned<recordio::Reader<agent::Call>>>&& reader,
+        const RequestMediaTypes& mediaTypes,
+        const Option<std::string>& principal) const;
+
     // Make continuation for `statistics` `static` as it might
     // execute when the invoking `Http` is already destructed.
     process::http::Response _statistics(
@@ -518,10 +545,12 @@ private:
 
     // Continuation for `/containers` endpoint
     process::Future<process::http::Response> _containers(
-        const process::http::Request& request) const;
+        const process::http::Request& request,
+        const Option<std::string>& principal) const;
 
     // Helper function to collect containers status and resource statistics.
-    process::Future<JSON::Array> __containers() const;
+    process::Future<JSON::Array> __containers(
+        Option<process::Owned<ObjectApprover>> approver) const;
 
     // Helper routines for endpoint authorization.
     Try<std::string> extractEndpoint(const process::http::URL& url) const;
@@ -530,61 +559,61 @@ private:
 
     process::Future<process::http::Response> getFlags(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> getHealth(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> getVersion(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> getMetrics(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> getLoggingLevel(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> setLoggingLevel(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> listFiles(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> getContainers(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> readFile(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> getFrameworks(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     mesos::agent::Response::GetFrameworks _getFrameworks(
         const process::Owned<ObjectApprover>& frameworksApprover) const;
 
     process::Future<process::http::Response> getExecutors(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     mesos::agent::Response::GetExecutors _getExecutors(
         const process::Owned<ObjectApprover>& frameworksApprover,
@@ -592,8 +621,8 @@ private:
 
     process::Future<process::http::Response> getTasks(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     mesos::agent::Response::GetTasks _getTasks(
         const process::Owned<ObjectApprover>& frameworksApprover,
@@ -602,8 +631,8 @@ private:
 
     process::Future<process::http::Response> getState(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     mesos::agent::Response::GetState _getState(
         const process::Owned<ObjectApprover>& frameworksApprover,
@@ -612,23 +641,56 @@ private:
 
     process::Future<process::http::Response> launchNestedContainer(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
+
+    process::Future<process::http::Response> _launchNestedContainer(
+        const ContainerID& containerId,
+        const CommandInfo& commandInfo,
+        const Option<ContainerInfo>& containerInfo,
+        const Option<mesos::slave::ContainerClass>& containerClass,
+        ContentType acceptType,
+        const process::Owned<ObjectApprover>& approver) const;
 
     process::Future<process::http::Response> waitNestedContainer(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> killNestedContainer(
         const mesos::agent::Call& call,
-        const Option<std::string>& principal,
-        ContentType contentType) const;
+        ContentType acceptType,
+        const Option<std::string>& principal) const;
+
+    process::Future<process::http::Response> launchNestedContainerSession(
+        const mesos::agent::Call& call,
+        const RequestMediaTypes& mediaTypes,
+        const Option<std::string>& principal) const;
+
+    process::Future<process::http::Response> attachContainerInput(
+        const mesos::agent::Call& call,
+        process::Owned<recordio::Reader<agent::Call>>&& decoder,
+        const RequestMediaTypes& mediaTypes,
+        const Option<std::string>& principal) const;
+
+    process::Future<process::http::Response> _attachContainerInput(
+        const mesos::agent::Call& call,
+        process::Owned<recordio::Reader<agent::Call>>&& decoder,
+        const RequestMediaTypes& mediaTypes) const;
+
+    process::Future<process::http::Response> attachContainerOutput(
+        const mesos::agent::Call& call,
+        const RequestMediaTypes& mediaTypes,
+        const Option<std::string>& principal) const;
+
+    process::Future<process::http::Response> _attachContainerOutput(
+        const mesos::agent::Call& call,
+        const RequestMediaTypes& mediaTypes) const;
 
     Slave* slave;
 
     // Used to rate limit the statistics endpoint.
-    Shared<RateLimiter> statisticsLimiter;
+    process::Shared<process::RateLimiter> statisticsLimiter;
   };
 
   friend struct Framework;
@@ -641,12 +703,12 @@ private:
   // Gauge methods.
   double _frameworks_active()
   {
-    return frameworks.size();
+    return static_cast<double>(frameworks.size());
   }
 
   double _uptime_secs()
   {
-    return (Clock::now() - startTime).secs();
+    return (process::Clock::now() - startTime).secs();
   }
 
   double _registered()
@@ -694,7 +756,7 @@ private:
 
   hashmap<FrameworkID, Framework*> frameworks;
 
-  boost::circular_buffer<process::Owned<Framework>> completedFrameworks;
+  BoundedHashMap<FrameworkID, process::Owned<Framework>> completedFrameworks;
 
   mesos::master::detector::MasterDetector* detector;
 
@@ -728,9 +790,8 @@ private:
   // the master.
   process::Timer pingTimer;
 
-  // Flag to indicate if recovery, including reconciling (i.e., reconnect/kill)
-  // with executors is finished.
-  process::Promise<Nothing> recovered;
+  // Timer for triggering agent (re)registration after detecting a new master.
+  process::Timer agentRegistrationTimer;
 
   // Root meta directory containing checkpointed data.
   const std::string metaDir;
@@ -746,7 +807,7 @@ private:
   Authenticatee* authenticatee;
 
   // Indicates if an authentication attempt is in progress.
-  Option<Future<bool>> authenticating;
+  Option<process::Future<bool>> authenticating;
 
   // Indicates if the authentication is successful.
   bool authenticated;
@@ -819,6 +880,7 @@ struct Executor
       const ExecutorInfo& info,
       const ContainerID& containerId,
       const std::string& directory,
+      const Option<std::string>& user,
       bool checkpoint);
 
   ~Executor();
@@ -900,6 +962,11 @@ struct Executor
 
   const std::string directory;
 
+  // The sandbox will be owned by this user and the executor will
+  // run as this user. This can be set to None when --switch_user
+  // is false or when compiled for Windows.
+  const Option<std::string> user;
+
   const bool checkpoint;
 
   // An Executor can either be connected via HTTP or by libprocess
@@ -964,6 +1031,7 @@ struct Framework
 {
   Framework(
       Slave* slave,
+      const Flags& slaveFlags,
       const FrameworkInfo& info,
       const Option<process::UPID>& pid);
 
@@ -988,19 +1056,21 @@ struct Framework
     TERMINATING,  // Framework is shutting down in the cluster.
   } state;
 
-  // We store the pointer to 'Slave' to get access to its methods
-  // variables. One could imagine 'Framework' as being an inner class
-  // of the 'Slave' class.
+  // We store the pointer to 'Slave' to get access to its methods and
+  // variables. One could imagine 'Framework' being an inner class of
+  // the 'Slave' class.
   Slave* slave;
 
   const FrameworkInfo info;
+
+  protobuf::framework::Capabilities capabilities;
 
   // Frameworks using the scheduler driver will have a 'pid',
   // which allows us to send executor messages directly to the
   // driver. Frameworks using the HTTP API (in 0.24.0) will
   // not have a 'pid', in which case executor messages are
   // sent through the master.
-  Option<UPID> pid;
+  Option<process::UPID> pid;
 
   // Executors with pending tasks.
   hashmap<ExecutorID, hashmap<TaskID, TaskInfo>> pending;
@@ -1008,8 +1078,27 @@ struct Framework
   // Current running executors.
   hashmap<ExecutorID, Executor*> executors;
 
-  // Up to MAX_COMPLETED_EXECUTORS_PER_FRAMEWORK completed executors.
   boost::circular_buffer<process::Owned<Executor>> completedExecutors;
+
+  bool hasTask(const TaskID& taskId)
+  {
+    foreachkey (const ExecutorID& executorId, pending) {
+      if (pending[executorId].contains(taskId)) {
+        return true;
+      }
+    }
+
+    foreachvalue (Executor* executor, executors) {
+      if (executor->queuedTasks.contains(taskId) ||
+          executor->launchedTasks.contains(taskId) ||
+          executor->terminatedTasks.contains(taskId)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
 private:
   Framework(const Framework&);              // No copying.
   Framework& operator=(const Framework&); // No assigning.

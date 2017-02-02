@@ -90,7 +90,7 @@ endif (WIN32)
 # libraries, we might as well move them to a library folder.)
 if (NOT WIN32)
   set(GLOG_CONFIG_CMD  ${GLOG_ROOT}/src/../configure --prefix=${GLOG_LIB_ROOT})
-  set(GLOG_BUILD_CMD   make)
+  set(GLOG_BUILD_CMD   make libglog.la)
   set(GLOG_INSTALL_CMD make install)
   # Patch glog to deal with a problem that appears when compiling on clang
   # under the C++11 standard. cf. MESOS-860, MESOS-966.
@@ -124,20 +124,26 @@ endif (NOT WIN32)
 set(HTTP_PARSER_UPDATE_CMD ${CMAKE_COMMAND} -E copy ${MESOS_3RDPARTY_SRC}/http-parser/CMakeLists.txt.template ${HTTP_PARSER_ROOT}/CMakeLists.txt)
 
 if (NOT WIN32)
-  set(HTTP_PARSER_PATCH_CMD  ${CMAKE_NOOP})
+  PATCH_CMD(${MESOS_3RDPARTY_SRC}/http-parser-${HTTP_PARSER_VERSION}.patch HTTP_PARSER_PATCH_CMD)
 elseif (WIN32)
   # Set the patch command which will utilize patch.exe under
   # `\Users\<user>\AppData\Local\Temp with no elevation prompt`
-  set(HTTP_PARSER_PATCH_CMD ${PATCHEXE_LOCATION} --binary -p1 < ${MESOS_3RDPARTY_BIN}/http-parser-${HTTP_PARSER_VERSION}.patch)
+  set(HTTP_PARSER_PATCH_CMD ${PATCHEXE_LOCATION} --binary -p1 < ${MESOS_3RDPARTY_SRC}/http-parser-${HTTP_PARSER_VERSION}.patch)
 endif (NOT WIN32)
 
 set(LIBEVENT_CMAKE_ARGS
   ${LIBEVENT_CMAKE_ARGS}
   -LH
-  -DCMAKE_C_FLAGS=-fPIC
   -DEVENT__HAVE_SYS_STAT_H=1
   -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}
   )
+
+if (NOT WIN32)
+  set(LIBEVENT_CMAKE_ARGS
+    ${LIBEVENT_CMAKE_ARGS}
+    -DCMAKE_C_FLAGS=-fPIC
+    )
+endif (NOT WIN32)
 
 # Third-party libraries. Tell the build system how to pull in and build third-
 # party libraries at compile time, using the ExternalProject_Add macro.
@@ -265,7 +271,12 @@ endif (WIN32)
 # library tests (located in `3rdparty/`).
 ###############################################################################
 
-include(ProcessTestsConfigure)
+list(
+  APPEND CMAKE_MODULE_PATH
+  ${CMAKE_SOURCE_DIR}/3rdparty/stout/cmake
+  )
+include(StoutConfigure)
+include(StoutTestsConfigure)
 
 if (REBUNDLED)
   set(GMOCK_URL    ${REBUNDLED_DIR}/gmock-${GMOCK_VERSION}.tar.gz)
@@ -334,13 +345,6 @@ ExternalProject_Add(
 #
 # Builds, configures, and compiles the Stout tests.
 ###################################################
-
-list(
-  APPEND CMAKE_MODULE_PATH
-  ${CMAKE_SOURCE_DIR}/3rdparty/stout/cmake
-  )
-include(StoutConfigure)
-include(StoutTestsConfigure)
 add_subdirectory(stout/tests)
 
 
@@ -425,7 +429,7 @@ ExternalProject_Add(
 
 if (NOT WIN32)
   set(LEVELDB_CONFIG_CMD  cd ${LEVELDB_ROOT} && ./configure --prefix=${LEVELDB_ROOT}-lib)
-  set(LEVELDB_BUILD_CMD   cd ${LEVELDB_ROOT} && make)
+  set(LEVELDB_BUILD_CMD   cd ${LEVELDB_ROOT} && make OPT=-O2\ -g\ -fPIC)
   set(LEVELDB_INSTALL_CMD cd ${LEVELDB_ROOT} && make install)
   PATCH_CMD(
     ${MESOS_3RDPARTY_SRC}/leveldb-${LEVELDB_VERSION}.patch

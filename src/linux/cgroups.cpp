@@ -1074,6 +1074,33 @@ Try<Nothing> assign(const string& hierarchy, const string& cgroup, pid_t pid)
 }
 
 
+Try<Nothing> isolate(
+    const string& hierarchy,
+    const string& cgroup,
+    pid_t pid)
+{
+  // Create cgroup if necessary.
+  Try<bool> exists = cgroups::exists(hierarchy, cgroup);
+  if (exists.isError()) {
+    return Error("Failed to check existence of cgroup: " + exists.error());
+  }
+
+  if (!exists.get()) {
+    Try<Nothing> create = cgroups::create(hierarchy, cgroup, true);
+    if (create.isError()) {
+      return Error("Failed to create cgroup: " + create.error());
+    }
+  }
+
+  Try<Nothing> assign = cgroups::assign(hierarchy, cgroup, pid);
+  if (assign.isError()) {
+    return Error("Failed to assign process to cgroup: " + assign.error());
+  }
+
+  return Nothing();
+}
+
+
 namespace event {
 
 #ifndef EFD_SEMAPHORE
@@ -1594,14 +1621,25 @@ private:
       terminate(self());
       return;
     } else if (future.isFailed()) {
-      promise.fail(future.failure());
+      // If the `cgroup` still exists in the hierarchy, treat this as
+      // an error; otherwise, treat this as a success since the `cgroup`
+      // has actually been cleaned up.
+      if (os::exists(path::join(hierarchy, cgroup))) {
+        promise.fail(future.failure());
+      } else {
+        promise.set(Nothing());
+      }
+
       terminate(self());
       return;
     }
 
     // Verify the cgroup is now empty.
     Try<set<pid_t>> processes = cgroups::processes(hierarchy, cgroup);
-    if (processes.isError() || !processes.get().empty()) {
+
+    // If the `cgroup` is already removed, treat this as a success.
+    if ((processes.isError() || !processes.get().empty()) &&
+        os::exists(path::join(hierarchy, cgroup))) {
       promise.fail("Failed to kill all processes in cgroup: " +
                    (processes.isError() ? processes.error()
                                         : "processes remain"));
@@ -1682,10 +1720,15 @@ private:
     foreach (const string& cgroup, cgroups) {
       Try<Nothing> remove = internal::remove(hierarchy, cgroup);
       if (remove.isError()) {
-        promise.fail(
-            "Failed to remove cgroup '" + cgroup + "': " + remove.error());
-        terminate(self());
-        return;
+        // If the `cgroup` still exists in the hierarchy, treat this as
+        // an error; otherwise, treat this as a success since the `cgroup`
+        // has actually been cleaned up.
+        if (os::exists(path::join(hierarchy, cgroup))) {
+          promise.fail(
+              "Failed to remove cgroup '" + cgroup + "': " + remove.error());
+          terminate(self());
+          return;
+        }
       }
     }
 
@@ -1735,7 +1778,12 @@ Future<Nothing> destroy(const string& hierarchy, const string& cgroup)
     foreach (const string& cgroup, candidates) {
       Try<Nothing> remove = cgroups::remove(hierarchy, cgroup);
       if (remove.isError()) {
-        return Failure(remove.error());
+        // If the `cgroup` still exists in the hierarchy, treat this as
+        // an error; otherwise, treat this as a success since the `cgroup`
+        // has actually been cleaned up.
+        if (os::exists(path::join(hierarchy, cgroup))) {
+          return Failure(remove.error());
+        }
       }
     }
   }

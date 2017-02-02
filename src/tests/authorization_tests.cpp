@@ -44,9 +44,12 @@ template <typename T>
 class AuthorizationTest : public MesosTest {};
 
 
-typedef ::testing::Types<LocalAuthorizer,
-                         tests::Module<Authorizer, TestLocalAuthorizer>>
-  AuthorizerTypes;
+typedef ::testing::Types<
+// TODO(josephw): Modules are not supported on Windows (MESOS-5994).
+#ifndef __WINDOWS__
+    tests::Module<Authorizer, TestLocalAuthorizer>,
+#endif // __WINDOWS__
+    LocalAuthorizer> AuthorizerTypes;
 
 
 TYPED_TEST_CASE(AuthorizationTest, AuthorizerTypes);
@@ -255,7 +258,7 @@ TYPED_TEST(AuthorizationTest, PrincipalRunAsAnyUser)
   {
     authorization::Request request;
     request.set_action(authorization::RUN_TASK);
-    request.mutable_subject()->set_value("foo");;
+    request.mutable_subject()->set_value("foo");
 
     FrameworkInfo frameworkInfo;
     frameworkInfo.set_user("user2");
@@ -671,9 +674,23 @@ TYPED_TEST(AuthorizationTest, AnyPrincipalOfferedRole)
   }
   {
     authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_framework_info()->set_role("*");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
     request.set_action(authorization::REGISTER_FRAMEWORK_WITH_ROLE);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->set_value("*");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_framework_info()->set_role("*");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
 }
@@ -707,6 +724,13 @@ TYPED_TEST(AuthorizationTest, SomePrincipalsOfferedRole)
   }
   {
     authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_framework_info()->set_role("ads");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
     request.set_action(authorization::REGISTER_FRAMEWORK_WITH_ROLE);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->set_value("ads");
@@ -714,9 +738,23 @@ TYPED_TEST(AuthorizationTest, SomePrincipalsOfferedRole)
   }
   {
     authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_framework_info()->set_role("ads");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
     request.set_action(authorization::REGISTER_FRAMEWORK_WITH_ROLE);
     request.mutable_subject()->set_value("baz");
     request.mutable_object()->set_value("ads");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("baz");
+    request.mutable_object()->mutable_framework_info()->set_role("ads");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
 }
@@ -754,6 +792,13 @@ TYPED_TEST(AuthorizationTest, PrincipalOfferedRole)
     request.mutable_object()->set_value("analytics");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_framework_info()->set_role("analytics");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   // Principal "bar" cannot be offered "analytics" role's resources.
   {
@@ -761,6 +806,13 @@ TYPED_TEST(AuthorizationTest, PrincipalOfferedRole)
     request.set_action(authorization::REGISTER_FRAMEWORK_WITH_ROLE);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->set_value("analytics");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_framework_info()->set_role("analytics");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 }
@@ -791,6 +843,13 @@ TYPED_TEST(AuthorizationTest, PrincipalNotOfferedAnyRoleRestrictive)
     request.mutable_object()->set_value("analytics");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_framework_info()->set_role("analytics");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   // Principal "bar" cannot be offered "analytics" role's resources.
   {
@@ -800,6 +859,13 @@ TYPED_TEST(AuthorizationTest, PrincipalNotOfferedAnyRoleRestrictive)
     request.mutable_object()->set_value("analytics");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_framework_info()->set_role("analytics");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
 
   // Principal "bar" cannot be offered "ads" role's resources because no ACL.
   {
@@ -807,6 +873,13 @@ TYPED_TEST(AuthorizationTest, PrincipalNotOfferedAnyRoleRestrictive)
     request.set_action(authorization::REGISTER_FRAMEWORK_WITH_ROLE);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->set_value("ads");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::REGISTER_FRAMEWORK);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_framework_info()->set_role("ads");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 }
@@ -853,6 +926,13 @@ TYPED_TEST(AuthorizationTest, Reserve)
     request.mutable_object()->set_value("bar");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::RESERVE_RESOURCES);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_resource()->set_role("bar");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   {
     authorization::Request request;
@@ -863,9 +943,23 @@ TYPED_TEST(AuthorizationTest, Reserve)
   }
   {
     authorization::Request request;
+    request.set_action(authorization::RESERVE_RESOURCES);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_resource()->set_role("awesome_role");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
     request.set_action(authorization::RESERVE_RESOURCES_WITH_ROLE);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->set_value("awesome_role");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::RESERVE_RESOURCES);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_resource()->set_role("awesome_role");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
 
@@ -878,6 +972,13 @@ TYPED_TEST(AuthorizationTest, Reserve)
     request.mutable_object()->set_value("ads");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::RESERVE_RESOURCES);
+    request.mutable_subject()->set_value("baz");
+    request.mutable_object()->mutable_resource()->set_role("ads");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   {
     authorization::Request request;
@@ -886,10 +987,23 @@ TYPED_TEST(AuthorizationTest, Reserve)
     request.mutable_object()->set_value("awesome_role");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::RESERVE_RESOURCES);
+    request.mutable_subject()->set_value("baz");
+    request.mutable_object()->mutable_resource()->set_role("awesome_role");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
 
   {
     authorization::Request request;
     request.set_action(authorization::RESERVE_RESOURCES_WITH_ROLE);
+    request.mutable_subject()->set_value("baz");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::RESERVE_RESOURCES);
     request.mutable_subject()->set_value("baz");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
@@ -902,6 +1016,13 @@ TYPED_TEST(AuthorizationTest, Reserve)
     request.set_action(authorization::RESERVE_RESOURCES_WITH_ROLE);
     request.mutable_subject()->set_value("zelda");
     request.mutable_object()->set_value("ads");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::RESERVE_RESOURCES);
+    request.mutable_subject()->set_value("zelda");
+    request.mutable_object()->mutable_resource()->set_role("ads");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 }
@@ -954,6 +1075,14 @@ TYPED_TEST(AuthorizationTest, Unreserve)
     request.mutable_object()->set_value("foo");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::UNRESERVE_RESOURCES);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_resource()
+        ->mutable_reservation()->set_principal("foo");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   // Principal "bar" cannot unreserve anyone's
   // resources, so requests 2 and 3 will fail.
@@ -964,12 +1093,28 @@ TYPED_TEST(AuthorizationTest, Unreserve)
     request.mutable_object()->set_value("foo");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::UNRESERVE_RESOURCES);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_resource()
+        ->mutable_reservation()->set_principal("foo");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
 
   {
     authorization::Request request;
     request.set_action(authorization::UNRESERVE_RESOURCES_WITH_PRINCIPAL);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->set_value("bar");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::UNRESERVE_RESOURCES);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_resource()
+        ->mutable_reservation()->set_principal("bar");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 
@@ -982,12 +1127,28 @@ TYPED_TEST(AuthorizationTest, Unreserve)
     request.mutable_object()->set_value("foo");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::UNRESERVE_RESOURCES);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_resource()
+        ->mutable_reservation()->set_principal("foo");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   {
     authorization::Request request;
     request.set_action(authorization::UNRESERVE_RESOURCES_WITH_PRINCIPAL);
     request.mutable_subject()->set_value("ops");
     request.mutable_object()->set_value("foo");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::UNRESERVE_RESOURCES);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_resource()
+        ->mutable_reservation()->set_principal("foo");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
   {
@@ -999,9 +1160,25 @@ TYPED_TEST(AuthorizationTest, Unreserve)
   }
   {
     authorization::Request request;
+    request.set_action(authorization::UNRESERVE_RESOURCES);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_resource()
+        ->mutable_reservation()->set_principal("bar");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
     request.set_action(authorization::UNRESERVE_RESOURCES_WITH_PRINCIPAL);
     request.mutable_subject()->set_value("ops");
     request.mutable_object()->set_value("ops");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::UNRESERVE_RESOURCES);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_resource()
+        ->mutable_reservation()->set_principal("ops");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
 
@@ -1013,6 +1190,14 @@ TYPED_TEST(AuthorizationTest, Unreserve)
     request.set_action(authorization::UNRESERVE_RESOURCES_WITH_PRINCIPAL);
     request.mutable_subject()->set_value("zelda");
     request.mutable_object()->set_value("foo");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::UNRESERVE_RESOURCES);
+    request.mutable_subject()->set_value("zelda");
+    request.mutable_object()->mutable_resource()
+        ->mutable_reservation()->set_principal("foo");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 }
@@ -1064,6 +1249,13 @@ TYPED_TEST(AuthorizationTest, CreateVolume)
     request.mutable_object()->set_value("awesome_role");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::CREATE_VOLUME);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_resource()->set_role("awesome_role");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   // Principal "bar" can create volumes for the "panda" role,
   // so this request will pass.
@@ -1072,6 +1264,13 @@ TYPED_TEST(AuthorizationTest, CreateVolume)
     request.set_action(authorization::CREATE_VOLUME_WITH_ROLE);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->set_value("panda");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::CREATE_VOLUME);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_resource()->set_role("panda");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
 
@@ -1084,6 +1283,13 @@ TYPED_TEST(AuthorizationTest, CreateVolume)
     request.mutable_object()->set_value("giraffe");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::CREATE_VOLUME);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_resource()->set_role("giraffe");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
 
   // Principal "baz" cannot create volumes for any role,
   // so this request will fail.
@@ -1092,6 +1298,13 @@ TYPED_TEST(AuthorizationTest, CreateVolume)
     request.set_action(authorization::CREATE_VOLUME_WITH_ROLE);
     request.mutable_subject()->set_value("baz");
     request.mutable_object()->set_value("panda");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::CREATE_VOLUME);
+    request.mutable_subject()->set_value("baz");
+    request.mutable_object()->mutable_resource()->set_role("panda");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 
@@ -1103,6 +1316,13 @@ TYPED_TEST(AuthorizationTest, CreateVolume)
     request.set_action(authorization::CREATE_VOLUME_WITH_ROLE);
     request.mutable_subject()->set_value("zelda");
     request.mutable_object()->set_value("panda");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::CREATE_VOLUME);
+    request.mutable_subject()->set_value("zelda");
+    request.mutable_object()->mutable_resource()->set_role("panda");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 }
@@ -1155,6 +1375,14 @@ TYPED_TEST(AuthorizationTest, DestroyVolume)
     request.mutable_object()->set_value("foo");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_VOLUME);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_resource()->mutable_disk()
+        ->mutable_persistence()->set_principal("foo");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   // Principal "bar" cannot destroy anyone's
   // volumes, so requests 2 and 3 will fail.
@@ -1165,12 +1393,28 @@ TYPED_TEST(AuthorizationTest, DestroyVolume)
     request.mutable_object()->set_value("foo");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_VOLUME);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_resource()->mutable_disk()
+        ->mutable_persistence()->set_principal("foo");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
 
   {
     authorization::Request request;
     request.set_action(authorization::DESTROY_VOLUME_WITH_PRINCIPAL);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->set_value("bar");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_VOLUME);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_resource()->mutable_disk()
+        ->mutable_persistence()->set_principal("bar");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 
@@ -1183,6 +1427,14 @@ TYPED_TEST(AuthorizationTest, DestroyVolume)
     request.mutable_object()->set_value("foo");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_VOLUME);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_resource()->mutable_disk()
+        ->mutable_persistence()->set_principal("foo");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
 
   {
     authorization::Request request;
@@ -1193,9 +1445,25 @@ TYPED_TEST(AuthorizationTest, DestroyVolume)
   }
   {
     authorization::Request request;
+    request.set_action(authorization::DESTROY_VOLUME);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_resource()->mutable_disk()
+        ->mutable_persistence()->set_principal("ops");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
     request.set_action(authorization::DESTROY_VOLUME_WITH_PRINCIPAL);
     request.mutable_subject()->set_value("ops");
     request.mutable_object()->set_value("bar");
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_VOLUME);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_resource()->mutable_disk()
+        ->mutable_persistence()->set_principal("bar");
     AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
   }
 
@@ -1207,6 +1475,14 @@ TYPED_TEST(AuthorizationTest, DestroyVolume)
     request.set_action(authorization::DESTROY_VOLUME_WITH_PRINCIPAL);
     request.mutable_subject()->set_value("zelda");
     request.mutable_object()->set_value("foo");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+  {
+    authorization::Request request;
+    request.set_action(authorization::DESTROY_VOLUME);
+    request.mutable_subject()->set_value("zelda");
+    request.mutable_object()->mutable_resource()->mutable_disk()
+        ->mutable_persistence()->set_principal("foo");
     AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
   }
 }
@@ -1634,6 +1910,105 @@ TYPED_TEST(AuthorizationTest, ViewFramework)
   {
     authorization::Request request;
     request.set_action(authorization::VIEW_FRAMEWORK);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+}
+
+
+// This tests the authorization of requests to ViewContainer.
+TYPED_TEST(AuthorizationTest, ViewContainer)
+{
+  // Setup ACLs.
+  ACLs acls;
+
+  {
+    // "foo" principal can view no containers.
+    mesos::ACL::ViewContainer* acl = acls.add_view_containers();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" principal can see containers running under user "bar".
+    mesos::ACL::ViewContainer* acl = acls.add_view_containers();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // "ops" principal can see all containers.
+    mesos::ACL::ViewContainer* acl = acls.add_view_containers();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // No one else can view any containers.
+    mesos::ACL::ViewContainer* acl = acls.add_view_containers();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  // Create FrameworkInfo with a generic user as object to be authorized.
+  FrameworkInfo frameworkInfo;
+  {
+    frameworkInfo.set_user("user");
+    frameworkInfo.set_name("f");
+  }
+
+  // Create FrameworkInfo with user "bar" as object to be authorized.
+  FrameworkInfo frameworkInfoBar;
+  {
+    frameworkInfoBar.set_user("bar");
+    frameworkInfoBar.set_name("f");
+  }
+
+  // Principal "foo" cannot view containers running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::VIEW_CONTAINER);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot view containers running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::VIEW_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can view containers running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::VIEW_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" can view containers running with user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::VIEW_CONTAINER);
     request.mutable_subject()->set_value("bar");
     request.mutable_object()->mutable_framework_info()->MergeFrom(
         frameworkInfoBar);
@@ -2240,6 +2615,1213 @@ TYPED_TEST(AuthorizationTest, SandBoxAccess)
 }
 
 
+// This tests the authorization of launching sessions in nested containers.
+TYPED_TEST(AuthorizationTest, LaunchNestedContainerSessions)
+{
+  // Setup ACLs.
+  ACLs acls;
+
+  {
+    // "ops" can launch sessions in any parent container.
+    mesos::ACL::LaunchNestedContainerSessionUnderParentWithUser* acl =
+        acls.add_launch_nested_container_sessions_under_parent_with_user();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // "foo" cannot launch sessions in any container running as any user.
+    mesos::ACL::LaunchNestedContainerSessionUnderParentWithUser* acl =
+        acls.add_launch_nested_container_sessions_under_parent_with_user();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" can launch sessions nested under a container running as
+    // linux user "bar".
+    mesos::ACL::LaunchNestedContainerSessionUnderParentWithUser* acl =
+        acls.add_launch_nested_container_sessions_under_parent_with_user();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // No one else can launch sessions in nested containers.
+    mesos::ACL::LaunchNestedContainerSessionUnderParentWithUser* acl =
+        acls.add_launch_nested_container_sessions_under_parent_with_user();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "foo" principal cannot launch sessions as commands in any parent
+    // container. He may still get to launch container sessions if he
+    // is allowed launch nested container sessions whose executors are
+    // running as a given user for which "foo" has permissions and the
+    // session uses a `container_info` instead of a `command_info`.
+    mesos::ACL::LaunchNestedContainerSessionAsUser* acl =
+        acls.add_launch_nested_container_sessions_as_user();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" principal can launch sessions running as user "bar".
+    mesos::ACL::LaunchNestedContainerSessionAsUser* acl =
+        acls.add_launch_nested_container_sessions_as_user();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // "ops" principal can launch sessions as any linux user.
+    mesos::ACL::LaunchNestedContainerSessionAsUser* acl =
+        acls.add_launch_nested_container_sessions_as_user();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // No one else can launch sessions as any user.
+    mesos::ACL::LaunchNestedContainerSessionAsUser* acl =
+        acls.add_launch_nested_container_sessions_as_user();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.set_user("user");
+
+  // Create ExecutorInfo with a user not mentioned in the ACLs in
+  // command as object to be authorized.
+  ExecutorInfo executorInfo;
+  {
+    executorInfo.set_name("Task");
+    executorInfo.mutable_executor_id()->set_value("t");
+    executorInfo.mutable_command()->set_value("echo hello");
+    executorInfo.mutable_command()->set_user("user");
+  }
+
+  // Create ExecutorInfo with user "bar" in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoBar;
+  {
+    executorInfoBar.set_name("Executor");
+    executorInfoBar.mutable_executor_id()->set_value("e");
+    executorInfoBar.mutable_command()->set_value("echo hello");
+    executorInfoBar.mutable_command()->set_user("bar");
+  }
+
+  // Create ExecutorInfo with no user in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoNoUser;
+  {
+    executorInfoNoUser.set_name("Executor");
+    executorInfoNoUser.mutable_executor_id()->set_value("s");
+    executorInfoNoUser.mutable_command()->set_value("echo hello");
+  }
+
+  // Create ExecutorInfo with no user in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoNoCommand;
+  {
+    executorInfoNoCommand.set_name("Executor");
+    executorInfoNoCommand.mutable_executor_id()->set_value("t");
+  }
+
+  // Principal "foo" cannot launch a session with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot launch a session with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can launch a session with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can launch a session with a request with the
+  // default `FrameworkInfo.user`.
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can launch a session with a request where the
+  // executor is running as a container, it falls back to the
+  // `FrameworkInfo.user`.
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoCommand);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" can launch a session as user "bar" under parent containers
+  // running as user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Create CommandInfo with a user not mentioned in the ACLs in
+  // command as object to be authorized.
+  CommandInfo commandInfo;
+  {
+    commandInfo.set_value("echo hello");
+    commandInfo.set_user("user");
+  }
+
+  // Create CommandInfo with user "bar" in command as object to
+  // be authorized.
+  CommandInfo commandInfoBar;
+  {
+    commandInfoBar.set_value("echo hello");
+    commandInfoBar.set_user("bar");
+  }
+
+  // Create CommandInfo with no user in command as object to
+  // be authorized.
+  CommandInfo commandInfoNoUser;
+  {
+    commandInfoNoUser.set_value("echo hello");
+  }
+
+  // Principal "foo" cannot launch a session with a request with
+  // ExecutorInfo and CommandInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(commandInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot launch a session with a request with
+  // CommandInfo running with user "user", even if the ExecutorInfo
+  // is running as "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(commandInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot launch a session with a request with
+  // CommandInfo and ExecutorInfo running with user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(commandInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can launch a sessions with any combination of requests.
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER_SESSION);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_command_info()->MergeFrom(commandInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(
+        commandInfoNoUser);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(
+        commandInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_command_info()->MergeFrom(
+        commandInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_command_info()->MergeFrom(
+        commandInfoNoUser);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+}
+
+
+// This tests the authorization of attaching to the input stream of a container.
+TYPED_TEST(AuthorizationTest, AttachContainerInput)
+{
+  // Setup ACLs.
+  ACLs acls;
+
+  {
+    // "foo" principal cannot attach to the input of any container.
+    mesos::ACL::AttachContainerInput* acl =
+        acls.add_attach_containers_input();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" principal can attach to the input of containers running under
+    // user "bar".
+    mesos::ACL::AttachContainerInput* acl =
+        acls.add_attach_containers_input();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // "ops" principal can attach to the input of all containers.
+    mesos::ACL::AttachContainerInput* acl =
+        acls.add_attach_containers_input();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // No one else can attach to the input of any container.
+    mesos::ACL::AttachContainerInput* acl =
+        acls.add_attach_containers_input();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.set_user("user");
+
+  // Create ExecutorInfo with a user not mentioned in the ACLs in
+  // command as object to be authorized.
+  ExecutorInfo executorInfo;
+  {
+    executorInfo.set_name("Task");
+    executorInfo.mutable_executor_id()->set_value("t");
+    executorInfo.mutable_command()->set_value("echo hello");
+    executorInfo.mutable_command()->set_user("user");
+  }
+
+  // Create ExecutorInfo with user "bar" in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoBar;
+  {
+    executorInfoBar.set_name("Executor");
+    executorInfoBar.mutable_executor_id()->set_value("e");
+    executorInfoBar.mutable_command()->set_value("echo hello");
+    executorInfoBar.mutable_command()->set_user("bar");
+  }
+
+  // Create ExecutorInfo with no user in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoNoUser;
+  {
+    executorInfoNoUser.set_name("Executor");
+    executorInfoNoUser.mutable_executor_id()->set_value("e");
+    executorInfoNoUser.mutable_command()->set_value("echo hello");
+  }
+
+  // Principal "foo" cannot attach to the input of a container with a request
+  // with ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_INPUT);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot attach to the input of a container with a request
+  // with ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_INPUT);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can attach to the input of a container with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_INPUT);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" can attach to the input of a container with a request with
+  // ExecutorInfo running with user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_INPUT);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can attach to the input of a container with a request with
+  // an ExecutorInfo without user.
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_INPUT);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+}
+
+
+// This tests the authorization of attaching to the output stream of a
+// container.
+TYPED_TEST(AuthorizationTest, AttachContainerOutput)
+{
+  // Setup ACLs.
+  ACLs acls;
+
+  {
+    // "foo" principal cannot attach to the output of any container.
+    mesos::ACL::AttachContainerOutput* acl =
+        acls.add_attach_containers_output();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" principal can attach to the output of containers running under
+    // user "bar".
+    mesos::ACL::AttachContainerOutput* acl =
+        acls.add_attach_containers_output();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // "ops" principal can attach to the output of all containers.
+    mesos::ACL::AttachContainerOutput* acl =
+        acls.add_attach_containers_output();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // No one else can attach to the output of any container.
+    mesos::ACL::AttachContainerOutput* acl =
+        acls.add_attach_containers_output();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.set_user("user");
+
+  // Create ExecutorInfo with a user not mentioned in the ACLs in
+  // command as object to be authorized.
+  ExecutorInfo executorInfo;
+  {
+    executorInfo.set_name("Task");
+    executorInfo.mutable_executor_id()->set_value("t");
+    executorInfo.mutable_command()->set_value("echo hello");
+    executorInfo.mutable_command()->set_user("user");
+  }
+
+  // Create ExecutorInfo with user "bar" in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoBar;
+  {
+    executorInfoBar.set_name("Executor");
+    executorInfoBar.mutable_executor_id()->set_value("e");
+    executorInfoBar.mutable_command()->set_value("echo hello");
+    executorInfoBar.mutable_command()->set_user("bar");
+  }
+
+  // Create ExecutorInfo with no user in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoNoUser;
+  {
+    executorInfoNoUser.set_name("Executor");
+    executorInfoNoUser.mutable_executor_id()->set_value("e");
+    executorInfoNoUser.mutable_command()->set_value("echo hello");
+  }
+
+  // Principal "foo" cannot attach to the output of a container with a request
+  // with ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_OUTPUT);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot attach to the output of a container with a request
+  // with ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_OUTPUT);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can attach to the output of a container with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_OUTPUT);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" can attach to the output of a container with a request with
+  // ExecutorInfo running with user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_OUTPUT);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can attach to the output of a container with a request with
+  // an ExecutorInfo without user.
+  {
+    authorization::Request request;
+    request.set_action(authorization::ATTACH_CONTAINER_OUTPUT);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+}
+
+
+// This tests the authorization of launching nested containers.
+TYPED_TEST(AuthorizationTest, LaunchNestedContainers)
+{
+  // Setup ACLs.
+  ACLs acls;
+
+  {
+    // "ops" can launch nested containers whose executor runs as any user.
+    mesos::ACL::LaunchNestedContainerUnderParentWithUser* acl =
+        acls.add_launch_nested_containers_under_parent_with_user();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // "foo" cannot launch nested containers.
+    mesos::ACL::LaunchNestedContainerUnderParentWithUser* acl =
+        acls.add_launch_nested_containers_under_parent_with_user();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" can launch nested containers under executors running as
+    // linux user "bar".
+    mesos::ACL::LaunchNestedContainerUnderParentWithUser* acl =
+        acls.add_launch_nested_containers_under_parent_with_user();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // No one else can launch nested containers.
+    mesos::ACL::LaunchNestedContainerUnderParentWithUser* acl =
+        acls.add_launch_nested_containers_under_parent_with_user();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "foo" principal cannot launch nested containers as commands
+    // under any parent container. He may still get to launch nested
+    // container if he is allowed to do so for executors wich run as
+    // a given user for which "foo" has permissions and the session
+    // uses a `container_info` instead of a `command_info`.
+    mesos::ACL::LaunchNestedContainerAsUser* acl =
+        acls.add_launch_nested_containers_as_user();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" principal can launch nested containers as user "bar".
+    mesos::ACL::LaunchNestedContainerAsUser* acl =
+        acls.add_launch_nested_containers_as_user();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // "ops" principal can launch nested containers any linux user.
+    mesos::ACL::LaunchNestedContainerAsUser* acl =
+        acls.add_launch_nested_containers_as_user();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // No one else can launch nested containers as any user.
+    mesos::ACL::LaunchNestedContainerAsUser* acl =
+        acls.add_launch_nested_containers_as_user();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.set_user("user");
+
+  // Create ExecutorInfo with a user not mentioned in the ACLs in
+  // command as object to be authorized.
+  ExecutorInfo executorInfo;
+  {
+    executorInfo.set_name("Task");
+    executorInfo.mutable_executor_id()->set_value("t");
+    executorInfo.mutable_command()->set_value("echo hello");
+    executorInfo.mutable_command()->set_user("user");
+  }
+
+  // Create ExecutorInfo with user "bar" in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoBar;
+  {
+    executorInfoBar.set_name("Executor");
+    executorInfoBar.mutable_executor_id()->set_value("e");
+    executorInfoBar.mutable_command()->set_value("echo hello");
+    executorInfoBar.mutable_command()->set_user("bar");
+  }
+
+  // Create ExecutorInfo with no user in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoNoUser;
+  {
+    executorInfoNoUser.set_name("Executor");
+    executorInfoNoUser.mutable_executor_id()->set_value("s");
+    executorInfoNoUser.mutable_command()->set_value("echo hello");
+  }
+
+  // Create ExecutorInfo with no command as object to be authorized.
+  ExecutorInfo executorInfoNoCommand;
+  {
+    executorInfoNoCommand.set_name("Executor");
+    executorInfoNoCommand.mutable_executor_id()->set_value("t");
+  }
+
+  // Principal "foo" cannot launch a nested container with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot launch a nested container with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can launch a nested container with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can launch a nested container with a request with the
+  // default `FrameworkInfo.user`.
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can launch a nested container with a request
+  // where the executor is running as a container, it falls back
+  // to the `FrameworkInfo.user`.
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoCommand);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" can launch a nested container as user "bar" under parent
+  // containers running as user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Create CommandInfo with a user not mentioned in the ACLs in
+  // command as object to be authorized.
+  CommandInfo commandInfo;
+  {
+    commandInfo.set_value("echo hello");
+    commandInfo.set_user("user");
+  }
+
+  // Create CommandInfo with user "bar" in command as object to
+  // be authorized.
+  CommandInfo commandInfoBar;
+  {
+    commandInfoBar.set_value("echo hello");
+    commandInfoBar.set_user("bar");
+  }
+
+  // Create CommandInfo with no user in command as object to
+  // be authorized.
+  CommandInfo commandInfoNoUser;
+  {
+    commandInfoNoUser.set_value("echo hello");
+  }
+
+  // Principal "foo" cannot launch a session with a request with
+  // ExecutorInfo and CommandInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(commandInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot launch a nested container with a request with
+  // CommandInfo running with user "user", even if the ExecutorInfo
+  // is running as "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(commandInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" can launch a nested container with a request with
+  // CommandInfo and ExecutorInfo running with user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(commandInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can launch nested containers with any combination of
+  // requests.
+  {
+    authorization::Request request;
+    request.set_action(authorization::LAUNCH_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_command_info()->MergeFrom(commandInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(
+        commandInfoNoUser);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfo);
+    request.mutable_object()->mutable_command_info()->MergeFrom(
+        commandInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_command_info()->MergeFrom(
+        commandInfoBar);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_command_info()->MergeFrom(
+        commandInfoNoUser);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+}
+
+
+// This tests the authorization of waiting for a nested container.
+TYPED_TEST(AuthorizationTest, WaitNestedContainer)
+{
+  // Setup ACLs.
+  ACLs acls;
+
+  {
+    // "foo" principal cannot wait of any nested container.
+    mesos::ACL::WaitNestedContainer* acl =
+        acls.add_wait_nested_containers();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" principal can wait for nested containers running under
+    // user "bar".
+    mesos::ACL::WaitNestedContainer* acl =
+        acls.add_wait_nested_containers();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // "ops" principal can wait for all nested containers.
+    mesos::ACL::WaitNestedContainer* acl =
+        acls.add_wait_nested_containers();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // No one else can wait for any nested container.
+    mesos::ACL::WaitNestedContainer* acl =
+        acls.add_wait_nested_containers();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.set_user("user");
+
+  // Create ExecutorInfo with a user not mentioned in the ACLs in
+  // command as object to be authorized.
+  ExecutorInfo executorInfo;
+  {
+    executorInfo.set_name("Task");
+    executorInfo.mutable_executor_id()->set_value("t");
+    executorInfo.mutable_command()->set_value("echo hello");
+    executorInfo.mutable_command()->set_user("user");
+  }
+
+  // Create ExecutorInfo with user "bar" in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoBar;
+  {
+    executorInfoBar.set_name("Executor");
+    executorInfoBar.mutable_executor_id()->set_value("e");
+    executorInfoBar.mutable_command()->set_value("echo hello");
+    executorInfoBar.mutable_command()->set_user("bar");
+  }
+
+  // Create ExecutorInfo with no user in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoNoUser;
+  {
+    executorInfoNoUser.set_name("Executor");
+    executorInfoNoUser.mutable_executor_id()->set_value("e");
+    executorInfoNoUser.mutable_command()->set_value("echo hello");
+  }
+
+  // Principal "foo" cannot wait for a nested container with a request
+  // with ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::WAIT_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot wait for a nested container with a request
+  // with ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::WAIT_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can wait for a nested container with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::WAIT_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" can wait for a nested container with a request with
+  // ExecutorInfo running with user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::WAIT_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can wait for a nested container with a request with
+  // an ExecutorInfo without user.
+  {
+    authorization::Request request;
+    request.set_action(authorization::WAIT_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+}
+
+
+// This tests the authorization of killing a nested container.
+TYPED_TEST(AuthorizationTest, KillNestedContainer)
+{
+  // Setup ACLs.
+  ACLs acls;
+
+  {
+    // "foo" principal cannot kill any nested container.
+    mesos::ACL::KillNestedContainer* acl =
+        acls.add_kill_nested_containers();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // "bar" principal can kill nested containers running under
+    // user "bar".
+    mesos::ACL::KillNestedContainer* acl =
+        acls.add_kill_nested_containers();
+    acl->mutable_principals()->add_values("bar");
+    acl->mutable_users()->add_values("bar");
+  }
+
+  {
+    // "ops" principal can kill all nested containers.
+    mesos::ACL::KillNestedContainer* acl =
+        acls.add_kill_nested_containers();
+    acl->mutable_principals()->add_values("ops");
+    acl->mutable_users()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // No one else can kill any nested container.
+    mesos::ACL::KillNestedContainer* acl =
+        acls.add_kill_nested_containers();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  FrameworkInfo frameworkInfo;
+  frameworkInfo.set_user("user");
+
+  // Create ExecutorInfo with a user not mentioned in the ACLs in
+  // command as object to be authorized.
+  ExecutorInfo executorInfo;
+  {
+    executorInfo.set_name("Task");
+    executorInfo.mutable_executor_id()->set_value("t");
+    executorInfo.mutable_command()->set_value("echo hello");
+    executorInfo.mutable_command()->set_user("user");
+  }
+
+  // Create ExecutorInfo with user "bar" in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoBar;
+  {
+    executorInfoBar.set_name("Executor");
+    executorInfoBar.mutable_executor_id()->set_value("e");
+    executorInfoBar.mutable_command()->set_value("echo hello");
+    executorInfoBar.mutable_command()->set_user("bar");
+  }
+
+  // Create ExecutorInfo with no user in command as object to
+  // be authorized.
+  ExecutorInfo executorInfoNoUser;
+  {
+    executorInfoNoUser.set_name("Executor");
+    executorInfoNoUser.mutable_executor_id()->set_value("e");
+    executorInfoNoUser.mutable_command()->set_value("echo hello");
+  }
+
+  // Principal "foo" cannot kill a nested container with a request
+  // with ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::KILL_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("foo");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" cannot kill a nested container with a request
+  // with ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::KILL_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can kill a nested container with a request with
+  // ExecutorInfo running with user "user".
+  {
+    authorization::Request request;
+    request.set_action(authorization::KILL_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(executorInfo);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "bar" can kill a nested container with a request with
+  // ExecutorInfo running with user "bar".
+  {
+    authorization::Request request;
+    request.set_action(authorization::KILL_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("bar");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoBar);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  // Principal "ops" can kill a nested container with a request with
+  // an ExecutorInfo without user.
+  {
+    authorization::Request request;
+    request.set_action(authorization::KILL_NESTED_CONTAINER);
+    request.mutable_subject()->set_value("ops");
+    request.mutable_object()->mutable_executor_info()->MergeFrom(
+        executorInfoNoUser);
+    request.mutable_object()->mutable_framework_info()->MergeFrom(
+        frameworkInfo);
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+}
+
+
 // This tests that a missing request.object is allowed for an ACL whose
 // Object is ANY.
 // NOTE: The only usecase for this behavior is currently teardownFramework.
@@ -2335,6 +3917,59 @@ TYPED_TEST(AuthorizationTest, ViewFlags)
     mesos::ACL::ViewFlags* acl = invalid.add_view_flags();
     acl->mutable_principals()->add_values("foo");
     acl->mutable_flags()->add_values("yoda");
+
+    Try<Authorizer*> create = TypeParam::create(parameterize(invalid));
+    EXPECT_ERROR(create);
+  }
+}
+
+
+TYPED_TEST(AuthorizationTest, SetLogLevel)
+{
+  // Setup ACLs.
+  ACLs acls;
+
+  {
+    // "foo" principal can set log level.
+    mesos::ACL::SetLogLevel* acl = acls.add_set_log_level();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_level()->set_type(mesos::ACL::Entity::ANY);
+  }
+
+  {
+    // Nobody else can set log level.
+    mesos::ACL::SetLogLevel* acl = acls.add_set_log_level();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_level()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  // Create an `Authorizer` with the ACLs.
+  Try<Authorizer*> create = TypeParam::create(parameterize(acls));
+  ASSERT_SOME(create);
+  Owned<Authorizer> authorizer(create.get());
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::SET_LOG_LEVEL);
+    request.mutable_subject()->set_value("foo");
+
+    AWAIT_EXPECT_TRUE(authorizer.get()->authorized(request));
+  }
+
+  {
+    authorization::Request request;
+    request.set_action(authorization::SET_LOG_LEVEL);
+    request.mutable_subject()->set_value("bar");
+    AWAIT_EXPECT_FALSE(authorizer.get()->authorized(request));
+  }
+
+  // Test that no authorizer is created with invalid ACLs.
+  {
+    ACLs invalid;
+
+    mesos::ACL::SetLogLevel* acl = invalid.add_set_log_level();
+    acl->mutable_principals()->add_values("foo");
+    acl->mutable_level()->add_values("yoda");
 
     Try<Authorizer*> create = TypeParam::create(parameterize(invalid));
     EXPECT_ERROR(create);

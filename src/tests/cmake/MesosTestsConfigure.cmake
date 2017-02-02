@@ -15,19 +15,28 @@
 # limitations under the License.
 
 set(
+  MESOS_TESTS_TARGET mesos-tests
+  CACHE STRING "Target we use to refer to tests for the mesos"
+  )
+
+set(
   TEST_HELPER_TARGET test-helper
-  CACHE STRING "Test helper target to run tests that require a subprocess."
+  CACHE STRING "Test helper target to run tests that require a subprocess"
   )
 
 # COMPILER CONFIGURATION.
 #########################
-if (WIN32)
-  STRING(REGEX REPLACE "/" "\\\\" CURRENT_CMAKE_SOURCE_DIR ${CMAKE_SOURCE_DIR})
-  STRING(REGEX REPLACE "/" "\\\\" CURRENT_CMAKE_BUILD_DIR ${CMAKE_BINARY_DIR})
-else (WIN32)
-  set(CURRENT_CMAKE_SOURCE_DIR ${CMAKE_SOURCE_DIR})
-  set(CURRENT_CMAKE_BUILD_DIR ${CMAKE_BINARY_DIR})
-endif (WIN32)
+# NOTE: On Windows, these paths should be Windows-style, with '\' characters
+# separating path components. Unfortunately, CMake does not escape these
+# slashes in path strings, so when we pass them as preprocessor flags,
+# a string like `C:\src` will look to the standard Windows API like a
+# string with an escaped '\s' character.
+#
+# On the other hand, Windows APIs are happy to take Unix-style paths as
+# arguments. So, to unblock making the agent tests work, we simply use
+# Unix paths here.
+set(CURRENT_CMAKE_SOURCE_DIR ${CMAKE_SOURCE_DIR})
+set(CURRENT_CMAKE_BUILD_DIR ${CMAKE_BINARY_DIR})
 
 add_definitions(-DSOURCE_DIR="${CURRENT_CMAKE_SOURCE_DIR}")
 add_definitions(-DBUILD_DIR="${CURRENT_CMAKE_BUILD_DIR}")
@@ -37,39 +46,11 @@ add_definitions(-DTESTLIBEXECDIR="${TEST_LIB_EXEC_DIR}")
 add_definitions(-DPKGMODULEDIR="${PKG_MODULE_DIR}")
 add_definitions(-DSBINDIR="${S_BIN_DIR}")
 
-# DIRECTORY STRUCTURE FOR THIRD-PARTY LIBS REQUIRED FOR TEST INFRASTRUCTURE.
-############################################################################
-EXTERNAL("gmock" ${GMOCK_VERSION} "${MESOS_3RDPARTY_BIN}")
-
-set(GTEST_SRC          ${GMOCK_ROOT}/gtest)
-set(GPERFTOOLS_VERSION 2.0)
-set(GPERFTOOLS         ${MESOS_3RDPARTY_BIN}/gperftools-${GPERFTOOLS_VERSION})
-
-# Convenience variables for include directories of third-party dependencies.
-set(GMOCK_INCLUDE_DIR ${GMOCK_ROOT}/include)
-set(GTEST_INCLUDE_DIR ${GTEST_SRC}/include)
-
-# Convenience variables for `lib` directories of built third-party dependencies.
-if (WIN32)
-  set(GMOCK_LIB_DIR ${GMOCK_ROOT}-build/${CMAKE_BUILD_TYPE})
-  set(GTEST_LIB_DIR ${GMOCK_ROOT}-build/gtest/${CMAKE_BUILD_TYPE})
-else (WIN32)
-  set(GMOCK_LIB_DIR ${GMOCK_ROOT}-lib/lib/)
-  # TODO(hausdorff): Figure out why this path is different from the
-  # `ProcessTestsConfigure` equivalent.
-  set(GTEST_LIB_DIR ${GMOCK_ROOT}-build/gtest/)
-endif (WIN32)
-
-# Convenience variables for "lflags", the symbols we pass to CMake to generate
-# things like `-L/path/to/glog` or `-lglog`.
-#set(GMOCK_LFLAG gmock)
-set(GTEST_LFLAG gtest)
-
 # DEFINE PROCESS LIBRARY DEPENDENCIES. Tells the process library build targets
 # download/configure/build all third-party libraries before attempting to build.
 ################################################################################
-set(TEST_HELPER_DEPENDENCIES
-  ${TEST_HELPER_DEPENDENCIES}
+set(MESOS_TESTS_DEPENDENCIES
+  ${MESOS_TESTS_DEPENDENCIES}
   ${MESOS_TARGET}
   ${GMOCK_TARGET}
   )
@@ -77,8 +58,14 @@ set(TEST_HELPER_DEPENDENCIES
 # DEFINE THIRD-PARTY INCLUDE DIRECTORIES. Tells compiler toolchain where to get
 # headers for our third party libs (e.g., -I/path/to/glog on Linux)..
 ###############################################################################
-set(TEST_HELPER_INCLUDE_DIRS
-  ${TEST_HELPER_INCLUDE_DIRS}
+set(MESOS_TESTS_INCLUDE_DIRS
+  ${MESOS_TESTS_INCLUDE_DIRS}
+  ${AGENT_INCLUDE_DIRS}
+  )
+
+set(MESOS_3RDPARTY_TESTS_INCLUDE_DIRS
+  ${MESOS_3RDPARTY_TESTS_INCLUDE_DIRS}
+  ${AGENT_3RDPARTY_INCLUDE_DIRS}
   ${GMOCK_INCLUDE_DIR}
   ${GTEST_INCLUDE_DIR}
   )
@@ -87,17 +74,29 @@ set(TEST_HELPER_INCLUDE_DIRS
 # toolchain where to find our third party libs (e.g., -L/path/to/glog on
 # Linux).
 ########################################################################
-set(TEST_HELPER_LIB_DIRS
-  ${TEST_HELPER_LIB_DIRS}
+set(MESOS_TESTS_LIB_DIRS
+  ${MESOS_TESTS_LIB_DIRS}
+  ${GMOCK_LIB_DIR}
   ${GTEST_LIB_DIR}
   )
 
 # DEFINE THIRD-PARTY LIBS. Used to generate flags that the linker uses to
 # include our third-party libs (e.g., -lglog on Linux).
 #########################################################################
-set(TEST_HELPER_LIBS
-  ${TEST_HELPER_LIBS}
-  ${MESOS_TARGET}
+set(MESOS_TESTS_LIBS
+  ${MESOS_TESTS_LIBS}
+  ${MESOS_LIBS_TARGET}
   ${PROCESS_TARGET}
+  ${MESOS_LIBS}
+  ${GMOCK_LFLAG}
   ${GTEST_LFLAG}
   )
+
+if (NOT WIN32)
+  set(MESOS_TESTS_LIBS
+    ${MESOS_TESTS_LIBS}
+    ${QOS_CONTROLLER_TARGET}
+    ${RESOURCE_ESTIMATOR_TARGET}
+    ${LOGROTATE_CONTAINER_LOGGER_TARGET}
+    )
+endif (NOT WIN32)

@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "slave/validation.hpp"
+
 #include <string>
 
 #include <mesos/agent/agent.hpp>
@@ -22,7 +24,9 @@
 #include <stout/unreachable.hpp>
 #include <stout/uuid.hpp>
 
-#include "slave/validation.hpp"
+#include "checks/checker.hpp"
+
+#include "common/validation.hpp"
 
 using std::string;
 
@@ -30,6 +34,51 @@ namespace mesos {
 namespace internal {
 namespace slave {
 namespace validation {
+
+namespace container {
+
+Option<Error> validateContainerId(const ContainerID& containerId)
+{
+  const string& id = containerId.value();
+
+  // Check common Mesos ID rules.
+  Option<Error> error = common::validation::validateID(id);
+  if (error.isSome()) {
+    return Error(error->message);
+  }
+
+  // Check ContainerID specific rules.
+  //
+  // Periods are disallowed because our string representation of
+  // ContainerID uses periods: <uuid>.<child>.<grandchild>.
+  // For example: <uuid>.redis.backup
+  //
+  // Spaces are disallowed as they can render logs confusing and
+  // need escaping on terminals when dealing with paths.
+  auto invalidCharacter = [](char c) {
+    return  c == '.' || c == ' ';
+  };
+
+  if (std::any_of(id.begin(), id.end(), invalidCharacter)) {
+    return Error("'ContainerID.value' '" + id + "'"
+                 " contains invalid characters");
+  }
+
+  // TODO(bmahler): Print the invalid field nicely within the error
+  // (e.g. 'parent.parent.parent.value'). For now we only have one
+  // level of nesting so it's ok.
+  if (containerId.has_parent()) {
+    Option<Error> parentError = validateContainerId(containerId.parent());
+
+    if (parentError.isSome()) {
+      return Error("'ContainerID.parent' is invalid: " + parentError->message);
+    }
+  }
+
+  return None();
+}
+
+} // namespace container {
 
 namespace agent {
 namespace call {
@@ -106,62 +155,156 @@ Option<Error> validate(
         return Error("Expecting 'launch_nested_container' to be present");
       }
 
-      const mesos::agent::Call::LaunchNestedContainer& launchNestedContainer =
-        call.launch_nested_container();
+      Option<Error> error = validation::container::validateContainerId(
+          call.launch_nested_container().container_id());
 
-      // The `ContainerID` must be a RFC-4122 Version 4 UUID
-      // in standard string format.
-      Try<UUID> uuid = UUID::fromString(
-          launchNestedContainer.container_id().value());
-
-      if (uuid.isError()) {
-        return Error("'launch_nested_container.container_id.value' must be"
-                     " an RFC-4122 version 4 UUID in string format: " +
-                     uuid.error());
+      if (error.isSome()) {
+        return Error("'launch_nested_container.container_id' is invalid"
+                     ": " + error->message);
       }
 
-      if (uuid->version() != UUID::version_random_number_based) {
-        return Error("Expected version 4 UUID but was version"
-                     " " + stringify(uuid->version()));
-      }
-
-      // A single parent `ContainerID` is expected, so that we know
+      // The parent `ContainerID` is required, so that we know
       // which container to place it underneath.
-      if (!launchNestedContainer.container_id().has_parent()) {
+      if (!call.launch_nested_container().container_id().has_parent()) {
         return Error("Expecting 'launch_nested_container.container_id.parent'"
                      " to be present");
-      } else if (launchNestedContainer.container_id().parent().has_parent()) {
-        return Error("Expecting a single parent ContainerID but"
-                     " 'launch_nested_container.container_id.parent.parent'"
-                     " is set");
+      }
+
+      if (call.launch_nested_container().has_command()) {
+        error = common::validation::validateCommandInfo(
+            call.launch_nested_container().command());
+        if (error.isSome()) {
+          return Error("'launch_nested_container.command' is invalid"
+                       ": " + error->message);
+        }
       }
 
       return None();
     }
 
-    case mesos::agent::Call::WAIT_NESTED_CONTAINER:
+    case mesos::agent::Call::WAIT_NESTED_CONTAINER: {
       if (!call.has_wait_nested_container()) {
         return Error("Expecting 'wait_nested_container' to be present");
       }
 
-      if (call.wait_nested_container().container_id().has_parent()) {
-        return Error("Not expecting 'wait_nested_container.container_id.parent'"
+      Option<Error> error = validation::container::validateContainerId(
+          call.wait_nested_container().container_id());
+
+      if (error.isSome()) {
+        return Error("'wait_nested_container.container_id' is invalid"
+                     ": " + error->message);
+      }
+
+      // Nested containers always have at least one parent.
+      if (!call.wait_nested_container().container_id().has_parent()) {
+        return Error("Expecting 'wait_nested_container.container_id.parent'"
                      " to be present");
       }
 
       return None();
+    }
 
-    case mesos::agent::Call::KILL_NESTED_CONTAINER:
+    case mesos::agent::Call::KILL_NESTED_CONTAINER: {
       if (!call.has_kill_nested_container()) {
         return Error("Expecting 'kill_nested_container' to be present");
       }
 
-      if (call.kill_nested_container().container_id().has_parent()) {
-        return Error("Not expecting 'kill_nested_container.container_id.parent'"
+      Option<Error> error = validation::container::validateContainerId(
+          call.kill_nested_container().container_id());
+
+      if (error.isSome()) {
+        return Error("'kill_nested_container.container_id' is invalid"
+                     ": " + error->message);
+      }
+
+      // Nested containers always have at least one parent.
+      if (!call.kill_nested_container().container_id().has_parent()) {
+        return Error("Expecting 'kill_nested_container.container_id.parent'"
                      " to be present");
       }
 
       return None();
+    }
+
+    case mesos::agent::Call::LAUNCH_NESTED_CONTAINER_SESSION: {
+      if (!call.has_launch_nested_container_session()) {
+        return Error(
+            "Expecting 'launch_nested_container_session' to be present");
+      }
+
+      Option<Error> error = validation::container::validateContainerId(
+          call.launch_nested_container_session().container_id());
+
+      if (error.isSome()) {
+        return Error("'launch_nested_container_session.container_id' is invalid"
+                     ": " + error->message);
+      }
+
+      // The parent `ContainerID` is required, so that we know
+      // which container to place it underneath.
+      if (!call.launch_nested_container_session().container_id().has_parent()) {
+        return Error(
+            "Expecting 'launch_nested_container_session.container_id.parent'"
+            " to be present");
+      }
+
+      if (call.launch_nested_container_session().has_command()) {
+        error = common::validation::validateCommandInfo(
+            call.launch_nested_container_session().command());
+        if (error.isSome()) {
+          return Error("'launch_nested_container_session.command' is invalid"
+                       ": " + error->message);
+        }
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::ATTACH_CONTAINER_INPUT: {
+      if (!call.has_attach_container_input()) {
+        return Error("Expecting 'attach_container_input' to be present");
+      }
+
+      if (!call.attach_container_input().has_type()) {
+        return Error("Expecting 'attach_container_input.type' to be present");
+      }
+
+      switch (call.attach_container_input().type()) {
+        case mesos::agent::Call::AttachContainerInput::UNKNOWN:
+          return Error("'attach_container_input.type' is unknown");
+
+        case mesos::agent::Call::AttachContainerInput::CONTAINER_ID: {
+          Option<Error> error = validation::container::validateContainerId(
+              call.attach_container_input().container_id());
+
+          if (error.isSome()) {
+            return Error("'attach_container_input.container_id' is invalid"
+                ": " + error->message);
+          }
+        }
+
+        case mesos::agent::Call::AttachContainerInput::PROCESS_IO:
+          return None();
+      }
+
+      UNREACHABLE();
+    }
+
+    case mesos::agent::Call::ATTACH_CONTAINER_OUTPUT: {
+      if (!call.has_attach_container_output()) {
+        return Error("Expecting 'attach_container_output' to be present");
+      }
+
+      Option<Error> error = validation::container::validateContainerId(
+          call.attach_container_output().container_id());
+
+      if (error.isSome()) {
+        return Error("'attach_container_output.container_id' is invalid"
+                     ": " + error->message);
+      }
+
+      return None();
+    }
   }
 
   UNREACHABLE();
@@ -212,7 +355,7 @@ Option<Error> validate(const mesos::executor::Call& call)
         return Error("Expecting 'uuid' to be present");
       }
 
-      Try<UUID> uuid = UUID::fromBytes(status.uuid()).get();
+      Try<UUID> uuid = UUID::fromBytes(status.uuid());
       if (uuid.isError()) {
         return uuid.error();
       }
@@ -243,6 +386,18 @@ Option<Error> validate(const mesos::executor::Call& call)
                      call.framework_id().value() +
                      " which is not allowed"
                      );
+      }
+
+      // TODO(alexr): Validate `check_status` is present if
+      // the corresponding `TaskInfo.check` has been defined.
+
+      if (status.has_check_status()) {
+        Option<Error> validate =
+          checks::validation::checkStatusInfo(status.check_status());
+
+        if (validate.isSome()) {
+          return validate.get();
+        }
       }
 
       return None();

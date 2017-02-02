@@ -32,19 +32,20 @@
 #include <stout/error.hpp>
 #include <stout/flags.hpp>
 #include <stout/json.hpp>
+#include <stout/lambda.hpp>
 #include <stout/os.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/try.hpp>
 
 #include <stout/os/killtree.hpp>
 
+#include "checks/health_checker.hpp"
+
 #include "common/protobuf_utils.hpp"
 #include "common/status_utils.hpp"
 
 #include "docker/docker.hpp"
 #include "docker/executor.hpp"
-
-#include "health-check/health_checker.hpp"
 
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
@@ -277,30 +278,24 @@ public:
   void error(ExecutorDriver* driver, const string& message) {}
 
 protected:
-  virtual void initialize()
-  {
-    install<TaskHealthStatus>(
-        &Self::taskHealthUpdated,
-        &TaskHealthStatus::task_id,
-        &TaskHealthStatus::healthy,
-        &TaskHealthStatus::kill_task);
-  }
-
-  void taskHealthUpdated(
-      const TaskID& taskID,
-      const bool& healthy,
-      const bool& initiateTaskKill)
+  void taskHealthUpdated(const TaskHealthStatus& healthStatus)
   {
     if (driver.isNone()) {
       return;
     }
 
+    // This check prevents us from sending `TASK_RUNNING` updates
+    // after the task has been transitioned to `TASK_KILLING`.
+    if (killed || terminated) {
+      return;
+    }
+
     cout << "Received task health update, healthy: "
-         << stringify(healthy) << endl;
+         << stringify(healthStatus.healthy()) << endl;
 
     TaskStatus status;
-    status.mutable_task_id()->CopyFrom(taskID);
-    status.set_healthy(healthy);
+    status.mutable_task_id()->CopyFrom(healthStatus.task_id());
+    status.set_healthy(healthStatus.healthy());
     status.set_state(TASK_RUNNING);
 
     if (containerNetworkInfo.isSome()) {
@@ -310,9 +305,9 @@ protected:
 
     driver.get()->sendStatusUpdate(status);
 
-    if (initiateTaskKill) {
+    if (healthStatus.kill_task()) {
       killedByHealthCheck = true;
-      killTask(driver.get(), taskID);
+      killTask(driver.get(), healthStatus.task_id());
     }
   }
 
@@ -370,6 +365,11 @@ private:
         driver.get()->sendStatusUpdate(status);
       }
 
+      // Stop health checking the task.
+      if (checker.get() != nullptr) {
+        checker->stop();
+      }
+
       // TODO(bmahler): Replace this with 'docker kill' so
       // that we can adjust the grace period in the case of
       // a `KillPolicy` override.
@@ -380,6 +380,11 @@ private:
   void reaped(const Future<Option<int>>& run)
   {
     terminated = true;
+
+    // Stop health checking the task.
+    if (checker.get() != nullptr) {
+      checker->stop();
+    }
 
     // In case the stop is stuck, discard it.
     stop.discard();
@@ -414,9 +419,10 @@ private:
       message = "Failed to get exit status of container";
     } else {
       int status = run->get();
-      CHECK(WIFEXITED(status) || WIFSIGNALED(status)) << status;
+      CHECK(WIFEXITED(status) || WIFSIGNALED(status))
+        << "Unexpected wait status " << status;
 
-      if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+      if (WSUCCEEDED(status)) {
         state = TASK_FINISHED;
       } else if (killed) {
         // Send TASK_KILLED if the task was killed as a result of
@@ -520,12 +526,14 @@ private:
       namespaces.push_back("net");
     }
 
-    Try<Owned<health::HealthChecker>> _checker = health::HealthChecker::create(
-        healthCheck,
-        self(),
-        task.task_id(),
-        containerPid,
-        namespaces);
+    Try<Owned<checks::HealthChecker>> _checker =
+      checks::HealthChecker::create(
+          healthCheck,
+          launcherDir,
+          defer(self(), &Self::taskHealthUpdated, lambda::_1),
+          task.task_id(),
+          containerPid,
+          namespaces);
 
     if (_checker.isError()) {
       // TODO(gilbert): Consider ABORT and return a TASK_FAILED here.
@@ -533,14 +541,6 @@ private:
            << _checker.error() << endl;
     } else {
       checker = _checker.get();
-
-      checker->healthCheck()
-        .onAny([](const Future<Nothing>& future) {
-          // Only possible to be a failure.
-          if (future.isFailed()) {
-            cerr << "Health check failed:" << future.failure() << endl;
-          }
-        });
     }
   }
 
@@ -565,7 +565,7 @@ private:
   Option<ExecutorDriver*> driver;
   Option<FrameworkInfo> frameworkInfo;
   Option<TaskID> taskId;
-  Owned<health::HealthChecker> checker;
+  Owned<checks::HealthChecker> checker;
   Option<NetworkInfo> containerNetworkInfo;
   Option<pid_t> containerPid;
 };
@@ -671,6 +671,8 @@ private:
 int main(int argc, char** argv)
 {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
+
+  process::initialize();
 
   mesos::internal::docker::Flags flags;
 
@@ -794,15 +796,30 @@ int main(int argc, char** argv)
     return EXIT_FAILURE;
   }
 
-  mesos::internal::docker::DockerExecutor executor(
-      docker.get(),
-      flags.container.get(),
-      flags.sandbox_directory.get(),
-      flags.mapped_directory.get(),
-      shutdownGracePeriod,
-      flags.launcher_dir.get(),
-      taskEnvironment);
+  Owned<mesos::internal::docker::DockerExecutor> executor(
+      new mesos::internal::docker::DockerExecutor(
+          docker.get(),
+          flags.container.get(),
+          flags.sandbox_directory.get(),
+          flags.mapped_directory.get(),
+          shutdownGracePeriod,
+          flags.launcher_dir.get(),
+          taskEnvironment));
 
-  mesos::MesosExecutorDriver driver(&executor);
-  return driver.run() == mesos::DRIVER_STOPPED ? EXIT_SUCCESS : EXIT_FAILURE;
+  Owned<mesos::MesosExecutorDriver> driver(
+      new mesos::MesosExecutorDriver(executor.get()));
+
+  bool success = driver->run() == mesos::DRIVER_STOPPED;
+
+  // NOTE: We need to delete the executor and driver before we call
+  // `process::finalize` because the executor/driver will try to terminate
+  // and wait on a libprocess actor in their destructor.
+  driver.reset();
+  executor.reset();
+
+  // NOTE: We need to finalize libprocess, on Windows especially,
+  // as any binary that uses the networking stack on Windows must
+  // also clean up the networking stack before exiting.
+  process::finalize(true);
+  return success ? EXIT_SUCCESS : EXIT_FAILURE;
 }

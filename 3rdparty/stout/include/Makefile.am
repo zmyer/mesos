@@ -16,6 +16,7 @@ nobase_include_HEADERS =			\
   stout/adaptor.hpp				\
   stout/attributes.hpp				\
   stout/base64.hpp				\
+  stout/boundedhashmap.hpp			\
   stout/bits.hpp				\
   stout/bytes.hpp				\
   stout/cache.hpp				\
@@ -67,6 +68,7 @@ nobase_include_HEADERS =			\
   stout/os/environment.hpp			\
   stout/os/exists.hpp				\
   stout/os/fcntl.hpp				\
+  stout/os/getenv.hpp				\
   stout/os/find.hpp				\
   stout/os/fork.hpp				\
   stout/os/freebsd.hpp				\
@@ -100,9 +102,12 @@ nobase_include_HEADERS =			\
   stout/os/strerror.hpp				\
   stout/os/su.hpp				\
   stout/os/sysctl.hpp				\
+  stout/os/temp.hpp				\
   stout/os/touch.hpp				\
   stout/os/utime.hpp				\
+  stout/os/wait.hpp				\
   stout/os/write.hpp				\
+  stout/os/xattr.hpp				\
   stout/os/posix/bootid.hpp			\
   stout/os/posix/chown.hpp			\
   stout/os/posix/chroot.hpp			\
@@ -112,6 +117,7 @@ nobase_include_HEADERS =			\
   stout/os/posix/fork.hpp			\
   stout/os/posix/fsync.hpp			\
   stout/os/posix/ftruncate.hpp			\
+  stout/os/posix/getenv.hpp			\
   stout/os/posix/kill.hpp			\
   stout/os/posix/killtree.hpp			\
   stout/os/posix/mkdtemp.hpp			\
@@ -126,7 +132,9 @@ nobase_include_HEADERS =			\
   stout/os/posix/socket.hpp			\
   stout/os/posix/stat.hpp			\
   stout/os/posix/su.hpp				\
+  stout/os/posix/temp.hpp			\
   stout/os/posix/write.hpp			\
+  stout/os/posix/xattr.hpp			\
   stout/os/raw/argv.hpp				\
   stout/os/raw/environment.hpp			\
   stout/os/windows/bootid.hpp			\
@@ -137,6 +145,7 @@ nobase_include_HEADERS =			\
   stout/os/windows/fork.hpp			\
   stout/os/windows/fsync.hpp			\
   stout/os/windows/ftruncate.hpp		\
+  stout/os/windows/getenv.hpp			\
   stout/os/windows/kill.hpp			\
   stout/os/windows/killtree.hpp			\
   stout/os/windows/mkdtemp.hpp			\
@@ -151,7 +160,9 @@ nobase_include_HEADERS =			\
   stout/os/windows/socket.hpp			\
   stout/os/windows/stat.hpp			\
   stout/os/windows/su.hpp			\
+  stout/os/windows/temp.hpp			\
   stout/os/windows/write.hpp			\
+  stout/os/windows/xattr.hpp			\
   stout/path.hpp				\
   stout/preprocessor.hpp			\
   stout/proc.hpp				\

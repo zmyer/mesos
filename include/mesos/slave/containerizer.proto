@@ -23,6 +23,18 @@ import "mesos/appc/spec.proto";
 import "mesos/docker/v1.proto";
 
 /**
+ * Some containers are launched in conjunction with a specific
+ * `ContainerClass`. These classes allow an isolator to customize
+ * their functionality based on the class of container being isolated.
+ * The classes we currently define are below.
+ */
+enum ContainerClass {
+  DEFAULT = 1;
+  DEBUG = 2;
+}
+
+
+/**
  * Information when an executor is impacted by a resource limitation
  * and should be terminated. Intended to support resources like memory
  * where the Linux kernel may invoke the OOM killer, killing some/all
@@ -52,13 +64,17 @@ message ContainerLimitation {
  * any dependency on RunState and in turn on internal protobufs.
  */
 message ContainerState {
-  required ExecutorInfo executor_info = 1;
+  // This field only exists for top level containers.
+  optional ExecutorInfo executor_info = 1;
 
-  // Container id of the last executor run.
+  // The container Id.
   required ContainerID container_id = 2;
 
-  required uint64 pid = 3;            // Executor pid.
-  required string directory = 4;      // Executor work directory.
+  // The pid of the init process in the container.
+  required uint64 pid = 3;
+
+  // The sandbox directory.
+  required string directory = 4;
 }
 
 
@@ -87,7 +103,7 @@ message ContainerRecoverInfo {
  */
 message ContainerConfig {
   // The executor associated with this container.
-  required ExecutorInfo executor_info = 8;
+  optional ExecutorInfo executor_info = 8;
 
   // The task (optional) associated with this container.
   optional TaskInfo task_info = 9;
@@ -100,6 +116,10 @@ message ContainerConfig {
 
   // Resources associated with the container during launch.
   repeated Resource resources = 13;
+
+  // The class of container being launched. Used by isolators to
+  // perform different operations depending on the class.
+  optional ContainerClass container_class = 14;
 
   // The work directory for the container in the host filesystem.
   required string directory = 3;
@@ -128,6 +148,21 @@ message ContainerConfig {
 }
 
 
+// This message is used to describe how to handle standard
+// input/output/error for the container.
+message ContainerIO {
+  enum Type {
+    UNKNOWN = 0;
+    FD = 1;       // File descriptor. Ownership will be transferred.
+    PATH = 2;     // File path.
+  }
+
+  optional Type type = 1;
+  optional int32 fd = 2;
+  optional string path = 3;
+}
+
+
 /**
  * Protobuf returned by Isolator::prepare(). The command is executed
  * by the Launcher in the containerized context.
@@ -141,15 +176,19 @@ message ContainerLaunchInfo {
   repeated CommandInfo pre_exec_commands = 1;
   optional Environment environment = 2;
 
-  // The root filesystem for the container.
-  //
-  // This field is not used since 0.28, and it is deprecated
-  // since 1.0.1.
-  optional string rootfs = 3 [deprecated = true]; // Since 1.0.1.
+  // (Linux only) The root filesystem for the container.
+  optional string rootfs = 3;
 
-  // (Linux only) The namespaces required for the container.
+  // (Linux only) The namespaces a nested container
+  // should enter in its parent before cloning.
+  repeated int32 enter_namespaces = 9;
+
+  // (Linux only) The namespaces that should be cloned for the container.
   // The namespaces are created while launching the executor.
-  optional uint32 namespaces = 4 [default = 0];
+  repeated int32 clone_namespaces = 4;
+
+  // (POSIX only) The user to launch the command as.
+  optional string user = 10;
 
   // If specified, it'll become the launch command for the custom
   // executor, or the launch command for the user task in the case of
@@ -159,6 +198,23 @@ message ContainerLaunchInfo {
   // The working directory for the container.
   // NOTE: This is different than Mesos sandbox.
   optional string working_directory = 6;
+
+  // (Linux only) The capabilities requested for the container.
+  // The capabilities are set while launching the container.
+  optional CapabilityInfo capabilities = 7;
+
+  // (POSIX only) The rlimits requested for the container.
+  // The rlimits are set while launching the container.
+  optional RLimitInfo rlimits = 8;
+
+  // I/O information about the container to be launched. If not set,
+  // the container will inherit the agent standard input/output/error.
+  optional ContainerIO in = 11;
+  optional ContainerIO out = 12;
+  optional ContainerIO err = 13;
+
+  // (POSIX only) The slave path of the pseudo terminal.
+  optional string tty_slave_path = 14;
 }
 
 

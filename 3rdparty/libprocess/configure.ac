@@ -69,56 +69,62 @@ AC_CONFIG_FILES([3rdparty/gmock_sources.cc])
 # Optional features.
 ###############################################################################
 
+AC_ARG_ENABLE([hardening],
+              AS_HELP_STRING([--disable-hardening],
+                             [disables security measures such as stack
+                             protection and position independent library code]),
+                             [], [enable_hardening=yes])
+
 AC_ARG_ENABLE([bundled],
               AS_HELP_STRING([--disable-bundled],
                              [build against preinstalled dependencies instead
                              of bundled libraries]),
-              [enable_bundled=no], [enable_bundled=yes])
+              [], [enable_bundled=yes])
 
 AC_ARG_ENABLE([debug],
               AS_HELP_STRING([--enable-debug],
                              [enable debugging. If CFLAGS/CXXFLAGS are set, this
                               option won't change them default: no]),
-              [enable_debug=yes], [])
+              [], [enable_debug=no])
 
 AC_ARG_ENABLE([install],
               AS_HELP_STRING([--enable-install],
                              [install libprocess]),
-              [AC_MSG_ERROR([libprocess can not currently be installed])])
+              [AC_MSG_ERROR([libprocess cannot currently be installed])])
 
 AC_ARG_ENABLE([libevent],
               AS_HELP_STRING([--enable-libevent],
                              [use libevent instead of libev default: no]),
-              [enable_libevent=yes], [])
+              [], [enable_libevent=no])
 
 AC_ARG_ENABLE([optimize],
               AS_HELP_STRING([--enable-optimize],
                              [enable optimizations. If CFLAGS/CXXFLAGS are set,
                               this option won't change them default: no]),
-              [enable_optimize=yes], [])
+              [], [enable_optimize=no])
 
 AC_ARG_ENABLE([perftools],
               AS_HELP_STRING([--enable-perftools],
-                             [enable google perftools]),
-              [gperftools=yes], [])
+                             [enable Google perftools]),
+              [], [enable_perftools=no])
 
 AC_ARG_ENABLE([ssl],
               AS_HELP_STRING([--enable-ssl],
                              [use ssl for libprocess communication
                              default: no]),
-              [enable_ssl=yes], [])
+              [], [enable_ssl=no])
 
 AC_ARG_ENABLE([static-unimplemented],
               AS_HELP_STRING([--enable-static-unimplemented],
                              [generate static assertion errors for unimplemented
                              functions default: no]),
-              [enable_static_unimplemented=yes], [])
+              [], [enable_static_unimplemented=no])
 
 AC_ARG_ENABLE([zlib],
             AS_HELP_STRING([--disable-zlib],
                            [disables zlib compression, which means the webui
                            will be far less responsive; not recommended]),
-            [enable_zlib=no], [enable_zlib=yes])
+            [], [enable_zlib=yes])
 
 
 ###############################################################################
@@ -213,8 +219,17 @@ AC_ARG_WITH([svn],
 
 
 ###############################################################################
+# Miscellaneous flags/library/tool checks.
+###############################################################################
+AC_ARG_VAR([TEST_DRIVER], [executable and arguments of a test driver])
+
+
+###############################################################################
 # Compiler checks.
 ###############################################################################
+
+# Check to see if we should harden or not.
+AM_CONDITIONAL([ENABLE_HARDENING], [test x"$enable_hardening" = "xyes"])
 
 AS_CASE($ax_cv_cxx_compiler_vendor,
   [clang], [
@@ -262,6 +277,12 @@ AS_CASE($ax_cv_cxx_compiler_vendor,
     AC_MSG_WARN([$ax_cv_cxx_compiler_vendor is an unsupported compiler])
   ]
 )
+
+# If our compiler supports strong stack protection, use it.
+# If not, use a lesser form of stack protection.
+AX_CHECK_COMPILE_FLAG([-fstack-protector-strong],
+  [AC_SUBST(STACK_PROTECTOR, "-fstack-protector-strong")],
+  [AC_SUBST(STACK_PROTECTOR, "-fstack-protector")])
 
 # Ensure that the build environment supports C++11 (with "strict" conformance),
 # and set "--std=" flag and CXXFLAGS environment variable as appropriate.
@@ -338,7 +359,7 @@ if test "x$enable_static_unimplemented" = "xyes"; then
   AC_DEFINE([ENABLE_STATIC_UNIMPLEMENTED], [1])
 fi
 
-AM_CONDITIONAL([HAS_GPERFTOOLS], [test x"$gperftools" = "xyes"])
+AM_CONDITIONAL([HAS_GPERFTOOLS], [test x"$enable_perftools" = "xyes"])
 AM_COND_IF([HAS_GPERFTOOLS], AC_DEFINE([ENABLE_GPERFTOOLS], [1]))
 
 # Disable static libprocess by default.
@@ -417,6 +438,15 @@ on this system (e.g., musl), a separate FTS package must be installed.
 ###############################################################################
 # Miscellaneous checks related to (un)bundled software.
 ###############################################################################
+
+# On OS X, if `--with-apr` was not provided, we try to use an available
+# brew installed version.
+if test -z "`echo $with_apr`" &&
+   test "$OS_NAME" = "darwin" &&
+   test -n "`command -v brew`" &&
+   test -n "`brew list --versions apr`"; then
+  with_apr=`brew --prefix apr`/libexec
+fi
 
 # Check if libapr-1 prefix path was provided, and if so, add it to
 # the CPPFLAGS and LDFLAGS with respective /include/apr-1 and /lib path

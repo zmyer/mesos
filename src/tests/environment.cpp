@@ -14,10 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __WINDOWS__
 #include <sys/wait.h>
+#endif // __WINDOWS__
 
 #include <string.h>
+#ifndef __WINDOWS__
 #include <unistd.h>
+#endif // __WINDOWS__
 
 #include <list>
 #include <set>
@@ -43,7 +47,9 @@
 #include <stout/strings.hpp>
 
 #include <stout/os/exists.hpp>
+#include <stout/os/pstree.hpp>
 #include <stout/os/shell.hpp>
+#include <stout/os/temp.hpp>
 
 #ifdef __linux__
 #include "linux/cgroups.hpp"
@@ -487,7 +493,7 @@ private:
 class SupportedFilesystemTestFilter : public TestFilter
 {
 public:
-  explicit SupportedFilesystemTestFilter(const string fsname)
+  explicit SupportedFilesystemTestFilter(const string& fsname)
   {
 #ifdef __linux__
     Try<bool> check = fs::supported(fsname);
@@ -634,6 +640,10 @@ class RootFilter : public TestFilter
 public:
   bool disable(const ::testing::TestInfo* test) const
   {
+#ifdef __WINDOWS__
+    // On Windows, `root` does not exist, so we cannot run `ROOT_` tests.
+    return matches(test, "ROOT_");
+#else
     Result<string> user = os::user();
     CHECK_SOME(user);
 
@@ -646,6 +656,7 @@ public:
 #endif // __linux__
 
     return matches(test, "ROOT_") && user.get() != "root";
+#endif // __WINDOWS__
   }
 };
 
@@ -785,16 +796,9 @@ Environment::Environment(const Flags& _flags) : flags(_flags)
 void Environment::SetUp()
 {
   // Clear any MESOS_ environment variables so they don't affect our tests.
-  char** environ = os::raw::environment();
-  for (int i = 0; environ[i] != nullptr; i++) {
-    string variable = environ[i];
-    if (variable.find("MESOS_") == 0) {
-      string key;
-      size_t eq = variable.find_first_of("=");
-      if (eq == string::npos) {
-        continue; // Not expecting a missing '=', but ignore anyway.
-      }
-      os::unsetenv(variable.substr(strlen("MESOS_"), eq - strlen("MESOS_")));
+  foreachkey (const string& key, os::environment()) {
+    if (key.find("MESOS_") == 0) {
+      os::unsetenv(key);
     }
   }
 
@@ -806,9 +810,16 @@ void Environment::SetUp()
     os::setenv("MESOS_NATIVE_JAVA_LIBRARY", path);
   }
 
+  // TODO(hausdorff): Revisit whether we need this check when we complete work
+  // to light up Agent tests on Windows (see epic tracking this work at
+  // MESOS-6695). As we incrementally add tests to the Windows build, we will
+  // add this check to the tests that need it; eventually, the goal is to get
+  // rid of this altogether. See MESOS-5903.
+#ifndef __WINDOWS__
   if (!GTEST_IS_THREADSAFE) {
     EXIT(EXIT_FAILURE) << "Testing environment is not thread safe, bailing!";
   }
+#endif // __WINDOWS__
 }
 
 
@@ -841,15 +852,10 @@ void tests::Environment::TemporaryDirectoryEventListener::OnTestEnd(
 #ifdef __linux__
     // Try to remove any mounts under 'directory'.
     if (::geteuid() == 0) {
-      Try<string> umount = os::shell(
-          "grep '%s' /proc/mounts | "
-          "cut -d' ' -f2 | "
-          "xargs --no-run-if-empty umount -l",
-          directory.c_str());
-
-      if (umount.isError()) {
+      Try<Nothing> unmount = fs::unmountAll(directory, MNT_DETACH);
+      if (unmount.isError()) {
         LOG(ERROR) << "Failed to umount for directory '" << directory
-                   << "': " << umount.error();
+                   << "': " << unmount.error();
       }
     }
 #endif
@@ -889,14 +895,19 @@ Try<string> Environment::TemporaryDirectoryEventListener::mkdtemp()
     testName = strings::remove(testName, "DISABLED_", strings::PREFIX);
   }
 
-  Option<string> tmpdir = os::getenv("TMPDIR");
-
-  if (tmpdir.isNone()) {
-    tmpdir = "/tmp";
-  }
+  const string tmpdir = os::temp();
 
   const string& path =
-    path::join(tmpdir.get(), strings::join("_", testCase, testName, "XXXXXX"));
+#ifndef __WINDOWS__
+    path::join(tmpdir, strings::join("_", testCase, testName, "XXXXXX"));
+#else
+    // TODO(hausdorff): When we resolve MESOS-5849, we should change
+    // this back to the same path as the Unix version. This is
+    // currently necessary to make the sandbox path short enough to
+    // avoid the infamous Windows path length errors, which would
+    // normally cause many of our tests to fail.
+    path::join(tmpdir, "XXXXXX");
+#endif // __WINDOWS__
 
   Try<string> mkdtemp = os::mkdtemp(path);
   if (mkdtemp.isSome()) {

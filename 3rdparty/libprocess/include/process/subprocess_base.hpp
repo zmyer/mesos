@@ -174,6 +174,18 @@ public:
     const lambda::function<Try<Nothing>(pid_t)> parent_setup;
 
     friend class Subprocess;
+
+#ifdef __WINDOWS__
+    /**
+     * A Windows Job Object is used to manage groups of processes, which
+     * we use due to the lack of a process hierarchy (in a UNIX sense)
+     * on Windows.
+     *
+     * This hook places the subprocess into a Job Object, which will allow
+     * us to kill the subprocess and all of its children together.
+     */
+    static ParentHook CREATE_JOB();
+#endif // __WINDOWS__
   };
 
   /**
@@ -198,6 +210,19 @@ public:
      * `ChildHook` for generating a new session id.
      */
     static ChildHook SETSID();
+
+#ifndef __WINDOWS__
+    /**
+     * `ChildHook` for duplicating a file descriptor.
+     */
+    static ChildHook DUP2(int oldFd, int newFd);
+
+    /**
+     * `ChildHook` to unset CLOEXEC on a file descriptor. This is
+     * useful to explicitly pass an FD to a subprocess.
+     */
+    static ChildHook UNSET_CLOEXEC(int fd);
+#endif // __WINDOWS__
 
     /**
      * `ChildHook` for starting a Supervisor process monitoring
@@ -280,6 +305,7 @@ public:
    * NOTE: Discarding this future has no effect on the subprocess!
    *
    * @return Future from doing a process::reap of this subprocess.
+   *     Note that process::reap never fails or discards this future.
    */
   Future<Option<int>> status() const { return data->status; }
 

@@ -29,6 +29,7 @@
 #include <stout/try.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
+#include <stout/unreachable.hpp>
 
 namespace mesos {
 namespace slave {
@@ -71,26 +72,55 @@ public:
     class IO
     {
     public:
+      enum class Type
+      {
+        FD,
+        PATH
+      };
+
       static IO PATH(const std::string& path)
       {
-        return IO(process::Subprocess::PATH(path));
+        return IO(Type::PATH, None(), path);
       }
 
       static IO FD(int fd)
       {
-        // NOTE: The FD is not duplicated and will be closed (as seen by the
-        // agent process) when the container is spawned.  This shifts the
-        // burden of FD-lifecycle management into the Containerizer.
-        return IO(process::Subprocess::FD(
-            fd, process::Subprocess::IO::OWNED));
+        return IO(Type::FD, fd, None());
       }
 
-      operator process::Subprocess::IO () const { return io; }
+      operator process::Subprocess::IO () const
+      {
+        switch (type_) {
+          case Type::FD:
+            // NOTE: The FD is not duplicated and will be closed (as
+            // seen by the agent process) when the container is
+            // spawned.  This shifts the burden of FD-lifecycle
+            // management into the Containerizer.
+            return process::Subprocess::FD(
+                fd_.get(),
+                process::Subprocess::IO::OWNED);
+          case Type::PATH:
+            return process::Subprocess::PATH(path_.get());
+          default:
+            UNREACHABLE();
+        }
+      }
+
+      Type type() const { return type_; }
+      Option<int> fd() const { return fd_; }
+      Option<std::string> path() const { return path_; }
 
     private:
-      IO(process::Subprocess::IO _io) : io(_io) {}
+      IO(Type _type,
+         const Option<int>& _fd,
+         const Option<std::string>& _path)
+        : type_(_type),
+          fd_(_fd),
+          path_(_path) {}
 
-      process::Subprocess::IO io;
+      Type type_;
+      Option<int> fd_;
+      Option<std::string> path_;
     };
 
     /**
@@ -128,31 +158,6 @@ public:
   virtual Try<Nothing> initialize() = 0;
 
   /**
-   * Called during the agent recovery process as executors re-register with
-   * the agent.
-   *
-   * The container logger should use this method to do any executor-specific
-   * setup.  This method should have the same side-effects as `prepare`, except
-   * that the executor is already running.  i.e. If `prepare` associates
-   * some metadata with the `ExecutorID` of each executor, that metadata
-   * should be restored here.
-   *
-   * If the container logger's state cannot be recovered, this method should
-   * return a `Failure`.  This failure is logged by the agent, but has no other
-   * effects.  The executor will not be killed.
-   * TODO(josephw): Consider different behavior when the executor cannot be
-   * recovered.  For example, we could add a flag to kill non-recovered
-   * executors.
-   *
-   * NOTE: The executor may have been spawned with a different container logger.
-   * This can occur if an executor is running and the agent is restarted with
-   * a different container logger module.
-   */
-  virtual process::Future<Nothing> recover(
-      const ExecutorInfo& executorInfo,
-      const std::string& sandboxDirectory) = 0;
-
-  /**
    * Called before Mesos creates a container.
    *
    * The container logger is given some of the arguments which the containerizer
@@ -175,7 +180,8 @@ public:
    */
   virtual process::Future<SubprocessInfo> prepare(
       const ExecutorInfo& executorInfo,
-      const std::string& sandboxDirectory) = 0;
+      const std::string& sandboxDirectory,
+      const Option<std::string>& user) = 0;
 };
 
 } // namespace slave {

@@ -78,6 +78,7 @@
 #include <process/owned.hpp>
 #include <process/process.hpp>
 #include <process/profiler.hpp>
+#include <process/reap.hpp>
 #include <process/sequence.hpp>
 #include <process/socket.hpp>
 #include <process/statistics.hpp>
@@ -90,6 +91,7 @@
 #include <process/ssl/flags.hpp>
 
 #include <stout/duration.hpp>
+#include <stout/flags.hpp>
 #include <stout/foreach.hpp>
 #include <stout/lambda.hpp>
 #include <stout/net.hpp>
@@ -98,6 +100,7 @@
 #include <stout/os.hpp>
 #include <stout/os/strerror.hpp>
 #include <stout/path.hpp>
+#include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 #include <stout/synchronized.hpp>
 #include <stout/thread_local.hpp>
@@ -109,9 +112,6 @@
 #include "event_loop.hpp"
 #include "gate.hpp"
 #include "process_reference.hpp"
-
-namespace firewall = process::firewall;
-namespace metrics = process::metrics;
 
 using process::wait; // Necessary on some OS's to disambiguate.
 
@@ -131,8 +131,10 @@ using process::http::authentication::AuthenticatorManager;
 
 using process::http::authorization::AuthorizationCallbacks;
 
-using process::network::Address;
-using process::network::Socket;
+using process::network::inet::Address;
+using process::network::inet::Socket;
+
+using process::network::internal::SocketImpl;
 
 using std::deque;
 using std::find;
@@ -148,6 +150,72 @@ using std::stringstream;
 using std::vector;
 
 namespace process {
+
+namespace internal {
+
+// These are environment variables expected in `process::initialize`.
+// All these flags should be loaded with the prefix "LIBPROCESS_".
+struct Flags : public virtual flags::FlagsBase
+{
+  Flags()
+  {
+    add(&Flags::ip,
+        "ip",
+        "The IP address for communication to and from libprocess.\n"
+        "If not specified, libprocess will attempt to reverse-DNS lookup\n"
+        "the hostname and use that IP instead.");
+
+    add(&Flags::advertise_ip,
+        "advertise_ip",
+        "The IP address that will be advertised to the outside world\n"
+        "for communication to and from libprocess.  This is useful,\n"
+        "for example, for containerized tasks in which communication\n"
+        "is bound locally to a non-public IP that will be inaccessible\n"
+        "to the master.");
+
+    add(&Flags::port,
+        "port",
+        "The port for communication to and from libprocess.\n"
+        "If not specified or set to 0, libprocess will bind it to a random\n"
+        "available port.",
+        [](const Option<int>& value) -> Option<Error> {
+          if (value.isSome()) {
+            if (value.get() < 0 || value.get() > USHRT_MAX) {
+              return Error(
+                  "LIBPROCESS_PORT=" + stringify(value.get()) +
+                  " is not a valid port");
+            }
+          }
+
+          return None();
+        });
+
+    add(&Flags::advertise_port,
+        "advertise_port",
+        "The port that will be advertised to the outside world\n"
+        "for communication to and from libprocess.  NOTE: This port\n"
+        "will not actually be bound (only the local '--port' will be), so\n"
+        "redirection to the local IP and port must be provided separately.",
+        [](const Option<int>& value) -> Option<Error> {
+          if (value.isSome()) {
+            if (value.get() <= 0 || value.get() > USHRT_MAX) {
+              return Error(
+                  "LIBPROCESS_ADVERTISE_PORT=" + stringify(value.get()) +
+                  " is not a valid port");
+            }
+          }
+
+          return None();
+        });
+  }
+
+  Option<net::IP> ip;
+  Option<net::IP> advertise_ip;
+  Option<int> port;
+  Option<int> advertise_port;
+};
+
+} // namespace internal {
 
 namespace ID {
 
@@ -188,7 +256,7 @@ class HttpProxy : public Process<HttpProxy>
 {
 public:
   explicit HttpProxy(const Socket& _socket);
-  virtual ~HttpProxy();
+  virtual ~HttpProxy() {};
 
   // Enqueues the response to be sent once all previously enqueued
   // responses have been processed (e.g., waited for and sent).
@@ -200,7 +268,7 @@ public:
   void handle(const Future<Response>& future, const Request& request);
 
 protected:
-  void initialize() override;
+  void finalize() override;
 
 private:
   // Starts "waiting" on the next available future response.
@@ -233,15 +301,6 @@ private:
   queue<Item*> items;
 
   Option<http::Pipe::Reader> pipe; // Current pipe, if streaming.
-
-  // We sequence the authentication results exposed to the caller
-  // in order to satisfy HTTP pipelining.
-  //
-  // Note that this needs to be done explicitly here because
-  // the authentication router does expose ordered completion
-  // of its Futures (it doesn't have the knowledge of sockets
-  // necessary to do it in a per-connection manner).
-  Owned<Sequence> authentications;
 };
 
 
@@ -301,12 +360,17 @@ public:
   SocketManager();
   ~SocketManager();
 
+  // Closes all managed sockets and clears any associated metadata.
+  // The `__s__` server socket must be closed and `ProcessManager`
+  // must be finalized before calling this.
+  void finalize();
+
   void accepted(const Socket& socket);
 
   void link(ProcessBase* process,
             const UPID& to,
             const ProcessBase::RemoteConnection remote,
-            const Socket::Kind& kind = Socket::DEFAULT_KIND());
+            const SocketImpl::Kind& kind = SocketImpl::DEFAULT_KIND());
 
   // Test-only method to fetch the file descriptor behind a
   // persistent socket.
@@ -314,12 +378,17 @@ public:
 
   PID<HttpProxy> proxy(const Socket& socket);
 
-  void send(Encoder* encoder, bool persist);
+  // Used to clean up the pointer to an `HttpProxy` in case the
+  // `HttpProxy` is killed outside the control of the `SocketManager`.
+  // This generally happens when `process::finalize` is called.
+  void unproxy(const Socket& socket);
+
+  void send(Encoder* encoder, bool persist, const Socket& socket);
   void send(const Response& response,
             const Request& request,
             const Socket& socket);
   void send(Message* message,
-            const Socket::Kind& kind = Socket::DEFAULT_KIND());
+            const SocketImpl::Kind& kind = SocketImpl::DEFAULT_KIND());
 
   Encoder* next(int s);
 
@@ -370,24 +439,24 @@ private:
   set<int> dispose;
 
   // Map from socket to socket address for outbound sockets.
-  map<int, Address> addresses;
+  hashmap<int, Address> addresses;
 
   // Map from socket address to temporary sockets (outbound sockets
   // that will be closed once there is no more data to send on them).
-  map<Address, int> temps;
+  hashmap<Address, int> temps;
 
   // Map from socket address (ip, port) to persistent sockets
   // (outbound sockets that will remain open even if there is no more
   // data to send on them).  We distinguish these from the 'temps'
   // collection so we can tell when a persistent socket has been lost
   // (and thus generate ExitedEvents).
-  map<Address, int> persists;
+  hashmap<Address, int> persists;
 
   // Map from outbound socket to outgoing queue.
-  map<int, queue<Encoder*>> outgoing;
+  hashmap<int, queue<Encoder*>> outgoing;
 
   // HTTP proxies.
-  map<int, HttpProxy*> proxies;
+  hashmap<int, HttpProxy*> proxies;
 
   // Protects instance variables.
   std::recursive_mutex mutex;
@@ -399,6 +468,13 @@ class ProcessManager
 public:
   explicit ProcessManager(const Option<string>& delegate);
   ~ProcessManager();
+
+  // Prevents any further processes from spawning and terminates all
+  // running processes. The special `gc` process will be terminated
+  // last. Then joins all processing threads and stops the event loop.
+  //
+  // This is a prerequisite for finalizing the `SocketManager`.
+  void finalize();
 
   // Initializes the processing threads and the event loop thread,
   // and returns the number of processing threads created.
@@ -420,7 +496,10 @@ public:
       Event* event,
       ProcessBase* sender = nullptr);
 
+  // TODO(josephw): Change the return type to a `Try<UPID>`. Currently,
+  // if this method fails, we return a default constructed `UPID`.
   UPID spawn(ProcessBase* process, bool manage);
+
   void resume(ProcessBase* process);
   void cleanup(ProcessBase* process);
 
@@ -470,8 +549,17 @@ private:
   // List of rules applied to all incoming HTTP requests.
   vector<Owned<firewall::FirewallRule>> firewallRules;
   std::recursive_mutex firewall_mutex;
+
+  // Whether the process manager is finalizing or not.
+  // If true, no further processes will be spawned.
+  std::atomic_bool finalizing;
 };
 
+
+// Synchronization primitives for `initialize`.
+// See documentation in `initialize` for how they are used.
+static std::atomic_bool initialize_started(false);
+static std::atomic_bool initialize_complete(false);
 
 // Server socket listen backlog.
 static const int LISTEN_BACKLOG = 500000;
@@ -479,8 +567,17 @@ static const int LISTEN_BACKLOG = 500000;
 // Local server socket.
 static Socket* __s__ = nullptr;
 
+// This mutex is only used to prevent a race between the `on_accept`
+// callback loop and closing/deleting `__s__` in `process::finalize`.
+static std::mutex* socket_mutex = new std::mutex();
+
+// The future returned by the last call to `__s__->accept()`.
+// This is used in `process::finalize` to explicitly terminate the
+// `__s__` socket's callback loop.
+static Future<Socket> future_accept;
+
 // Local socket address.
-static Address __address__;
+static Address __address__ = Address::ANY_ANY();
 
 // Active SocketManager (eventually will probably be thread-local).
 static SocketManager* socket_manager = nullptr;
@@ -521,6 +618,20 @@ THREAD_LOCAL ProcessBase* __process__ = nullptr;
 // Per thread executor pointer.
 THREAD_LOCAL Executor* _executor_ = nullptr;
 
+namespace metrics {
+namespace internal {
+
+PID<metrics::internal::MetricsProcess> metrics;
+
+} // namespace internal {
+} // namespace metrics {
+
+namespace internal {
+
+PID<process::internal::ReaperProcess> reaper;
+
+} // namespace internal {
+
 
 namespace http {
 
@@ -549,12 +660,20 @@ namespace authorization {
 
 void setCallbacks(const AuthorizationCallbacks& callbacks)
 {
+  if (authorization_callbacks != nullptr) {
+    delete authorization_callbacks;
+  }
+
   authorization_callbacks = new AuthorizationCallbacks(callbacks);
 }
 
 
 void unsetCallbacks()
 {
+  if (authorization_callbacks != nullptr) {
+    delete authorization_callbacks;
+  }
+
   authorization_callbacks = nullptr;
 }
 
@@ -615,7 +734,26 @@ static bool libprocess(Request* request)
 }
 
 
-static Message* parse(Request* request)
+// Returns a 'BODY' request once the body of the provided
+// 'PIPE' request can be read completely.
+static Future<Owned<Request>> convert(Owned<Request>&& pipeRequest)
+{
+  CHECK_EQ(Request::PIPE, pipeRequest->type);
+  CHECK_SOME(pipeRequest->reader);
+  CHECK(pipeRequest->body.empty());
+
+  return pipeRequest->reader->readAll()
+    .then([pipeRequest](const string& body) -> Future<Owned<Request>> {
+      pipeRequest->type = Request::BODY;
+      pipeRequest->body = body;
+      pipeRequest->reader = None(); // Remove the reader.
+
+      return pipeRequest;
+    });
+}
+
+
+static Future<Message*> parse(const Request& request)
 {
   // TODO(benh): Do better error handling (to deal with a malformed
   // libprocess message, malicious or otherwise).
@@ -623,11 +761,11 @@ static Message* parse(Request* request)
   // First try and determine 'from'.
   Option<UPID> from = None();
 
-  if (request->headers.contains("Libprocess-From")) {
-    from = UPID(strings::trim(request->headers["Libprocess-From"]));
+  if (request.headers.contains("Libprocess-From")) {
+    from = UPID(strings::trim(request.headers.at("Libprocess-From")));
   } else {
     // Try and get 'from' from the User-Agent.
-    const string& agent = request->headers["User-Agent"];
+    const string& agent = request.headers.at("User-Agent");
     const string identifier = "libprocess/";
     size_t index = agent.find(identifier);
     if (index != string::npos) {
@@ -636,37 +774,42 @@ static Message* parse(Request* request)
   }
 
   if (from.isNone()) {
-    return nullptr;
+    return Failure("Failed to determine sender from request headers");
   }
 
   // Now determine 'to'.
-  size_t index = request->url.path.find('/', 1);
+  size_t index = request.url.path.find('/', 1);
   index = index != string::npos ? index - 1 : string::npos;
 
   // Decode possible percent-encoded 'to'.
-  Try<string> decode = http::decode(request->url.path.substr(1, index));
+  Try<string> decode = http::decode(request.url.path.substr(1, index));
 
   if (decode.isError()) {
-    VLOG(2) << "Failed to decode URL path: " << decode.get();
-    return nullptr;
+    return Failure("Failed to decode URL path: " + decode.get());
   }
 
   const UPID to(decode.get(), __address__);
 
   // And now determine 'name'.
-  index = index != string::npos ? index + 2: request->url.path.size();
-  const string name = request->url.path.substr(index);
+  index = index != string::npos ? index + 2: request.url.path.size();
+  const string name = request.url.path.substr(index);
 
   VLOG(2) << "Parsed message name '" << name
           << "' for " << to << " from " << from.get();
 
-  Message* message = new Message();
-  message->name = name;
-  message->from = from.get();
-  message->to = to;
-  message->body = request->body;
+  CHECK_SOME(request.reader);
+  http::Pipe::Reader reader = request.reader.get(); // Remove const.
 
-  return message;
+  return reader.readAll()
+    .then([from, name, to](const string& body) {
+      Message* message = new Message();
+      message->name = name;
+      message->from = from.get();
+      message->to = to;
+      message->body = body;
+
+      return message;
+    });
 }
 
 
@@ -677,7 +820,7 @@ void decode_recv(
     char* data,
     size_t size,
     Socket socket,
-    DataDecoder* decoder)
+    StreamingRequestDecoder* decoder)
 {
   if (length.isDiscarded() || length.isFailed()) {
     if (length.isFailed()) {
@@ -723,7 +866,7 @@ void decode_recv(
 
     foreach (Request* request, requests) {
       request->client = address.get();
-      process_manager->handle(decoder->socket(), request);
+      process_manager->handle(socket, request);
     }
   }
 
@@ -783,7 +926,7 @@ void on_accept(const Future<Socket>& socket)
     const size_t size = 80 * 1024;
     char* data = new char[size];
 
-    DataDecoder* decoder = new DataDecoder(socket.get());
+    StreamingRequestDecoder* decoder = new StreamingRequestDecoder();
 
     socket.get().recv(data, size)
       .onAny(lambda::bind(
@@ -795,8 +938,13 @@ void on_accept(const Future<Socket>& socket)
           decoder));
   }
 
-  __s__->accept()
-    .onAny(lambda::bind(&on_accept, lambda::_1));
+  // NOTE: `__s__` may be cleaned up during `process::finalize`.
+  synchronized (socket_mutex) {
+    if (__s__ != nullptr) {
+      future_accept = __s__->accept()
+        .onAny(lambda::bind(&on_accept, lambda::_1));
+    }
+  }
 }
 
 } // namespace internal {
@@ -813,6 +961,32 @@ void install(vector<Owned<FirewallRule>>&& rules)
 
 } // namespace firewall {
 
+
+// Tests can declare this function and use it to re-configure libprocess
+// programmatically. Without explicitly declaring this function, it
+// is not visible. This is the preferred behavior as we do not want
+// applications changing these settings while they are
+// running (this would be undefined behavior).
+// NOTE: If the test is changing SSL-related configuration, the SSL library
+// must be reinitialized first.  See `reinitialize` in `openssl.cpp`.
+void reinitialize(
+    const Option<string>& delegate,
+    const Option<string>& readwriteAuthenticationRealm,
+    const Option<string>& readonlyAuthenticationRealm)
+{
+  process::finalize();
+
+  // Reset the initialization synchronization primitives.
+  initialize_started.store(false);
+  initialize_complete.store(false);
+
+  process::initialize(
+      delegate,
+      readwriteAuthenticationRealm,
+      readonlyAuthenticationRealm);
+}
+
+
 bool initialize(
     const Option<string>& delegate,
     const Option<string>& readwriteAuthenticationRealm,
@@ -827,8 +1001,6 @@ bool initialize(
   // frequently throughout the code base. Therefore we chose to use
   // atomics rather than `Once`, as the overhead of a mutex and
   // condition variable is excessive here.
-  static std::atomic_bool initialize_started(false);
-  static std::atomic_bool initialize_complete(false);
 
   // Try and do the initialization or wait for it to complete.
 
@@ -859,6 +1031,18 @@ bool initialize(
       return false;
     }
   }
+
+#ifdef __WINDOWS__
+  // Initialize the Windows socket stack. This operation is idempotent.
+  // NOTE: This call can report an error here if it determines it is
+  // incompatible with the WSA version, so it is important to call this
+  // even if we expect users of libprocess to have already started the
+  // socket stack themselves. We exit the process under error condition
+  // to prevent cryptic errors later.
+  if (!net::wsa_initialize()) {
+    EXIT(EXIT_FAILURE) << "WSA failed to initialize";
+  }
+#endif // __WINDOWS__
 
   // We originally tried to leave SIGPIPE unblocked and to work
   // around SIGPIPE in order to avoid imposing policy on users
@@ -896,28 +1080,28 @@ bool initialize(
 
   Clock::initialize(lambda::bind(&timedout, lambda::_1));
 
-  __address__ = Address::LOCALHOST_ANY();
+  // Fill in the local IP and port for inter-libprocess communication.
+  __address__ = Address::ANY_ANY();
 
-  // Check environment for ip.
-  Option<string> value = os::getenv("LIBPROCESS_IP");
-  if (value.isSome()) {
-    Try<net::IP> ip = net::IP::parse(value.get(), AF_INET);
-    if (ip.isError()) {
-      LOG(FATAL) << "Parsing LIBPROCESS_IP=" << value.get()
-                 << " failed: " << ip.error();
-    }
-    __address__.ip = ip.get();
+  // Fetch and parse the libprocess environment variables.
+  internal::Flags flags;
+  Try<flags::Warnings> load = flags.load("LIBPROCESS_");
+
+  if (load.isError()) {
+    EXIT(EXIT_FAILURE) << flags.usage(load.error());
   }
 
-  // Check environment for port.
-  value = os::getenv("LIBPROCESS_PORT");
-  if (value.isSome()) {
-    Try<int> result = numify<int>(value.get().c_str());
-    if (result.isSome() && result.get() >=0 && result.get() <= USHRT_MAX) {
-      __address__.port = result.get();
-    } else {
-      LOG(FATAL) << "LIBPROCESS_PORT=" << value.get() << " is not a valid port";
-    }
+  // Log any flag warnings.
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
+
+  if (flags.ip.isSome()) {
+    __address__.ip = flags.ip.get();
+  }
+
+  if (flags.port.isSome()) {
+    __address__.port = flags.port.get();
   }
 
   // Create a "server" socket for communicating.
@@ -948,25 +1132,12 @@ bool initialize(
   __address__ = bind.get();
 
   // If advertised IP and port are present, use them instead.
-  value = os::getenv("LIBPROCESS_ADVERTISE_IP");
-  if (value.isSome()) {
-    Try<net::IP> ip = net::IP::parse(value.get(), AF_INET);
-    if (ip.isError()) {
-      LOG(FATAL) << "Parsing LIBPROCESS_ADVERTISE_IP=" << value.get()
-                 << " failed: " << ip.error();
-    }
-    __address__.ip = ip.get();
+  if (flags.advertise_ip.isSome()) {
+    __address__.ip = flags.advertise_ip.get();
   }
 
-  value = os::getenv("LIBPROCESS_ADVERTISE_PORT");
-  if (value.isSome()) {
-    Try<int> result = numify<int>(value.get().c_str());
-    if (result.isSome() && result.get() >=0 && result.get() <= USHRT_MAX) {
-      __address__.port = result.get();
-    } else {
-      LOG(FATAL) << "LIBPROCESS_ADVERTISE_PORT=" << value.get()
-                 << " is not a valid port";
-    }
+  if (flags.advertise_port.isSome()) {
+    __address__.port = flags.advertise_port.get();
   }
 
   // Lookup hostname if missing ip or if ip is 0.0.0.0 in case we
@@ -1002,7 +1173,7 @@ bool initialize(
   // invoke `accept()` and `spawn()` below.
   initialize_complete.store(true);
 
-  __s__->accept()
+  future_accept = __s__->accept()
     .onAny(lambda::bind(&internal::on_accept, lambda::_1));
 
   // TODO(benh): Make sure creating the garbage collector, logging
@@ -1042,8 +1213,10 @@ bool initialize(
   // Create global help process.
   help = spawn(new Help(delegate), true);
 
-  // Initialize the global metrics process.
-  metrics::initialize(readonlyAuthenticationRealm);
+  // Create the global metrics process.
+  metrics::internal::metrics = spawn(
+      metrics::internal::MetricsProcess::create(readonlyAuthenticationRealm),
+      true);
 
   // Create the global logging process.
   _logging = spawn(new Logging(readwriteAuthenticationRealm), true);
@@ -1056,6 +1229,10 @@ bool initialize(
 
   // Create the global HTTP authentication router.
   authenticator_manager = new AuthenticatorManager();
+
+  // Create the global reaper process.
+  process::internal::reaper =
+    spawn(new process::internal::ReaperProcess(), true);
 
   // Initialize the mime types.
   mime::initialize();
@@ -1077,32 +1254,81 @@ bool initialize(
 
 // Gracefully winds down libprocess in roughly the reverse order of
 // initialization.
-void finalize()
+//
+// NOTE: `finalize_wsa` controls whether libprocess also finalizes
+// the Windows socket stack, which affects the entire process.
+void finalize(bool finalize_wsa)
 {
-  // The clock is only paused during tests.  Pausing may lead to infinite waits
-  // during clean up, so we make sure the clock is running normally.
+  // The clock is only paused during tests.  Pausing may lead to infinite
+  // waits during clean up, so we make sure the clock is running normally.
   Clock::resume();
 
-  // This will terminate any existing processes created via `spawn()`,
-  // like `gc`, `help`, `Logging()`, `Profiler()`, and `System()`.
-  // NOTE: This will also stop the event loop.
-
-  // TODO(arojas): The HTTP authentication logic in ProcessManager
-  // does not handle the case where the process_manager is deleted
-  // while authentication was in progress!!
-
+  // This will terminate the underlying process for the `Route`.
   delete processes_route;
   processes_route = nullptr;
+
+  // Close the server socket.
+  // This will prevent any further connections managed by the `SocketManager`.
+  synchronized (socket_mutex) {
+    // Explicitly terminate the callback loop used to accept incoming
+    // connections. This is necessary as the server socket ignores
+    // most errors, including when the server socket has been closed.
+    future_accept.discard();
+
+    delete __s__;
+    __s__ = nullptr;
+  }
+
+  // Terminate all running processes and prevent further processes from
+  // being spawned. This will also clean up any metadata for running
+  // processes held by the `SocketManager`. After this method returns,
+  // libprocess should be single-threaded.
+  process_manager->finalize();
+
+  // Now that all threads except for the main thread have joined, we should
+  // delete the one remaining `_executor_` pointer.
+  delete _executor_;
+  _executor_ = nullptr;
+
+  // This clears any remaining timers. Because the event loop has been
+  // stopped, no timers will fire.
+  Clock::finalize();
+
+  // Clean up the socket manager.
+  // Terminating processes above will also clean up any links between
+  // processes (which may be expressed as open sockets) and the various
+  // `HttpProxy` processes managing incoming HTTP requests. We cannot
+  // delete the `SocketManager` yet, since the `ProcessManager` may
+  // potentially dereference it.
+  socket_manager->finalize();
+
+  // This is dereferenced inside `ProcessBase::visit(HttpEvent&)`.
+  // We can safely delete it since no further incoming HTTP connections
+  // can be made because the server socket has been destroyed. This must
+  // be deleted before the `ProcessManager` as it will indirectly
+  // dereference the `ProcessManager`.
+  delete authenticator_manager;
+  authenticator_manager = nullptr;
+
+  // At this point, there should be no running processes, no sockets,
+  // and a single remaining thread. We can safely remove the global
+  // `SocketManager` and `ProcessManager` pointers now.
+  delete socket_manager;
+  socket_manager = nullptr;
 
   delete process_manager;
   process_manager = nullptr;
 
-  // TODO(neilc): We currently don't cleanup or deallocate the
-  // socket_manager (MESOS-3910).
+  // Clear the public address of the server socket.
+  // NOTE: This variable is necessary for process communication, so it
+  // cannot be cleared until after the `ProcessManager` is deleted.
+  __address__ = Address::ANY_ANY();
 
-  // The clock must be cleaned up after the `process_manager` as processes
-  // may otherwise add timers after cleaning up.
-  Clock::finalize();
+#ifdef __WINDOWS__
+  if (finalize_wsa && !net::wsa_cleanup()) {
+    EXIT(EXIT_FAILURE) << "Failed to finalize the WSA socket stack";
+  }
+#endif // __WINDOWS__
 }
 
 
@@ -1133,7 +1359,7 @@ HttpProxy::HttpProxy(const Socket& _socket)
     socket(_socket) {}
 
 
-HttpProxy::~HttpProxy()
+void HttpProxy::finalize()
 {
   // Need to make sure response producers know not to continue to
   // create a response (streaming or otherwise).
@@ -1165,16 +1391,10 @@ HttpProxy::~HttpProxy()
     items.pop();
     delete item;
   }
-}
 
-
-void HttpProxy::initialize()
-{
-  // We have to construct the sequence outside of the HttpProxy
-  // constructor in order to prevent a deadlock between the
-  // SocketManager and the ProcessManager (see the comment in
-  // SocketManager::proxy).
-  authentications.reset(new Sequence("__authentications__"));
+  // Just in case this process gets killed outside of `SocketManager::close`,
+  // remove the proxy from the socket.
+  socket_manager->unproxy(socket);
 }
 
 
@@ -1290,13 +1510,15 @@ bool HttpProxy::process(const Future<Response>& future, const Request& request)
         // TODO(benh): Consider a way to have the socket manager turn
         // on TCP_CORK for both sends and then turn it off.
         socket_manager->send(
-            new HttpResponseEncoder(socket, response, request),
-            true);
+            new HttpResponseEncoder(response, request),
+            true,
+            socket);
 
         // Note the file descriptor gets closed by FileEncoder.
         socket_manager->send(
-            new FileEncoder(socket, fd, s.st_size),
-            request.keepAlive);
+            new FileEncoder(fd, s.st_size),
+            request.keepAlive,
+            socket);
       }
     }
   } else if (response.type == Response::PIPE) {
@@ -1311,8 +1533,9 @@ bool HttpProxy::process(const Future<Response>& future, const Request& request)
     VLOG(3) << "Starting \"chunked\" streaming";
 
     socket_manager->send(
-        new HttpResponseEncoder(socket, response, request),
-        true);
+        new HttpResponseEncoder(response, request),
+        true,
+        socket);
 
     CHECK_SOME(response.reader);
     http::Pipe::Reader reader = response.reader.get();
@@ -1367,8 +1590,9 @@ void HttpProxy::stream(
 
     // Always persist the connection when streaming is not finished.
     socket_manager->send(
-        new DataEncoder(socket, out.str()),
-        finished ? request->keepAlive : true);
+        new DataEncoder(out.str()),
+        finished ? request->keepAlive : true,
+        socket);
   } else if (chunk.isFailed()) {
     VLOG(1) << "Failed to read from stream: " << chunk.failure();
     // TODO(bmahler): Have to close connection if headers were sent!
@@ -1393,6 +1617,36 @@ SocketManager::SocketManager() {}
 
 
 SocketManager::~SocketManager() {}
+
+
+void SocketManager::finalize()
+{
+  // We require the `SocketManager` to be finalized after the server socket
+  // has been closed. This means that no further incoming sockets will be
+  // given to the `SocketManager` at this point.
+  CHECK(__s__ == nullptr);
+
+  // We require all processes to be terminated prior to finalizing the
+  // `SocketManager`. This simplifies the finalization logic as we do not
+  // have to worry about sockets or links being created during cleanup.
+  CHECK(gc == nullptr);
+
+  int socket = -1;
+  // Close each socket.
+  // Don't hold the lock since there is a dependency between `SocketManager`
+  // and `ProcessManager`, which may result in deadlock.  See comments in
+  // `SocketManager::close` for more details.
+  do {
+    synchronized (mutex) {
+      socket = !sockets.empty() ? sockets.begin()->first : -1;
+    }
+
+    if (socket >= 0) {
+      // This will also clean up any other state related to this socket.
+      close(socket);
+    }
+  } while (socket >= 0);
+}
 
 
 void SocketManager::accepted(const Socket& socket)
@@ -1453,7 +1707,7 @@ void SocketManager::link_connect(
       future.isFailed() &&
       network::openssl::flags().enabled &&
       network::openssl::flags().support_downgrade &&
-      socket.kind() == Socket::SSL;
+      socket.kind() == SocketImpl::Kind::SSL;
 
     Option<Socket> poll_socket = None();
 
@@ -1461,7 +1715,15 @@ void SocketManager::link_connect(
     // POLL socket.
     if (attempt_downgrade) {
       synchronized (mutex) {
-        Try<Socket> create = Socket::create(Socket::POLL);
+        // It is possible that a prior call to `link()` with `RECONNECT`
+        // semantics has swapped out this socket before we finished
+        // connecting. In this case, we simply stop here and allow the
+        // latest created socket to complete the link.
+        if (sockets.count(socket) <= 0) {
+          return;
+        }
+
+        Try<Socket> create = Socket::create(SocketImpl::Kind::POLL);
         if (create.isError()) {
           VLOG(1) << "Failed to link, create socket: " << create.error();
           socket_manager->close(socket);
@@ -1497,16 +1759,26 @@ void SocketManager::link_connect(
     return;
   }
 
-  size_t size = 80 * 1024;
-  char* data = new char[size];
+  synchronized (mutex) {
+    // It is possible that a prior call to `link()` with `RECONNECT`
+    // semantics has swapped out this socket before we finished
+    // connecting. In this case, we simply stop here and allow the
+    // latest created socket to complete the link.
+    if (sockets.count(socket) <= 0) {
+      return;
+    }
 
-  socket.recv(data, size)
-    .onAny(lambda::bind(
-        &internal::ignore_recv_data,
-        lambda::_1,
-        socket,
-        data,
-        size));
+    size_t size = 80 * 1024;
+    char* data = new char[size];
+
+    socket.recv(data, size)
+      .onAny(lambda::bind(
+          &internal::ignore_recv_data,
+          lambda::_1,
+          socket,
+          data,
+          size));
+  }
 
   // In order to avoid a race condition where internal::send() is
   // called after SocketManager::link() but before the socket is
@@ -1531,7 +1803,7 @@ void SocketManager::link(
     ProcessBase* process,
     const UPID& to,
     const ProcessBase::RemoteConnection remote,
-    const Socket::Kind& kind)
+    const SocketImpl::Kind& kind)
 {
   // TODO(benh): The semantics we want to support for link are such
   // that if there is nobody to link to (local or remote) then an
@@ -1557,7 +1829,13 @@ void SocketManager::link(
         // from SSL to POLL if enabled.
         Try<Socket> create = Socket::create(kind);
         if (create.isError()) {
-          VLOG(1) << "Failed to link, create socket: " << create.error();
+          LOG(WARNING) << "Failed to link, create socket: " << create.error();
+
+          // Failure to create a new socket should generate an `ExitedEvent`
+          // for the linkee. At this point, we have not passed ownership of
+          // this socket to the `SocketManager`, so there is only one possible
+          // linkee to notify.
+          process->enqueue(new ExitedEvent(to));
           return;
         }
         socket = create.get();
@@ -1566,9 +1844,9 @@ void SocketManager::link(
         CHECK(sockets.count(s) == 0);
         sockets.emplace(s, socket.get());
 
-        addresses[s] = to.address;
+        addresses.emplace(s, to.address);
 
-        persists[to.address] = s;
+        persists.emplace(to.address, s);
 
         // Initialize 'outgoing' to prevent a race with
         // SocketManager::send() while the socket is not yet connected.
@@ -1583,7 +1861,13 @@ void SocketManager::link(
         // create a new socket anyway.
         Try<Socket> create = Socket::create(kind);
         if (create.isError()) {
-          VLOG(1) << "Failed to link, create socket: " << create.error();
+          LOG(WARNING) << "Failed to link, create socket: " << create.error();
+
+          // Failure to create a new socket should generate an `ExitedEvent`
+          // for the linkee. At this point, we have not passed ownership of
+          // this socket to the `SocketManager`, so there is only one possible
+          // linkee to notify.
+          process->enqueue(new ExitedEvent(to));
           return;
         }
 
@@ -1591,10 +1875,21 @@ void SocketManager::link(
 
         // Update all the data structures that are mapped to the old
         // socket. They will now point to the new socket we are about
-        // to try to connect. The old socket should no longer have any
-        // references after the swap and should be closed.
+        // to try to connect.
         Socket existing(sockets.at(persists.at(to.address)));
         swap_implementing_socket(existing, socket.get());
+
+        // The `existing` socket could be a perfectly functional socket.
+        // In this case, the socket may be referenced in the callback
+        // loop of `internal::ignore_recv_data`. We shutdown the socket
+        // in order to interrupt this callback loop and thereby release
+        // the final socket reference. This will not result in an
+        // `ExitedEvent` because we have already removed the `existing`
+        // socket from the mapping of linkees and linkers.
+        Try<Nothing> shutdown = existing.shutdown();
+        if (shutdown.isError()) {
+          VLOG(1) << "Failed to shutdown old link: " << shutdown.error();
+        }
 
         connect = true;
       }
@@ -1674,6 +1969,20 @@ PID<HttpProxy> SocketManager::proxy(const Socket& socket)
 }
 
 
+void SocketManager::unproxy(const Socket& socket)
+{
+  synchronized (mutex) {
+    auto proxy = proxies.find(socket);
+
+    // NOTE: We may have already removed this proxy if the associated
+    // `HttpProxy` was destructed via `SocketManager::close`.
+    if (proxy != proxies.end()) {
+      proxies.erase(proxy);
+    }
+  }
+}
+
+
 namespace internal {
 
 void _send(
@@ -1746,12 +2055,11 @@ void _send(
 } // namespace internal {
 
 
-void SocketManager::send(Encoder* encoder, bool persist)
+void SocketManager::send(Encoder* encoder, bool persist, const Socket& socket)
 {
   CHECK(encoder != nullptr);
 
   synchronized (mutex) {
-    Socket socket = encoder->socket();
     if (sockets.count(socket) > 0) {
       // Update whether or not this socket should get disposed after
       // there is no more data to send.
@@ -1774,7 +2082,7 @@ void SocketManager::send(Encoder* encoder, bool persist)
   }
 
   if (encoder != nullptr) {
-    internal::send(encoder, encoder->socket());
+    internal::send(encoder, socket);
   }
 }
 
@@ -1794,7 +2102,7 @@ void SocketManager::send(
     }
   }
 
-  send(new HttpResponseEncoder(socket, response, request), persist);
+  send(new HttpResponseEncoder(response, request), persist, socket);
 }
 
 
@@ -1816,7 +2124,7 @@ void SocketManager::send_connect(
       future.isFailed() &&
       network::openssl::flags().enabled &&
       network::openssl::flags().support_downgrade &&
-      socket.kind() == Socket::SSL;
+      socket.kind() == SocketImpl::Kind::SSL;
 
     Option<Socket> poll_socket = None();
 
@@ -1824,7 +2132,7 @@ void SocketManager::send_connect(
     // POLL socket.
     if (attempt_downgrade) {
       synchronized (mutex) {
-        Try<Socket> create = Socket::create(Socket::POLL);
+        Try<Socket> create = Socket::create(SocketImpl::Kind::POLL);
         if (create.isError()) {
           VLOG(1) << "Failed to link, create socket: " << create.error();
           socket_manager->close(socket);
@@ -1863,7 +2171,7 @@ void SocketManager::send_connect(
     return;
   }
 
-  Encoder* encoder = new MessageEncoder(socket, message);
+  Encoder* encoder = new MessageEncoder(message);
 
   // Receive and ignore data from this socket. Note that we don't
   // expect to receive anything other than HTTP '202 Accepted'
@@ -1883,7 +2191,7 @@ void SocketManager::send_connect(
 }
 
 
-void SocketManager::send(Message* message, const Socket::Kind& kind)
+void SocketManager::send(Message* message, const SocketImpl::Kind& kind)
 {
   CHECK(message != nullptr);
 
@@ -1908,7 +2216,7 @@ void SocketManager::send(Message* message, const Socket::Kind& kind)
       }
 
       if (outgoing.count(socket.get()) > 0) {
-        outgoing[socket.get()].push(new MessageEncoder(socket.get(), message));
+        outgoing[socket.get()].push(new MessageEncoder(message));
         return;
       } else {
         // Initialize the outgoing queue.
@@ -1933,8 +2241,8 @@ void SocketManager::send(Message* message, const Socket::Kind& kind)
       CHECK(sockets.count(s) == 0);
       sockets.emplace(s, socket.get());
 
-      addresses[s] = address;
-      temps[address] = s;
+      addresses.emplace(s, address);
+      temps.emplace(address, s);
 
       dispose.insert(s);
 
@@ -1957,9 +2265,7 @@ void SocketManager::send(Message* message, const Socket::Kind& kind)
   } else {
     // If we're not connecting and we haven't added the encoder to
     // the 'outgoing' queue then schedule it to be sent.
-    internal::send(
-        new MessageEncoder(socket.get(), message),
-        socket.get());
+    internal::send(new MessageEncoder(message), socket.get());
   }
 }
 
@@ -1998,10 +2304,10 @@ Encoder* SocketManager::next(int s)
           // This is either a temporary socket we created or it's a
           // socket that we were receiving data from and possibly
           // sending HTTP responses back on. Clean up either way.
-          if (addresses.count(s) > 0) {
-            const Address& address = addresses[s];
-            CHECK(temps.count(address) > 0 && temps[address] == s);
-            temps.erase(address);
+          Option<Address> address = addresses.get(s);
+          if (address.isSome()) {
+            CHECK(temps.count(address.get()) > 0 && temps[address.get()] == s);
+            temps.erase(address.get());
             addresses.erase(s);
           }
 
@@ -2048,7 +2354,7 @@ Encoder* SocketManager::next(int s)
 
 void SocketManager::close(int s)
 {
-  HttpProxy* proxy = nullptr; // Non-null if needs to be terminated.
+  Option<UPID> proxy; // Some if an `HttpProxy` needs to be terminated.
 
   synchronized (mutex) {
     // This socket might not be active if it was already asked to get
@@ -2069,15 +2375,15 @@ void SocketManager::close(int s)
       }
 
       // Clean up after sockets used for remote communication.
-      if (addresses.count(s) > 0) {
-        const Address& address = addresses[s];
-
+      Option<Address> address = addresses.get(s);
+      if (address.isSome()) {
         // Don't bother invoking `exited` unless socket was persistent.
-        if (persists.count(address) > 0 && persists[address] == s) {
-          persists.erase(address);
-          exited(address); // Generate ExitedEvent(s)!
-        } else if (temps.count(address) > 0 && temps[address] == s) {
-          temps.erase(address);
+        if (persists.count(address.get()) > 0 && persists[address.get()] == s) {
+          persists.erase(address.get());
+          exited(address.get()); // Generate ExitedEvent(s)!
+        } else if (temps.count(address.get()) > 0 &&
+                   temps[address.get()] == s) {
+          temps.erase(address.get());
         }
 
         addresses.erase(s);
@@ -2085,7 +2391,7 @@ void SocketManager::close(int s)
 
       // Clean up any proxy associated with this socket.
       if (proxies.count(s) > 0) {
-        proxy = proxies[s];
+        proxy = proxies.at(s)->self();
         proxies.erase(s);
       }
 
@@ -2118,8 +2424,8 @@ void SocketManager::close(int s)
 
   // We terminate the proxy outside the synchronized block to avoid
   // possible deadlock between the ProcessManager and SocketManager.
-  if (proxy != nullptr) {
-    terminate(proxy);
+  if (proxy.isSome()) {
+    terminate(proxy.get());
   }
 
   // Note that we don't actually:
@@ -2264,18 +2570,20 @@ void SocketManager::swap_implementing_socket(
     // Update the fd that this address is associated with. Once we've
     // done this we can update the 'temps' and 'persists'
     // data structures using this updated address.
-    addresses[to_fd] = addresses[from_fd];
+    Option<Address> address = addresses.get(from_fd);
+    CHECK_SOME(address);
+    addresses.emplace(to_fd, address.get());
     addresses.erase(from_fd);
 
-    // If this address is a temporary link.
-    if (temps.count(addresses[to_fd]) > 0) {
-      temps[addresses[to_fd]] = to_fd;
+    // If this address is a persistent or temporary link
+    // that matches the original FD.
+    if (persists.count(address.get()) > 0 &&
+        persists.at(address.get()) == from_fd) {
+      persists[address.get()] = to_fd;
       // No need to erase as we're changing the value, not the key.
-    }
-
-    // If this address is a persistent link.
-    if (persists.count(addresses[to_fd]) > 0) {
-      persists[addresses[to_fd]] = to_fd;
+    } else if (temps.count(address.get()) > 0 &&
+               temps.at(address.get()) == from_fd) {
+      temps[address.get()] = to_fd;
       // No need to erase as we're changing the value, not the key.
     }
 
@@ -2295,49 +2603,68 @@ void SocketManager::swap_implementing_socket(
 ProcessManager::ProcessManager(const Option<string>& _delegate)
   : delegate(_delegate),
     running(0),
-    joining_threads(false) {}
+    joining_threads(false),
+    finalizing(false) {}
 
 
-ProcessManager::~ProcessManager()
+ProcessManager::~ProcessManager() {}
+
+
+void ProcessManager::finalize()
 {
   CHECK(gc != nullptr);
+
+  // Prevent anymore processes from being spawned.
+  finalizing.store(true);
 
   // Terminate one process at a time. Events are deleted and the process
   // is erased from `processes` in ProcessManager::cleanup(). Don't hold
   // the lock or process the whole map as terminating one process might
   // trigger other terminations.
   //
-  // We skip the GC process here and instead terminate it below. This
-  // ensures that the GC process is running whenever we terminate any
-  // GC-managed process, which is necessary to ensure GC is performed.
+  // We skip the GC process in this loop and instead terminate it last.
+  // This ensures that the GC process is running whenever we terminate
+  // any GC-managed process, which is necessary to prevent leaking.
   while (true) {
-    ProcessBase* process = nullptr;
+    // NOTE: We terminate by `UPID` rather than `ProcessBase` as the
+    // process may terminate between the synchronized section below
+    // and the calls to `process:terminate` and `process::wait`.
+    // If the process has already terminated, further termination
+    // is a noop.
+    UPID pid;
 
     synchronized (processes_mutex) {
+      ProcessBase* process = nullptr;
+
       foreachvalue (ProcessBase* candidate, processes) {
         if (candidate == gc) {
           continue;
         }
+
         process = candidate;
+        pid = candidate->self();
+        break;
+      }
+
+      if (process == nullptr) {
         break;
       }
     }
 
-    if (process == nullptr) {
-      break;
-    }
-
     // Terminate this process but do not inject the message,
     // i.e. allow it to finish its work first.
-    process::terminate(process, false);
-    process::wait(process);
+    process::terminate(pid, false);
+    process::wait(pid);
   }
 
+  // Terminate `gc`.
   process::terminate(gc, false);
   process::wait(gc);
 
-  delete gc;
-  gc = nullptr;
+  synchronized (processes_mutex) {
+    delete gc;
+    gc = nullptr;
+  }
 
   // Send signal to all processing threads to stop running.
   joining_threads.store(true);
@@ -2417,6 +2744,11 @@ long ProcessManager::init_threads()
         }
         process_manager->resume(process);
       } while (true);
+
+      // Threads are joining. Delete the thread local `_executor_`
+      // pointer to prevent a memory leak.
+      delete _executor_;
+      _executor_ = nullptr;
     }
 
     // We hold a constant reference to `joining_threads` to make it clear that
@@ -2463,42 +2795,57 @@ void ProcessManager::handle(
   // Check if this is a libprocess request (i.e., 'User-Agent:
   // libprocess/id@ip:port') and if so, parse as a message.
   if (libprocess(request)) {
-    Message* message = parse(request);
-    if (message != nullptr) {
-      // TODO(benh): Use the sender PID when delivering in order to
-      // capture happens-before timing relationships for testing.
-      bool accepted = deliver(message->to, new MessageEvent(message));
+    // It is guaranteed that the continuation would run before the next
+    // request arrives. Also, it's fine to pass the `this` pointer to the
+    // continuation as this would get executed synchronously (if still pending)
+    // from `SocketManager::finalize()` due to it closing all active sockets
+    // during libprocess finalization.
+    parse(*request)
+      .onAny([this, socket, request](const Future<Message*>& future) {
+        // Get the HttpProxy pid for this socket.
+        PID<HttpProxy> proxy = socket_manager->proxy(socket);
 
-      // Get the HttpProxy pid for this socket.
-      PID<HttpProxy> proxy = socket_manager->proxy(socket);
+        if (!future.isReady()) {
+          Response response = InternalServerError(
+              future.isFailed() ? future.failure() : "discarded future");
 
-      // Only send back an HTTP response if this isn't from libprocess
-      // (which we determine by looking at the User-Agent). This is
-      // necessary because older versions of libprocess would try and
-      // recv the data and parse it as an HTTP request which would
-      // fail thus causing the socket to get closed (but now
-      // libprocess will ignore responses, see ignore_data).
-      Option<string> agent = request->headers.get("User-Agent");
-      if (agent.getOrElse("").find("libprocess/") == string::npos) {
-        if (accepted) {
-          VLOG(2) << "Accepted libprocess message to " << request->url.path;
-          dispatch(proxy, &HttpProxy::enqueue, Accepted(), *request);
-        } else {
-          VLOG(1) << "Failed to handle libprocess message to "
-                  << request->url.path << ": not found";
-          dispatch(proxy, &HttpProxy::enqueue, NotFound(), *request);
+          dispatch(proxy, &HttpProxy::enqueue, response, *request);
+
+          VLOG(1) << "Returning '" << response.status << "' for '"
+                  << request->url.path << "': " << response.body;
+
+          delete request;
+          return;
         }
-      }
 
-      delete request;
-      return;
-    }
+        Message* message = CHECK_NOTNULL(future.get());
 
-    VLOG(1) << "Failed to handle libprocess message: "
-            << request->method << " " << request->url.path
-            << " (User-Agent: " << request->headers["User-Agent"] << ")";
+        // TODO(benh): Use the sender PID when delivering in order to
+        // capture happens-before timing relationships for testing.
+        bool accepted = deliver(message->to, new MessageEvent(message));
 
-    delete request;
+        // Only send back an HTTP response if this isn't from libprocess
+        // (which we determine by looking at the User-Agent). This is
+        // necessary because older versions of libprocess would try and
+        // recv the data and parse it as an HTTP request which would
+        // fail thus causing the socket to get closed (but now
+        // libprocess will ignore responses, see ignore_data).
+        Option<string> agent = request->headers.get("User-Agent");
+        if (agent.getOrElse("").find("libprocess/") == string::npos) {
+          if (accepted) {
+            VLOG(2) << "Accepted libprocess message to " << request->url.path;
+            dispatch(proxy, &HttpProxy::enqueue, Accepted(), *request);
+          } else {
+            VLOG(1) << "Failed to handle libprocess message to "
+                    << request->url.path << ": not found";
+            dispatch(proxy, &HttpProxy::enqueue, NotFound(), *request);
+          }
+        }
+
+        delete request;
+        return;
+      });
+
     return;
   }
 
@@ -2635,7 +2982,7 @@ bool ProcessManager::deliver(
   // the receiver using the sender if necessary to preserve the
   // happens-before relationship between the sender and receiver. Note
   // that the assumption is that the sender remains valid for at least
-  // the duration of this routine (so that we can look up it's current
+  // the duration of this routine (so that we can look up its current
   // time).
   if (Clock::paused()) {
     Clock::update(
@@ -2668,6 +3015,20 @@ bool ProcessManager::deliver(
 UPID ProcessManager::spawn(ProcessBase* process, bool manage)
 {
   CHECK(process != nullptr);
+
+  // If the `ProcessManager` is cleaning itself up, no further processes
+  // may be spawned.
+  if (finalizing.load()) {
+    LOG(WARNING)
+      << "Attempted to spawn a process (" << process->self()
+      << ") after finalizing libprocess!";
+
+    if (manage) {
+      delete process;
+    }
+
+    return UPID();
+  }
 
   synchronized (processes_mutex) {
     if (processes.count(process->pid.id) > 0) {
@@ -2914,13 +3275,13 @@ void ProcessManager::link(
   if (to.address != __address__) {
     socket_manager->link(process, to, remote);
   } else {
-    // Since the pid is local we want to get a reference to it's
+    // Since the pid is local we want to get a reference to its
     // underlying process so that while we are invoking the link
     // manager we don't miss sending a possible ExitedEvent.
     if (ProcessReference _ = use(to)) {
       socket_manager->link(process, to, remote);
     } else {
-      // Since the pid isn't valid it's process must have already died
+      // Since the pid isn't valid its process must have already died
       // (or hasn't been spawned yet) so send a process exit message.
       process->enqueue(new ExitedEvent(to));
     }
@@ -3083,7 +3444,7 @@ void ProcessManager::enqueue(ProcessBase* process)
     return;
   }
 
-  // TODO(benh): Check and see if this process has it's own thread. If
+  // TODO(benh): Check and see if this process has its own thread. If
   // it does, push it on that threads runq, and wake up that thread if
   // it's not running. Otherwise, check and see which thread this
   // process was last running on, and put it on that threads runq.
@@ -3342,10 +3703,12 @@ void ProcessBase::visit(const HttpEvent& event)
     handlers.httpSequence.reset(new Sequence("__auth_handlers__"));
   }
 
-  CHECK(event.request->url.path.find('/') == 0); // See ProcessManager::handle.
+  const string& path = event.request->url.path;
+
+  CHECK(path.find('/') == 0); // See ProcessManager::handle.
 
   // Split the path by '/'.
-  vector<string> tokens = strings::tokenize(event.request->url.path, "/");
+  vector<string> tokens = strings::tokenize(path, "/");
   CHECK(!tokens.empty());
 
   const string id = http::decode(tokens[0]).get();
@@ -3369,125 +3732,40 @@ void ProcessBase::visit(const HttpEvent& event)
       continue;
     }
 
-    HttpEndpoint endpoint = handlers.http[name];
-    Future<Option<AuthenticationResult>> authentication = None();
+    const HttpEndpoint& endpoint = handlers.http[name];
 
-    if (endpoint.realm.isSome()) {
-      authentication = authenticator_manager->authenticate(
-          *event.request, endpoint.realm.get());
+    Owned<Request> request(new Request(*event.request));
+    Future<Response> response;
+
+    if (!endpoint.options.requestStreaming) {
+      // Consume the request body on behalf of the endpoint.
+      response = convert(std::move(request))
+        .then(defer(self(), [this, endpoint, name](
+            const Owned<Request>& request) {
+          return _visit(endpoint, name, request);
+        }));
+    } else {
+      response = _visit(endpoint, name, request);
     }
 
-    // Sequence the authentication future to ensure the handlers
-    // are invoked in the same order that requests arrive.
-    authentication = handlers.httpSequence->add<Option<AuthenticationResult>>(
-        [authentication]() { return authentication; });
-
-    Request request = *event.request;
-    Promise<Response>* response = new Promise<Response>();
-    event.response->associate(response->future());
-
-    authentication
-      .onAny(defer(self(), [this, endpoint, request, response, name, id](
-          const Future<Option<AuthenticationResult>>& authentication) {
-        if (!authentication.isReady()) {
-          response->set(
-              authentication.isFailed()
-                ? ServiceUnavailable(authentication.failure())
-                : ServiceUnavailable());
-
-          VLOG(1) << "Returning '" << response->future()->status << "'"
-                  << " for '" << request.url.path << "'"
-                  << " (authentication failed: "
-                  << (authentication.isFailed()
-                      ? authentication.failure()
-                      : "discarded") << ")";
-
-          delete response;
-          return;
+    response
+      .onAny([path](const Future<Response>& response) {
+        if (!response.isReady()) {
+          VLOG(1) << "Failed to process request for '" << path << "': "
+                  << (response.isFailed() ? response.failure() : "discarded");
         }
+      });
 
-        Option<string> principal = None();
-
-        // If authentication failed, we do not continue with authorization.
-        if (authentication->isSome()) {
-          if (authentication.get()->unauthorized.isSome()) {
-            // Request was not authenticated, challenged issued.
-            response->set(authentication.get()->unauthorized.get());
-
-            delete response;
-            return;
-          } else if (authentication.get()->forbidden.isSome()) {
-            // Request was not authenticated, no challenge issued.
-            response->set(authentication.get()->forbidden.get());
-
-            delete response;
-            return;
-          }
-
-          principal = authentication.get()->principal;
-        }
-
-        // The result of a call to an authorization callback.
-        Future<bool> authorization;
-
-        // Look for an authorization callback installed for this endpoint path.
-        // If none is found, use a trivial one.
-        const string callback_path = path::join("/" + id, name);
-        if (authorization_callbacks != nullptr &&
-            authorization_callbacks->count(callback_path) > 0) {
-          authorization = authorization_callbacks->at(callback_path)(
-              request, principal);
-
-          // Sequence the authorization future to ensure the handlers
-          // are invoked in the same order that requests arrive.
-          authorization = handlers.httpSequence->add<bool>(
-              [authorization]() { return authorization; });
-        } else {
-          authorization = handlers.httpSequence->add<bool>(
-              []() { return true; });
-        }
-
-        // Install a callback on the authorization result.
-        authorization
-          .onAny(defer(self(), [endpoint, request, response, principal](
-              const Future<bool>& authorization) {
-            if (!authorization.isReady()) {
-              response->set(
-                  authorization.isFailed()
-                    ? ServiceUnavailable(authorization.failure())
-                    : ServiceUnavailable());
-
-              VLOG(1) << "Returning '" << response->future()->status << "'"
-                      << " for '" << request.url.path << "'"
-                      << " (authorization failed: "
-                      << (authorization.isFailed()
-                          ? authorization.failure()
-                          : "discarded") << ")";
-
-              delete response;
-              return;
-            }
-
-            if (authorization.get() == true) {
-              // Authorization succeeded, so forward request to the handler.
-              if (endpoint.realm.isNone()) {
-                response->associate(endpoint.handler.get()(request));
-              } else {
-                response->associate(endpoint.authenticatedHandler.get()(
-                    request, principal));
-              }
-            } else {
-              // Authorization failed, so return a `Forbidden` response.
-              response->set(Forbidden());
-            }
-
-            delete response;
-            return;
-        }));
-      }));
-
+    event.response->associate(response);
     return;
   }
+
+  // Ensure the body is consumed so that no backpressure is applied
+  // to the socket (ignore the content since we do not care about it).
+  //
+  // TODO(anand): Is this an error?
+  CHECK_SOME(event.request->reader);
+  event.request->reader->readAll();
 
   // If no HTTP handler is found look in assets.
   name = tokens.size() > 1 ? tokens[1] : "";
@@ -3498,7 +3776,7 @@ void ProcessBase::visit(const HttpEvent& event)
     response.path = assets[name].path;
 
     // Construct the final path by appending remaining tokens.
-    for (int i = 2; i < tokens.size(); i++) {
+    for (size_t i = 2; i < tokens.size(); i++) {
       response.path += "/" + tokens[i];
     }
 
@@ -3511,7 +3789,7 @@ void ProcessBase::visit(const HttpEvent& event)
 
     // TODO(benh): Use "text/plain" for assets that don't have an
     // extension or we don't have a mapping for? It might be better to
-    // just let the browser guess (or do it's own default).
+    // just let the browser guess (or do its own default).
 
     event.response->associate(response);
 
@@ -3522,6 +3800,83 @@ void ProcessBase::visit(const HttpEvent& event)
           << " '" << event.request->url.path << "'";
 
   event.response->associate(NotFound());
+}
+
+
+Future<Response> ProcessBase::_visit(
+    const HttpEndpoint& endpoint,
+    const string& name,
+    const Owned<Request>& request)
+{
+  Future<Option<AuthenticationResult>> authentication = None();
+
+  if (endpoint.realm.isSome()) {
+    authentication = authenticator_manager->authenticate(
+        *request, endpoint.realm.get());
+  }
+
+  // Sequence the authentication future to ensure the handlers
+  // are invoked in the same order that requests arrive.
+  authentication = handlers.httpSequence->add<Option<AuthenticationResult>>(
+      [authentication]() { return authentication; });
+
+  return authentication
+    .then(defer(self(), [this, endpoint, request, name](
+        const Option<AuthenticationResult>& authentication)
+          -> Future<Response> {
+      Option<string> principal = None();
+
+      // If authentication failed, we do not continue with authorization.
+      if (authentication.isSome()) {
+        if (authentication->unauthorized.isSome()) {
+          // Request was not authenticated, challenged issued.
+          return authentication->unauthorized.get();
+        } else if (authentication->forbidden.isSome()) {
+          // Request was not authenticated, no challenge issued.
+          return authentication->forbidden.get();
+        }
+
+        principal = authentication->principal;
+      }
+
+      // The result of a call to an authorization callback.
+      Future<bool> authorization;
+
+      // Look for an authorization callback installed for this endpoint path.
+      // If none is found, use a trivial one.
+      const string callback_path = path::join("/" + pid.id, name);
+      if (authorization_callbacks != nullptr &&
+          authorization_callbacks->count(callback_path) > 0) {
+        authorization = authorization_callbacks->at(callback_path)(
+            *request, principal);
+
+        // Sequence the authorization future to ensure the handlers
+        // are invoked in the same order that requests arrive.
+          authorization = handlers.httpSequence->add<bool>(
+            [authorization]() { return authorization; });
+      } else {
+        authorization = handlers.httpSequence->add<bool>(
+            []() { return true; });
+      }
+
+      // Install a callback on the authorization result.
+      return authorization
+        .then(defer(self(), [endpoint, request, principal](
+            bool authorization) -> Future<Response> {
+          if (authorization) {
+            // Authorization succeeded, so forward request to the handler.
+            if (endpoint.realm.isNone()) {
+              return endpoint.handler.get()(*request);
+            }
+
+            return endpoint.authenticatedHandler.get()(*request, principal);
+          }
+
+          // Authorization failed, so return a `Forbidden` response.
+          return Forbidden();
+        }
+      ));
+    }));
 }
 
 
@@ -3552,13 +3907,15 @@ UPID ProcessBase::link(const UPID& to, const RemoteConnection remote)
 void ProcessBase::route(
     const string& name,
     const Option<string>& help_,
-    const HttpRequestHandler& handler)
+    const HttpRequestHandler& handler,
+    const RouteOptions& options)
 {
   // Routes must start with '/'.
   CHECK(name.find('/') == 0);
 
   HttpEndpoint endpoint;
   endpoint.handler = handler;
+  endpoint.options = options;
 
   handlers.http[name.substr(1)] = endpoint;
 
@@ -3570,7 +3927,8 @@ void ProcessBase::route(
     const string& name,
     const string& realm,
     const Option<string>& help_,
-    const AuthenticatedHttpRequestHandler& handler)
+    const AuthenticatedHttpRequestHandler& handler,
+    const RouteOptions& options)
 {
   // Routes must start with '/'.
   CHECK(name.find('/') == 0);
@@ -3578,6 +3936,7 @@ void ProcessBase::route(
   HttpEndpoint endpoint;
   endpoint.realm = realm;
   endpoint.authenticatedHandler = handler;
+  endpoint.options = options;
 
   handlers.http[name.substr(1)] = endpoint;
 

@@ -34,6 +34,8 @@
 #include "slave/containerizer/mesos/linux_launcher.hpp"
 #endif // __linux__
 
+#include "slave/containerizer/mesos/provisioner/constants.hpp"
+
 using std::string;
 
 mesos::internal::slave::Flags::Flags()
@@ -42,7 +44,7 @@ mesos::internal::slave::Flags::Flags()
       "hostname",
       "The hostname the agent should report.\n"
       "If left unset, the hostname is resolved from the IP address\n"
-      "that the agent binds to; unless the user explicitly prevents\n"
+      "that the agent advertises; unless the user explicitly prevents\n"
       "that, using `--no-hostname_lookup`, in which case the IP itself\n"
       "is used.");
 
@@ -94,14 +96,20 @@ mesos::internal::slave::Flags::Flags()
 
   add(&Flags::isolation,
       "isolation",
-      "Isolation mechanisms to use, e.g., `posix/cpu,posix/mem`, or\n"
+      "Isolation mechanisms to use, e.g., `posix/cpu,posix/mem` (or \n"
+      "`windows/cpu` if you are on Windows), or\n"
       "`cgroups/cpu,cgroups/mem`, or network/port_mapping\n"
       "(configure with flag: `--with-network-isolator` to enable),\n"
       "or `gpu/nvidia` for nvidia specific gpu isolation,\n"
       "or load an alternate isolator module using the `--modules`\n"
       "flag. Note that this flag is only relevant for the Mesos\n"
       "Containerizer.",
-      "posix/cpu,posix/mem");
+#ifndef __WINDOWS__
+      "posix/cpu,posix/mem"
+#else
+      "windows/cpu"
+#endif // __WINDOWS__
+      );
 
   add(&Flags::launcher,
       "launcher",
@@ -127,8 +135,7 @@ mesos::internal::slave::Flags::Flags()
   add(&Flags::image_provisioner_backend,
       "image_provisioner_backend",
       "Strategy for provisioning container rootfs from images,\n"
-      "e.g., `aufs`, `bind`, `copy`, `overlay`.",
-      "copy");
+      "e.g., `aufs`, `bind`, `copy`, `overlay`.");
 
   add(&Flags::appc_simple_discovery_uri_prefix,
       "appc_simple_discovery_uri_prefix",
@@ -208,13 +215,36 @@ mesos::internal::slave::Flags::Flags()
       "is stored by an agent that it needs to persist across crashes (but\n"
       "not across reboots). This directory will be cleared on reboot.\n"
       "(Example: `/var/run/mesos`)",
-      DEFAULT_RUNTIME_DIRECTORY);
+      []() -> string {
+        Try<std::string> var = os::var();
+        if (var.isSome()) {
+#ifdef __WINDOWS__
+          const std::string prefix(var.get());
+#else
+          const std::string prefix(path::join(var.get(), "run"));
+#endif // __WINDOWS__
+
+          // We check for access on the prefix because the remainder
+          // of the directory structure is created by the agent later.
+          Try<bool> access = os::access(prefix, R_OK | W_OK);
+          if (access.isSome() && access.get()) {
+#ifdef __WINDOWS__
+            return path::join(prefix, "mesos", "runtime");
+#else
+            return path::join(prefix, "mesos");
+#endif // __WINDOWS__
+          }
+        }
+
+        // We provide a fallback path for ease of use in case `os::var()`
+        // errors or if the directory is not accessible.
+        return path::join(os::temp(), "mesos", "runtime");
+      }());
 
   add(&Flags::launcher_dir, // TODO(benh): This needs a better name.
       "launcher_dir",
-      "Directory path of Mesos binaries. Mesos looks for the health-check,\n"
-      "fetcher, containerizer, and executor binary files under this\n"
-      "directory.",
+      "Directory path of Mesos binaries. Mesos looks for the fetcher,\n"
+      "containerizer, and executor binary files under this directory.",
       PKGLIBEXECDIR);
 
   add(&Flags::hadoop_home,
@@ -239,6 +269,14 @@ mesos::internal::slave::Flags::Flags()
       "therefore the flag currently does not exist on that platform.",
       true);
 #endif // __WINDOWS__
+
+  add(&Flags::http_heartbeat_interval,
+      "http_heartbeat_interval",
+      "This flag sets a heartbeat interval (e.g. '5secs', '10mins') for\n"
+      "messages to be sent over persistent connections made against\n"
+      "the agent HTTP API. Currently, this only applies to the\n"
+      "'LAUNCH_NESTED_CONTAINER_SESSION' and 'ATTACH_CONTAINER_OUTPUT' calls.",
+      Seconds(30));
 
   add(&Flags::frameworks_home,
       "frameworks_home",
@@ -361,6 +399,12 @@ mesos::internal::slave::Flags::Flags()
       "the executor registered.) during recovery are ignored and as much\n"
       "state as possible is recovered.\n",
       true);
+
+  add(&Flags::max_completed_executors_per_framework,
+      "max_completed_executors_per_framework",
+      "Maximum number of completed executors per framework to store\n"
+      "in memory.\n",
+      DEFAULT_MAX_COMPLETED_EXECUTORS_PER_FRAMEWORK);
 
 #ifdef __linux__
   add(&Flags::cgroups_hierarchy,
@@ -614,7 +658,12 @@ mesos::internal::slave::Flags::Flags()
       "sandbox_directory",
       "The absolute path for the directory in the container where the\n"
       "sandbox is mapped to.\n",
-      "/mnt/mesos/sandbox");
+#ifndef __WINDOWS__
+      "/mnt/mesos/sandbox"
+#else
+      "C:\\mesos\\sandbox"
+#endif // __WINDOWS__
+      );
 
   add(&Flags::default_container_info,
       "default_container_info",
@@ -712,11 +761,10 @@ mesos::internal::slave::Flags::Flags()
 
   add(&Flags::network_cni_plugins_dir,
       "network_cni_plugins_dir",
-      "Directory path of the CNI plugin binaries. The `network/cni`\n"
-      "isolator will find CNI plugins under this directory so that\n"
+      "A search path for CNI plugin binaries. The `network/cni`\n"
+      "isolator will find CNI plugins under these set of directories so that\n"
       "it can execute the plugins to add/delete container from the CNI\n"
-      "networks. It is the operator's responsibility to install the CNI\n"
-      "plugin binaries in the specified directory.");
+      "networks.");
 
   add(&Flags::network_cni_config_dir,
       "network_cni_config_dir",

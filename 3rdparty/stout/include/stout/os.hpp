@@ -48,11 +48,13 @@
 #include <stout/os/chroot.hpp>
 #include <stout/os/exists.hpp>
 #include <stout/os/fcntl.hpp>
+#include <stout/os/getenv.hpp>
 #include <stout/os/kill.hpp>
 #include <stout/os/ls.hpp>
 #include <stout/os/mkdir.hpp>
 #include <stout/os/mkdtemp.hpp>
 #include <stout/os/mktemp.hpp>
+#include <stout/os/os.hpp>
 #include <stout/os/pagesize.hpp>
 #include <stout/os/process.hpp>
 #include <stout/os/rename.hpp>
@@ -61,14 +63,17 @@
 #include <stout/os/shell.hpp>
 #include <stout/os/stat.hpp>
 #include <stout/os/su.hpp>
+#include <stout/os/temp.hpp>
 #include <stout/os/touch.hpp>
 #include <stout/os/utime.hpp>
+#include <stout/os/wait.hpp>
+#include <stout/os/xattr.hpp>
 
 #include <stout/os/raw/argv.hpp>
 #include <stout/os/raw/environment.hpp>
 
 // For readability, we minimize the number of #ifdef blocks in the code by
-// splitting platform specifc system calls into separate directories.
+// splitting platform specific system calls into separate directories.
 #ifdef __WINDOWS__
 #include <stout/windows/os.hpp>
 #else

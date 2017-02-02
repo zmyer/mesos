@@ -15,11 +15,13 @@
 
 #include <direct.h>
 #include <io.h>
-#include <TlHelp32.h>
 #include <Psapi.h>
+#include <TlHelp32.h>
+#include <Userenv.h>
 
 #include <sys/utime.h>
 
+#include <codecvt>
 #include <list>
 #include <map>
 #include <set>
@@ -30,10 +32,13 @@
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/path.hpp>
+#include <stout/strings.hpp>
 #include <stout/try.hpp>
 #include <stout/windows.hpp>
 
 #include <stout/os/os.hpp>
+#include <stout/os/getenv.hpp>
+#include <stout/os/process.hpp>
 #include <stout/os/read.hpp>
 
 #include <stout/os/raw/environment.hpp>
@@ -151,8 +156,12 @@ inline Try<std::set<pid_t>> pids(Option<pid_t> group, Option<pid_t> session)
     // TODO(alexnaparu): Set a limit to the memory that can be used.
     processes.resize(max_items);
     size_in_bytes = processes.size() * sizeof(pid_t);
-    BOOL result = ::EnumProcesses(processes.data(), size_in_bytes,
-                                  &bytes_returned);
+    CHECK_LE(size_in_bytes, MAXDWORD);
+
+    BOOL result = ::EnumProcesses(
+        processes.data(),
+        static_cast<DWORD>(size_in_bytes),
+        &bytes_returned);
 
     if (!result) {
       return WindowsError("os::pids: Call to `EnumProcesses` failed");
@@ -369,12 +378,6 @@ inline std::string hstrerror(int err)
 }
 
 
-// This function is a portable version of execvpe ('p' means searching
-// executable from PATH and 'e' means setting environments). We add
-// this function because it is not available on all systems.
-inline int execvpe(const char* file, char** argv, char** envp) = delete;
-
-
 inline Try<Nothing> chown(
     uid_t uid,
     gid_t gid,
@@ -426,8 +429,8 @@ inline Try<Load> loadavg()
   // No Windows equivalent, return an error until there is a need. We can
   // construct an approximation of this function by periodically polling
   // `GetSystemTimes` and using a sliding window of statistics.
-  return WindowsErrorBase(ERROR_NOT_SUPPORTED,
-                          "Failed to determine system load averages");
+  return WindowsError(ERROR_NOT_SUPPORTED,
+                      "Failed to determine system load averages");
 }
 
 
@@ -487,32 +490,6 @@ inline Try<UTSInfo> uname()
   info.machine = internal::machine();
 
   return info;
-}
-
-
-// Looks in the environment variables for the specified key and
-// returns a string representation of its value. If no environment
-// variable matching key is found, None() is returned.
-inline Option<std::string> getenv(const std::string& key)
-{
-  DWORD buffer_size = ::GetEnvironmentVariable(key.c_str(), nullptr, 0);
-  if (buffer_size == 0) {
-    return None();
-  }
-
-  std::unique_ptr<char[]> environment(new char[buffer_size]);
-
-  DWORD value_size =
-    ::GetEnvironmentVariable(key.c_str(), environment.get(), buffer_size);
-
-  if (value_size == 0) {
-    // If `value_size == 0` here, that probably means the environment variable
-    // was deleted between when we checked and when we allocated the buffer. We
-    // report `None` to indicate the environment variable was not found.
-    return None();
-  }
-
-  return std::string(environment.get());
 }
 
 
@@ -747,19 +724,28 @@ inline Try<Nothing> kill_job(pid_t pid)
 }
 
 
-inline std::string temp()
+inline Try<std::string> var()
 {
-  // Get temp folder for current user.
-  char temp_folder[MAX_PATH + 2];
-  if (::GetTempPath(MAX_PATH + 2, temp_folder) == 0) {
-    // Failed, try current folder.
-    if (::GetCurrentDirectory(MAX_PATH + 2, temp_folder) == 0) {
-      // Failed, use relative path.
-      return ".";
-    }
+  // Get the `ProgramData` path. First, find the size of the output buffer.
+  // This size includes the null-terminating character.
+  DWORD size = 0;
+  if (::GetAllUsersProfileDirectoryW(nullptr, &size)) {
+    // The expected behavior here is for the function to "fail"
+    // and return `false`, and `size` receives necessary buffer size.
+    return WindowsError(
+        "os::var: `GetAllUsersProfileDirectory` succeeded unexpectedly");
   }
 
-  return std::string(temp_folder);
+  std::vector<wchar_t> var_folder(size);
+  if (!::GetAllUsersProfileDirectoryW(&var_folder[0], &size)) {
+    return WindowsError(
+        "os::var: `GetAllUsersProfileDirectory` failed");
+  }
+
+  // Convert UTF-16 `wchar[]` to UTF-8 `string`.
+  std::wstring wvar_folder(&var_folder[0]);
+  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
+  return converter.to_bytes(wvar_folder);
 }
 
 
@@ -816,6 +802,22 @@ inline intptr_t fd_to_handle(int in)
 inline int handle_to_fd(intptr_t in, int flags)
 {
   return ::_open_osfhandle(in, flags);
+}
+
+
+// Returns a host-specific default for the `PATH` environment variable, based
+// on the configuration of the host.
+inline std::string host_default_path()
+{
+  // NOTE: On Windows, this code must run on the host where we are
+  // expecting to `exec` the task, because the value of
+  // `%SYSTEMROOT%` is not identical on all platforms.
+  const Option<std::string> systemRootEnv = os::getenv("SYSTEMROOT");
+  const std::string systemRoot = systemRootEnv.isSome()
+    ? systemRootEnv.get()
+    : "C:\\WINDOWS";
+
+  return strings::join(";", systemRoot, path::join(systemRoot, "system32"));
 }
 
 } // namespace os {

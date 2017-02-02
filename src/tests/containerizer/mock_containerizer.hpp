@@ -26,6 +26,7 @@
 
 #include <process/future.hpp>
 #include <process/gmock.hpp>
+#include <process/http.hpp>
 
 #include <stout/hashset.hpp>
 #include <stout/nothing.hpp>
@@ -57,13 +58,19 @@ public:
           const std::map<std::string, std::string>&,
           bool));
 
-  MOCK_METHOD4(
+  MOCK_METHOD6(
       launch,
-      process::Future<Nothing>(
-          const ContainerID& containerId,
-          const CommandInfo& commandInfo,
-          const Option<ContainerInfo>& containerInfo,
-          const Resources& resources));
+      process::Future<bool>(
+          const ContainerID&,
+          const CommandInfo&,
+          const Option<ContainerInfo>&,
+          const Option<std::string>&,
+          const SlaveID&,
+          const Option<mesos::slave::ContainerClass>&));
+
+  MOCK_METHOD1(
+      attach,
+      process::Future<process::http::Connection>(const ContainerID&));
 
   MOCK_METHOD2(
       update,

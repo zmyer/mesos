@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "linux/fs.hpp"
+
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,9 +41,10 @@
 #include <stout/os.hpp>
 
 #include <stout/os/read.hpp>
+#include <stout/os/shell.hpp>
 #include <stout/os/stat.hpp>
 
-#include "linux/fs.hpp"
+#include "common/status_utils.hpp"
 
 using std::list;
 using std::set;
@@ -87,23 +90,56 @@ Try<bool> supported(const string& fsname)
 }
 
 
+Try<uint32_t> type(const string& path)
+{
+  struct statfs buf;
+  if (statfs(path.c_str(), &buf) < 0) {
+    return ErrnoError();
+  }
+  return (uint32_t) buf.f_type;
+}
+
+
+Try<string> typeName(uint32_t fsType)
+{
+  // `typeNames` maps a filesystem id to its filesystem type name.
+  hashmap<uint32_t, string> typeNames = {
+    {FS_TYPE_AUFS      , "aufs"},
+    {FS_TYPE_BTRFS     , "btrfs"},
+    {FS_TYPE_CRAMFS    , "cramfs"},
+    {FS_TYPE_ECRYPTFS  , "ecryptfs"},
+    {FS_TYPE_EXTFS     , "extfs"},
+    {FS_TYPE_F2FS      , "f2fs"},
+    {FS_TYPE_GPFS      , "gpfs"},
+    {FS_TYPE_JFFS2FS   , "jffs2fs"},
+    {FS_TYPE_JFS       , "jfs"},
+    {FS_TYPE_NFSFS     , "nfsfs"},
+    {FS_TYPE_RAMFS     , "ramfs"},
+    {FS_TYPE_REISERFS  , "reiserfs"},
+    {FS_TYPE_SMBFS     , "smbfs"},
+    {FS_TYPE_SQUASHFS  , "squashfs"},
+    {FS_TYPE_TMPFS     , "tmpfs"},
+    {FS_TYPE_VXFS      , "vxfs"},
+    {FS_TYPE_XFS       , "xfs"},
+    {FS_TYPE_ZFS       , "zfs"},
+    {FS_TYPE_OVERLAY   , "overlay"}
+  };
+
+  if (!typeNames.contains(fsType)) {
+    return Error("Unexpected filesystem type '" + stringify(fsType) + "'");
+  }
+
+  return typeNames[fsType];
+}
+
+
 Try<MountInfoTable> MountInfoTable::read(
-    const Option<pid_t>& pid,
+    const string& lines,
     bool hierarchicalSort)
 {
   MountInfoTable table;
 
-  const string path = path::join(
-      "/proc",
-      (pid.isSome() ? stringify(pid.get()) : "self"),
-      "mountinfo");
-
-  Try<string> lines = os::read(path);
-  if (lines.isError()) {
-    return Error("Failed to read mountinfo file: " + lines.error());
-  }
-
-  foreach (const string& line, strings::tokenize(lines.get(), "\n")) {
+  foreach (const string& line, strings::tokenize(lines, "\n")) {
     Try<Entry> parse = MountInfoTable::Entry::parse(line);
     if (parse.isError()) {
       return Error("Failed to parse entry '" + line + "': " + parse.error());
@@ -127,7 +163,7 @@ Try<MountInfoTable> MountInfoTable::read(
         CHECK_NONE(rootParentId);
         rootParentId = entry.parent;
       }
-      parentToChildren[entry.parent].push_back(std::move(entry));
+      parentToChildren[entry.parent].push_back(entry);
     }
 
     // Walk the hashmap and construct a list of entries sorted
@@ -138,14 +174,24 @@ Try<MountInfoTable> MountInfoTable::read(
     vector<MountInfoTable::Entry> sortedEntries;
 
     std::function<void(int)> sortFrom = [&](int parentId) {
-      CHECK(!visitedParents.contains(parentId)) << lines.get();
+      CHECK(!visitedParents.contains(parentId))
+        << "Cycle found in mount table hierarchy at entry"
+        << " '" << stringify(parentId) << "': " << std::endl << lines;
 
       visitedParents.insert(parentId);
 
       foreach (const MountInfoTable::Entry& entry, parentToChildren[parentId]) {
-        int newParentId = entry.id;
-        sortedEntries.push_back(std::move(entry));
-        sortFrom(newParentId);
+        sortedEntries.push_back(entry);
+
+        // It is legal to have a `MountInfoTable` entry whose
+        // `entry.id` is the same as its `entry.parent`. This can
+        // happen (for example), if a system boots from the network
+        // and then keeps the original `/` in RAM. To avoid cycles
+        // when walking the mount hierarchy, we only recurse into our
+        // children if this case is not satisfied.
+        if (parentId != entry.id) {
+          sortFrom(entry.id);
+        }
       }
     };
 
@@ -158,6 +204,24 @@ Try<MountInfoTable> MountInfoTable::read(
   }
 
   return table;
+}
+
+
+Try<MountInfoTable> MountInfoTable::read(
+    const Option<pid_t>& pid,
+    bool hierarchicalSort)
+{
+  const string path = path::join(
+      "/proc",
+      (pid.isSome() ? stringify(pid.get()) : "self"),
+      "mountinfo");
+
+  Try<string> lines = os::read(path);
+  if (lines.isError()) {
+    return Error("Failed to read mountinfo file: " + lines.error());
+  }
+
+  return MountInfoTable::read(lines.get(), hierarchicalSort);
 }
 
 
@@ -404,6 +468,24 @@ Try<Nothing> unmountAll(const string& target, int flags)
       Try<Nothing> unmount = fs::unmount(entry.dir, flags);
       if (unmount.isError()) {
         return unmount;
+      }
+
+      // This normally should not fail even if the entry is not in
+      // mtab or mtab doesn't exist or is not writable. However we
+      // still catch the error here in case there's an error somewhere
+      // else while running this command.
+      // TODO(xujyan): Consider using `setmntent(3)` to implement this.
+      int status = os::spawn("umount", {"umount", "--fake", entry.dir});
+
+      const string message =
+        "Failed to clean up '" + entry.dir + "' in /etc/mtab";
+
+      if (status == -1) {
+        return ErrnoError(message);
+      }
+
+      if (!WSUCCEEDED(status)) {
+        return Error(message + ": " + WSTRINGIFY(status));
       }
     }
   }

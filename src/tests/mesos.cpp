@@ -107,8 +107,10 @@ master::Flags MesosTest::CreateMasterFlags()
 
   flags.authenticate_http_readonly = true;
   flags.authenticate_http_readwrite = true;
+#ifdef HAS_AUTHENTICATION
   flags.authenticate_frameworks = true;
   flags.authenticate_agents = true;
+#endif // HAS_AUTHENTICATION
 
   flags.authenticate_http_frameworks = true;
   flags.http_framework_authenticators = "basic";
@@ -143,8 +145,10 @@ master::Flags MesosTest::CreateMasterFlags()
   // Set default ACLs.
   flags.acls = ACLs();
 
-  // Use the replicated log (without ZooKeeper) by default.
-  flags.registry = "replicated_log";
+  // Use the in-memory registry (instead of the replicated log) by default.
+  // TODO(josephw): Consider changing this back to `replicated_log` once
+  // all platforms support this registrar backend.
+  flags.registry = "in_memory";
 
   // On many test VMs, this default is too small.
   flags.registry_store_timeout = flags.registry_store_timeout * 5;
@@ -174,6 +178,7 @@ slave::Flags MesosTest::CreateSlaveFlags()
   flags.launcher_dir = getLauncherDir();
 
   {
+#ifdef HAS_AUTHENTICATION
     // Create a default credential file for master/agent authentication.
     const string& path = path::join(directory.get(), "credential");
 
@@ -197,6 +202,7 @@ slave::Flags MesosTest::CreateSlaveFlags()
 
     // Set default (permissive) ACLs.
     flags.acls = ACLs();
+#endif // HAS_AUTHENTICATION
   }
 
   flags.authenticate_http_readonly = true;
@@ -565,6 +571,8 @@ slave::Flags ContainerizerTest<slave::MesosContainerizer>::CreateSlaveFlags()
   } else {
     flags.isolation = "posix/cpu,posix/mem";
   }
+#elif defined(__WINDOWS__)
+  flags.isolation = "windows/cpu";
 #else
   flags.isolation = "posix/cpu,posix/mem";
 #endif
@@ -596,6 +604,8 @@ slave::Flags ContainerizerTest<slave::MesosContainerizer>::CreateSlaveFlags()
 #ifdef __linux__
 void ContainerizerTest<slave::MesosContainerizer>::SetUpTestCase()
 {
+  MesosTest::SetUpTestCase();
+
   Result<string> user = os::user();
   EXPECT_SOME(user);
 

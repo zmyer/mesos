@@ -23,6 +23,7 @@
 #include <mesos/resources.hpp>
 
 #include <process/future.hpp>
+#include <process/http.hpp>
 #include <process/process.hpp>
 
 #include <stout/hashmap.hpp>
@@ -61,6 +62,17 @@ public:
       const SlaveID& slaveId,
       const std::map<std::string, std::string>& environment,
       bool checkpoint);
+
+  virtual process::Future<bool> launch(
+      const ContainerID& containerId,
+      const CommandInfo& commandInfo,
+      const Option<ContainerInfo>& containerInfo,
+      const Option<std::string>& user,
+      const SlaveID& slaveId,
+      const Option<mesos::slave::ContainerClass>& containerClass = None());
+
+  virtual process::Future<process::http::Connection> attach(
+      const ContainerID& containerId);
 
   virtual process::Future<Nothing> update(
       const ContainerID& containerId,

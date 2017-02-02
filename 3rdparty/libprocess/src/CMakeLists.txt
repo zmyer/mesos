@@ -47,6 +47,7 @@ set(PROCESS_SRC
   latch.cpp
   logging.cpp
   metrics/metrics.cpp
+  mime.cpp
   pid.cpp
   poll_socket.cpp
   poll_socket.hpp
@@ -78,6 +79,7 @@ endif (ENABLE_LIBEVENT)
 # INCLUDE DIRECTIVES FOR PROCESS LIBRARY (generates, e.g., -I/path/to/thing
 # on Linux).
 ###########################################################################
+include_directories(SYSTEM ${PROCESS_3RDPARTY_INCLUDE_DIRS})
 include_directories(${PROCESS_INCLUDE_DIRS})
 
 # LINKING LIBRARIES BY DIRECTORY (might generate, e.g., -L/path/to/thing on
@@ -87,13 +89,32 @@ link_directories(${PROCESS_LIB_DIRS})
 
 # THE PROCESS LIBRARY (generates, e.g., libprocess.so, etc., on Linux).
 #######################################################################
-add_library(${PROCESS_TARGET} STATIC ${PROCESS_SRC})
+if (WIN32)
+  add_library(${PROCESS_TARGET} STATIC ${PROCESS_SRC})
+else (WIN32)
+  add_library(${PROCESS_TARGET} SHARED ${PROCESS_SRC})
+
+  set_target_properties(
+    ${PROCESS_TARGET} PROPERTIES
+    POSITION_INDEPENDENT_CODE TRUE
+    )
+endif (WIN32)
+
+GROUP_STOUT_HEADERS()
+GROUP_PROCESS_HEADERS()
+
+GROUP_SOURCE(
+  "src"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "*.[ch]*")
+
 set_target_properties(
   ${PROCESS_TARGET} PROPERTIES
   VERSION ${PROCESS_PACKAGE_VERSION}
   SOVERSION ${PROCESS_PACKAGE_SOVERSION}
-  COMPILE_FLAGS "-fPIC"
   )
+
 add_dependencies(${PROCESS_TARGET} ${PROCESS_DEPENDENCIES})
 
 # ADD LINKER FLAGS (generates, e.g., -lglog on Linux).

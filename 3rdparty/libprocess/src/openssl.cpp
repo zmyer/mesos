@@ -286,6 +286,9 @@ string error_string(unsigned long code)
 // this function, it is not visible. This is the preferred behavior as
 // we do not want applications changing these settings while they are
 // running (this would be undefined behavior).
+// NOTE: This does not change the configuration of existing sockets, such
+// as the server socket spawned during libprocess initialization.
+// See `reinitialize` in `process.cpp`.
 void reinitialize()
 {
   // Wipe out and recreate the default flags.
@@ -297,28 +300,28 @@ void reinitialize()
   // environment. See comment at top of openssl.hpp for a full list.
   //
   // NOTE: We used to look for environment variables prefixed by SSL_.
-  // To be backward compatible, for each environment variable prefixed
-  // by SSL_, we generate the corresponding LIBPROCESS_SSL_ version.
-  // See details in MESOS-5863.
-  map<string, string> environments = os::environment();
-  foreachpair (const string& key, const string& value, environments) {
-    if (strings::startsWith(key, "SSL_")) {
-      const string new_key = "LIBPROCESS_" + key;
-      if (environments.count(new_key) == 0) {
-        os::setenv(new_key, value);
-      } else if (environments[new_key] != value) {
-        LOG(WARNING) << "Mismatched SSL environment variables: "
-                     << key << "=" << value << ", "
-                     << new_key << "=" << environments[new_key];
-      }
+  // To be backward compatible, we interpret environment variables
+  // prefixed with either SSL_ and LIBPROCESS_SSL_ where the latter
+  // one takes precedence. See details in MESOS-5863.
+  map<string, Option<string>> environment_ssl =
+      ssl_flags->extract("SSL_");
+  map<string, Option<string>> environments =
+      ssl_flags->extract("LIBPROCESS_SSL_");
+  foreachpair (
+      const string& key, const Option<string>& value, environment_ssl) {
+    if (environments.count(key) > 0 && environments.at(key) != value) {
+      LOG(WARNING) << "Mismatched values for SSL environment variables "
+                   << "SSL_" << key << " and "
+                   << "LIBPROCESS_SSL_" << key;
     }
   }
+  environments.insert(environment_ssl.begin(), environment_ssl.end());
 
-  Try<flags::Warnings> load = ssl_flags->load("LIBPROCESS_SSL_");
+  Try<flags::Warnings> load = ssl_flags->load(environments);
   if (load.isError()) {
     EXIT(EXIT_FAILURE)
       << "Failed to load flags from environment variables "
-      << "prefixed by LIBPROCESS_SSL_ or SSL_ (deprecated):"
+      << "prefixed by LIBPROCESS_SSL_ or SSL_ (deprecated): "
       << load.error();
   }
 
@@ -413,39 +416,39 @@ void reinitialize()
   }
 
   if (ssl_flags->ca_file.isNone()) {
-    VLOG(2) << "CA file path is unspecified! NOTE: "
-            << "Set CA file path with LIBPROCESS_SSL_CA_FILE=<filepath>";
+    LOG(INFO) << "CA file path is unspecified! NOTE: "
+              << "Set CA file path with LIBPROCESS_SSL_CA_FILE=<filepath>";
   }
 
   if (ssl_flags->ca_dir.isNone()) {
-    VLOG(2) << "CA directory path unspecified! NOTE: "
-            << "Set CA directory path with LIBPROCESS_SSL_CA_DIR=<dirpath>";
+    LOG(INFO) << "CA directory path unspecified! NOTE: "
+              << "Set CA directory path with LIBPROCESS_SSL_CA_DIR=<dirpath>";
   }
 
   if (!ssl_flags->verify_cert) {
-    VLOG(2) << "Will not verify peer certificate!\n"
-            << "NOTE: Set LIBPROCESS_SSL_VERIFY_CERT=1 to enable "
-            << "peer certificate verification";
+    LOG(INFO) << "Will not verify peer certificate!\n"
+              << "NOTE: Set LIBPROCESS_SSL_VERIFY_CERT=1 to enable "
+              << "peer certificate verification";
   }
 
   if (!ssl_flags->require_cert) {
-    VLOG(2) << "Will only verify peer certificate if presented!\n"
-            << "NOTE: Set LIBPROCESS_SSL_REQUIRE_CERT=1 to require "
-            << "peer certificate verification";
+    LOG(INFO) << "Will only verify peer certificate if presented!\n"
+              << "NOTE: Set LIBPROCESS_SSL_REQUIRE_CERT=1 to require "
+              << "peer certificate verification";
   }
 
   if (ssl_flags->verify_ipadd) {
-    VLOG(2) << "Will use IP address verification in subject alternative name "
-            << "certificate extension.";
+    LOG(INFO) << "Will use IP address verification in subject alternative name "
+              << "certificate extension.";
   }
 
   if (ssl_flags->require_cert && !ssl_flags->verify_cert) {
     // Requiring a certificate implies that is should be verified.
     ssl_flags->verify_cert = true;
 
-    VLOG(2) << "LIBPROCESS_SSL_REQUIRE_CERT implies "
-            << "peer certificate verification.\n"
-            << "LIBPROCESS_SSL_VERIFY_CERT set to true";
+    LOG(INFO) << "LIBPROCESS_SSL_REQUIRE_CERT implies "
+              << "peer certificate verification.\n"
+              << "LIBPROCESS_SSL_VERIFY_CERT set to true";
   }
 
   // Initialize OpenSSL if we've been asked to do verification of peer
@@ -464,7 +467,7 @@ void reinitialize()
       if (SSL_CTX_load_verify_locations(ctx, ca_file, ca_dir) != 1) {
         unsigned long error = ERR_get_error();
         EXIT(EXIT_FAILURE)
-          << "Could not load CA file and/or directory ("
+          << "Could not load CA file and/or directory (OpenSSL error #"
           << stringify(error)  << "): "
           << error_string(error) << " -> "
           << (ca_file != nullptr ? (stringify("FILE: ") + ca_file) : "")
@@ -472,18 +475,41 @@ void reinitialize()
       }
 
       if (ca_file != nullptr) {
-        VLOG(2) << "Using CA file: " << ca_file;
+        LOG(INFO) << "Using CA file: " << ca_file;
       }
       if (ca_dir != nullptr) {
-        VLOG(2) << "Using CA dir: " << ca_dir;
+        LOG(INFO) << "Using CA dir: " << ca_dir;
       }
     } else {
       if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
         EXIT(EXIT_FAILURE) << "Could not load default CA file and/or directory";
       }
 
-      VLOG(2) << "Using default CA file '" << X509_get_default_cert_file()
-              << "' and/or directory '" << X509_get_default_cert_dir() << "'";
+      // For getting the defaults for ca-directory and/or ca-file from
+      // openssl, we have to mimic parts of its logic; if the user has
+      // set the openssl-specific environment variable, use that one -
+      // if the user has not set that variable, use the compiled in
+      // defaults.
+      string ca_dir;
+
+      const map<string, string> environment = os::environment();
+
+      if (environment.count(X509_get_default_cert_dir_env()) > 0) {
+        ca_dir = environment.at(X509_get_default_cert_dir_env());
+      } else {
+        ca_dir = X509_get_default_cert_dir();
+      }
+
+      string ca_file;
+
+      if (environment.count(X509_get_default_cert_file_env()) > 0) {
+        ca_file = environment.at(X509_get_default_cert_file_env());
+      } else {
+        ca_file = X509_get_default_cert_file();
+      }
+
+      LOG(INFO) << "Using default CA file '" << ca_file
+                << "' and/or directory '" << ca_dir << "'";
     }
 
     // Set SSL peer verification callback.
@@ -504,7 +530,10 @@ void reinitialize()
   if (SSL_CTX_use_certificate_chain_file(
           ctx,
           ssl_flags->cert_file.get().c_str()) != 1) {
-    EXIT(EXIT_FAILURE) << "Could not load cert file";
+    unsigned long error = ERR_get_error();
+    EXIT(EXIT_FAILURE)
+      << "Could not load cert file '" << ssl_flags->cert_file.get() << "' "
+      << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
   // Set private key.
@@ -512,19 +541,27 @@ void reinitialize()
           ctx,
           ssl_flags->key_file.get().c_str(),
           SSL_FILETYPE_PEM) != 1) {
-    EXIT(EXIT_FAILURE) << "Could not load key file";
+    unsigned long error = ERR_get_error();
+    EXIT(EXIT_FAILURE)
+      << "Could not load key file '" << ssl_flags->key_file.get() << "' "
+      << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
   // Validate key.
   if (SSL_CTX_check_private_key(ctx) != 1) {
+    unsigned long error = ERR_get_error();
     EXIT(EXIT_FAILURE)
-      << "Private key does not match the certificate public key";
+      << "Private key does not match the certificate public key "
+      << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
   VLOG(2) << "Using ciphers: " << ssl_flags->ciphers;
 
   if (SSL_CTX_set_cipher_list(ctx, ssl_flags->ciphers.c_str()) == 0) {
-    EXIT(EXIT_FAILURE) << "Could not set ciphers: " << ssl_flags->ciphers;
+    unsigned long error = ERR_get_error();
+    EXIT(EXIT_FAILURE)
+      << "Could not set ciphers '" << ssl_flags->ciphers << "' "
+      << "(OpenSSL error #" << stringify(error) << "): " << error_string(error);
   }
 
   // Clear all the protocol options. They will be reset if needed

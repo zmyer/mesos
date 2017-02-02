@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <string>
+#include <vector>
 
 #include <gmock/gmock.h>
 
@@ -56,6 +57,7 @@ using process::http::OK;
 using process::http::Response;
 
 using std::string;
+using std::vector;
 
 using testing::AtMost;
 using testing::DoAll;
@@ -69,9 +71,11 @@ class SlaveAuthorizerTest : public MesosTest {};
 
 
 typedef ::testing::Types<
-  LocalAuthorizer,
-  tests::Module<Authorizer, TestLocalAuthorizer>>
-  AuthorizerTypes;
+// TODO(josephw): Modules are not supported on Windows (MESOS-5994).
+#ifndef __WINDOWS__
+    tests::Module<Authorizer, TestLocalAuthorizer>,
+#endif // __WINDOWS__
+    LocalAuthorizer> AuthorizerTypes;
 
 
 TYPED_TEST_CASE(SlaveAuthorizerTest, AuthorizerTypes);
@@ -148,7 +152,7 @@ TYPED_TEST(SlaveAuthorizerTest, FilterStateEndpoint)
   frameworkInfo.set_user("bar");
 
   // Create an executor with user "bar".
-  ExecutorInfo executor = CREATE_EXECUTOR_INFO("test-executor", "sleep 2");
+  ExecutorInfo executor = createExecutorInfo("test-executor", "sleep 2");
   executor.mutable_command()->set_user("bar");
 
   MockExecutor exec(executor.executor_id());
@@ -280,7 +284,7 @@ TYPED_TEST(SlaveAuthorizerTest, ViewFlags)
   }
 
   {
-    // Second default principal can not see the flags.
+    // Second default principal cannot see the flags.
     mesos::ACL::ViewFlags* acl = acls.add_view_flags();
     acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL_2.principal());
     acl->mutable_flags()->set_type(ACL::Entity::NONE);
@@ -293,10 +297,14 @@ TYPED_TEST(SlaveAuthorizerTest, ViewFlags)
 
   StandaloneMasterDetector detector;
 
+  Future<Nothing> recover = FUTURE_DISPATCH(_, &Slave::__recover);
+
   Try<Owned<cluster::Slave>> agent =
     this->StartSlave(&detector, authorizer.get());
 
   ASSERT_SOME(agent);
+
+  AWAIT_READY(recover);
 
   // Ensure that the slave has finished recovery.
   Clock::pause();
@@ -392,8 +400,17 @@ TEST_P(SlaveEndpointTest, AuthorizedRequest)
 
   MockAuthorizer mockAuthorizer;
 
+  Future<Nothing> recover = FUTURE_DISPATCH(_, &Slave::__recover);
+
   Try<Owned<cluster::Slave>> agent = StartSlave(&detector, &mockAuthorizer);
   ASSERT_SOME(agent);
+
+  AWAIT_READY(recover);
+
+  // Ensure that the slave has finished recovery.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
 
   Future<authorization::Request> request;
   EXPECT_CALL(mockAuthorizer, authorized(_))
@@ -433,8 +450,17 @@ TEST_P(SlaveEndpointTest, UnauthorizedRequest)
 
   MockAuthorizer mockAuthorizer;
 
+  Future<Nothing> recover = FUTURE_DISPATCH(_, &Slave::__recover);
+
   Try<Owned<cluster::Slave>> agent = StartSlave(&detector, &mockAuthorizer);
   ASSERT_SOME(agent);
+
+  AWAIT_READY(recover);
+
+  // Ensure that the slave has finished recovery.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
 
   EXPECT_CALL(mockAuthorizer, authorized(_))
     .WillOnce(Return(false));
@@ -458,8 +484,17 @@ TEST_P(SlaveEndpointTest, NoAuthorizer)
 
   StandaloneMasterDetector detector;
 
+  Future<Nothing> recover = FUTURE_DISPATCH(_, &Slave::__recover);
+
   Try<Owned<cluster::Slave>> agent = StartSlave(&detector, CreateSlaveFlags());
   ASSERT_SOME(agent);
+
+  AWAIT_READY(recover);
+
+  // Ensure that the slave has finished recovery.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
 
   Future<Response> response = http::get(
       agent.get()->pid,

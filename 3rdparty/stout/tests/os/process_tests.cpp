@@ -67,6 +67,8 @@ int getppid()
       }
     } while (Process32Next(h, &pe));
   }
+
+  return -1;
 }
 #endif // __WINDOWS__
 
@@ -106,6 +108,13 @@ TEST_F(ProcessTest, Process)
   // NOTE: On Windows, inspecting other processes usually requires privileges.
   // So we expect it to error out instead of succeed, unlike the POSIX version.
   EXPECT_ERROR(init_process);
+#elif __FreeBSD__
+  // In a FreeBSD jail, we wont find an init process.
+  if (!isJailed()) {
+      EXPECT_SOME(init_process);
+  } else {
+      EXPECT_NONE(init_process);
+  }
 #else
   EXPECT_SOME(init_process);
 #endif // __WINDOWS__
@@ -117,7 +126,7 @@ TEST_F(ProcessTest, Processes)
   const Try<list<Process>> processes = os::processes();
 
   ASSERT_SOME(processes);
-  ASSERT_GT(processes.get().size(), 2);
+  ASSERT_GT(processes.get().size(), 2u);
 
   // Look for ourselves in the table.
   bool found = false;
@@ -227,7 +236,7 @@ TEST_F(ProcessTest, Pstree)
       nullptr,                // Use parent's starting directory.
       &si,
       &pi);
-  ASSERT_TRUE(created);
+  ASSERT_TRUE(created == TRUE);
 
   Try<ProcessTree> tree_after_spawn = os::pstree(getpid());
   ASSERT_SOME(tree_after_spawn);
@@ -251,8 +260,8 @@ TEST_F(ProcessTest, Pstree)
 
   tree =
     Fork(None(),                   // Child.
-      Fork(Exec("sleep 10")),   // Grandchild.
-      Exec("sleep 10"))();
+      Fork(Exec(SLEEP_COMMAND(10))),   // Grandchild.
+      Exec(SLEEP_COMMAND(10)))();
 
   ASSERT_SOME(tree);
 

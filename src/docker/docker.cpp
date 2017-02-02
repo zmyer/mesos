@@ -532,10 +532,11 @@ Future<Option<int>> Docker::run(
     }
   }
 
+  string environmentVariables;
+
   if (env.isSome()) {
-    foreachpair (string key, string value, env.get()) {
-      argv.push_back("-e");
-      argv.push_back(key + "=" + value);
+    foreachpair (const string& key, const string& value, env.get()) {
+      environmentVariables += key + "=" + value + "\n";
     }
   }
 
@@ -546,14 +547,42 @@ Future<Option<int>> Docker::run(
       // Skip to avoid duplicate environment variables.
       continue;
     }
-    argv.push_back("-e");
-    argv.push_back(variable.name() + "=" + variable.value());
+    environmentVariables += variable.name() + "=" + variable.value() + "\n";
   }
 
-  argv.push_back("-e");
-  argv.push_back("MESOS_SANDBOX=" + mappedDirectory);
-  argv.push_back("-e");
-  argv.push_back("MESOS_CONTAINER_NAME=" + name);
+  environmentVariables += "MESOS_SANDBOX=" + mappedDirectory + "\n";
+  environmentVariables += "MESOS_CONTAINER_NAME=" + name + "\n";
+
+  Try<string> environmentFile_ = os::mktemp();
+  if (environmentFile_.isError()) {
+    return Failure("Failed to create temporary docker environment "
+                   "file: " + environmentFile_.error());
+  }
+
+  const string& environmentFile = environmentFile_.get();
+
+  Try<int> fd = os::open(
+      environmentFile,
+      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+      S_IRUSR | S_IWUSR);
+
+  if (fd.isError()) {
+    return Failure(
+        "Failed to open file '" + environmentFile + "': " + fd.error());
+  }
+
+  Try<Nothing> write = os::write(fd.get(), environmentVariables);
+
+  os::close(fd.get());
+
+  if (write.isError()) {
+    return Failure(
+        "Failed to write docker environment file to '" + environmentFile +
+        "': " + write.error());
+  }
+
+  argv.push_back("--env-file");
+  argv.push_back(environmentFile);
 
   Option<string> volumeDriver;
   foreach (const Volume& volume, containerInfo.volumes()) {
@@ -775,11 +804,16 @@ Future<Option<int>> Docker::run(
 
   if (commandInfo.shell()) {
     // We override the entrypoint if shell is enabled because we
-    // assume the user intends to run the command within /bin/sh
+    // assume the user intends to run the command within a shell
     // and not the default entrypoint of the image. View MESOS-1770
     // for more details.
     argv.push_back("--entrypoint");
+
+#ifdef __WINDOWS__
+    argv.push_back("cmd");
+#else
     argv.push_back("/bin/sh");
+#endif // __WINDOWS__
   }
 
   argv.push_back("--name");
@@ -791,10 +825,15 @@ Future<Option<int>> Docker::run(
       return Failure("Shell specified but no command value provided");
     }
 
-    // Adding -c here because Docker cli only supports a single word
-    // for overriding entrypoint, so adding the -c flag for /bin/sh
-    // as part of the command.
+    // The Docker CLI only supports a single word for overriding the
+    // entrypoint, so we must specify `-c` (or `/c` on Windows)
+    // for the other parts of the command.
+#ifdef __WINDOWS__
+    argv.push_back("/c");
+#else
     argv.push_back("-c");
+#endif // __WINDOWS__
+
     argv.push_back(commandInfo.value());
   } else {
     if (commandInfo.has_value()) {
@@ -830,7 +869,15 @@ Future<Option<int>> Docker::run(
   }
 
   s->status()
-    .onDiscard(lambda::bind(&commandDiscarded, s.get(), cmd));
+    .onDiscard(lambda::bind(&commandDiscarded, s.get(), cmd))
+    .onAny([environmentFile]() {
+      Try<Nothing> rm = os::rm(environmentFile);
+
+      if (rm.isError()) {
+        LOG(WARNING) << "Failed to remove temporary docker environment file "
+                     << "'" << environmentFile << "': " << rm.error();
+      }
+    });
 
   // Ideally we could capture the stderr when docker itself fails,
   // however due to the stderr redirection used here we cannot.
@@ -851,7 +898,7 @@ Future<Nothing> Docker::stop(
 {
   int timeoutSecs = (int) timeout.secs();
   if (timeoutSecs < 0) {
-    return Failure("A negative timeout can not be applied to docker stop: " +
+    return Failure("A negative timeout cannot be applied to docker stop: " +
                    stringify(timeoutSecs));
   }
 
@@ -1381,9 +1428,19 @@ Future<Docker::Image> Docker::__pull(
   // TODO(gilbert): Deprecate the fetching docker config file
   // specified as URI method on 0.30.0 release.
   map<string, string> environment = os::environment();
-  environment["HOME"] = home.isSome()
-    ? home.get()
-    : directory;
+  environment["HOME"] = directory;
+
+  bool configExisted =
+    os::exists(path::join(directory, ".docker", "config.json")) ||
+    os::exists(path::join(directory, ".dockercfg"));
+
+  // We always set the sandbox as the 'HOME' directory, unless
+  // there is no docker config file downloaded in the sandbox
+  // and another docker config file is specified using the
+  // '--docker_config' agent flag.
+  if (!configExisted && home.isSome()) {
+    environment["HOME"] = home.get();
+  }
 
   Try<Subprocess> s_ = subprocess(
       path,

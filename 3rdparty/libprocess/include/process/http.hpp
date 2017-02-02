@@ -30,6 +30,7 @@
 #include <process/future.hpp>
 #include <process/owned.hpp>
 #include <process/pid.hpp>
+#include <process/socket.hpp>
 
 #include <stout/error.hpp>
 #include <stout/hashmap.hpp>
@@ -49,11 +50,15 @@ namespace process {
 template <typename T>
 class Future;
 
-namespace network {
-class Socket;
-} // namespace network {
-
 namespace http {
+
+enum class Scheme {
+  HTTP,
+#ifdef USE_SSL_SOCKET
+  HTTPS
+#endif
+};
+
 
 namespace authentication {
 
@@ -257,45 +262,6 @@ typedef hashmap<std::string,
                 CaseInsensitiveEqual> Headers;
 
 
-struct Request
-{
-  std::string method;
-
-  // TODO(benh): Add major/minor version.
-
-  // For client requests, the URL should be a URI.
-  // For server requests, the URL may be a URI or a relative reference.
-  URL url;
-
-  Headers headers;
-
-  // TODO(bmahler): Add a 'query' field which contains both
-  // the URL query and the parsed form data from the body.
-
-  std::string body;
-
-  // TODO(bmahler): Ensure this is consistent with the 'Connection'
-  // header; perhaps make this a function that checks the header.
-  bool keepAlive;
-
-  // For server requests, this contains the address of the client.
-  // Note that this may correspond to a proxy or load balancer address.
-  network::Address client;
-
-  /**
-   * Returns whether the encoding is considered acceptable in the
-   * response. See RFC 2616 section 14.3 for details.
-   */
-  bool acceptsEncoding(const std::string& encoding) const;
-
-  /**
-   * Returns whether the media type is considered acceptable in the
-   * response. See RFC 2616, section 14.1 for the details.
-   */
-  bool acceptsMediaType(const std::string& mediaType) const;
-};
-
-
 // Represents an asynchronous in-memory unbuffered Pipe, currently
 // used for streaming HTTP responses via chunked encoding. Note that
 // being an in-memory pipe means that this cannot be used across OS
@@ -307,9 +273,8 @@ struct Request
 //
 // Unlike unix pipes, if the read-end of the pipe is closed before
 // the write-end is closed, rather than receiving SIGPIPE or EPIPE
-// during a write, the writer is notified via a future. Like unix
-// pipes, we are not notified if the read-end is closed after the
-// write-end is closed, even if data is remaining in the pipe!
+// during a write, the writer is notified via a future. This future
+// is discarded if the write-end is closed first.
 //
 // No buffering means that each non-empty write to the pipe will
 // correspond to to an equivalent read from the pipe, and the
@@ -346,6 +311,12 @@ public:
     // Returns Failure if the writer failed, or the read-end
     // is closed.
     Future<std::string> read();
+
+    // Performs a series of asynchronous reads, until EOF is reached.
+    // Returns the concatenated result of the reads.
+    // Returns Failure if the writer failed, or the read-end
+    // is closed.
+    Future<std::string> readAll();
 
     // Closing the read-end of the pipe before the write-end closes
     // or fails will notify the writer that the reader is no longer
@@ -448,6 +419,83 @@ private:
   };
 
   std::shared_ptr<Data> data;
+};
+
+
+struct Request
+{
+  Request()
+    : keepAlive(false), type(BODY) {}
+
+  std::string method;
+
+  // TODO(benh): Add major/minor version.
+
+  // For client requests, the URL should be a URI.
+  // For server requests, the URL may be a URI or a relative reference.
+  URL url;
+
+  Headers headers;
+
+  // TODO(bmahler): Ensure this is consistent with the 'Connection'
+  // header; perhaps make this a function that checks the header.
+  //
+  // TODO(anand): Ideally, this could default to 'true' since
+  // persistent connections are the default since HTTP 1.1.
+  // Perhaps, we need to go from `keepAlive` to `closeConnection`
+  // to reflect the header more accurately, and to have an
+  // intuitive default of false.
+  //
+  // Default: false.
+  bool keepAlive;
+
+  // For server requests, this contains the address of the client.
+  // Note that this may correspond to a proxy or load balancer address.
+  Option<network::Address> client;
+
+  // Clients can choose to provide the entire body at once
+  // via BODY or can choose to stream the body over to the
+  // server via PIPE.
+  //
+  // Default: BODY.
+  enum
+  {
+    BODY,
+    PIPE
+  } type;
+
+  // TODO(bmahler): Add a 'query' field which contains both
+  // the URL query and the parsed form data from the body.
+
+  std::string body;
+  Option<Pipe::Reader> reader;
+
+  /**
+   * Returns whether the encoding is considered acceptable in the
+   * response. See RFC 2616 section 14.3 for details.
+   */
+  bool acceptsEncoding(const std::string& encoding) const;
+
+  /**
+   * Returns whether the media type in the "Accept" header  is considered
+   * acceptable in the response. See RFC 2616, section 14.1 for the details.
+   */
+  bool acceptsMediaType(const std::string& mediaType) const;
+
+  /**
+   * Returns whether the media type in the `name` header is considered
+   * acceptable in the response. The media type should have similar
+   * semantics as the "Accept" header. See RFC 2616, section 14.1 for
+   * the details.
+   */
+  bool acceptsMediaType(
+      const std::string& name,
+      const std::string& mediaType) const;
+
+private:
+  bool _acceptsMediaType(
+      Option<std::string> name,
+      const std::string& mediaType) const;
 };
 
 
@@ -821,6 +869,8 @@ public:
 
 private:
   Connection(const network::Socket& s);
+  friend Future<Connection> connect(
+      const network::Address& address, Scheme scheme);
   friend Future<Connection> connect(const URL&);
 
   // Forward declaration.
@@ -830,7 +880,67 @@ private:
 };
 
 
+Future<Connection> connect(const network::Address& address, Scheme scheme);
+
+
 Future<Connection> connect(const URL& url);
+
+
+namespace internal {
+
+Future<Nothing> serve(
+    network::Socket s,
+    std::function<Future<Response>(const Request&)>&& f);
+
+} // namespace internal {
+
+
+// Serves HTTP requests on the specified socket using the specified
+// handler.
+//
+// Returns `Nothing` after serving has completed, either because (1) a
+// failure occured receiving requests or sending responses or (2) the
+// HTTP connection was not persistent (i.e., a 'Connection: close'
+// header existed either on the request or the response) or (3)
+// serving was discarded.
+//
+// Doing a `discard()` on the Future returned from `serve` will
+// discard any current socket receiving and any current socket
+// sending and shutdown the socket in both directions.
+//
+// NOTE: HTTP pipelining is automatically performed. If you don't want
+// pipelining you must explicitly sequence/serialize the requests to
+// wait for previous responses yourself.
+//
+// NOTE: The `Request` passed to the handler is of type `PIPE` and should
+// always be read using `Request.reader`.
+template <typename F>
+Future<Nothing> serve(const network::Socket& s, F&& f)
+{
+  return internal::serve(s, std::function<Future<Response>(const Request&)>(f));
+}
+
+
+// TODO(benh): Eventually we probably want something like a `Server`
+// that will handle accepting new sockets and then calling `serve`. It
+// would also be valuable to introduce shutdown semantics that are
+// better than the current discard semantics on `serve`. For example:
+//
+// class Server
+// {
+//   struct ShutdownOptions
+//   {
+//     // During the grace period, no new connections will
+//     // be accepted. Existing connections will be closed
+//     // when currently received requests have been handled.
+//     // The server will shut down reads on each connection
+//     // to prevent new requests from arriving.
+//     Duration gracePeriod;
+//   };
+//
+//   // Shuts down the server.
+//   Future<Nothing> shutdown(Sever::ShutdownOptions options);
+// };
 
 
 // Create a http Request from the specified parameters.
@@ -887,7 +997,8 @@ Future<Response> get(
     const UPID& upid,
     const Option<std::string>& path = None(),
     const Option<std::string>& query = None(),
-    const Option<Headers>& headers = None());
+    const Option<Headers>& headers = None(),
+    const Option<std::string>& scheme = None());
 
 
 // Asynchronously sends an HTTP POST request to the specified URL
@@ -908,7 +1019,8 @@ Future<Response> post(
     const Option<std::string>& path = None(),
     const Option<Headers>& headers = None(),
     const Option<std::string>& body = None(),
-    const Option<std::string>& contentType = None());
+    const Option<std::string>& contentType = None(),
+    const Option<std::string>& scheme = None());
 
 
 /**
@@ -932,12 +1044,14 @@ Future<Response> requestDelete(
  * @param path The optional path to be be deleted. If not send the
      request is send to the process directly.
  * @param headers Optional headers for the request.
+ * @param scheme Optional scheme for the request.
  * @return A future with the HTTP response.
  */
 Future<Response> requestDelete(
     const UPID& upid,
     const Option<std::string>& path = None(),
-    const Option<Headers>& headers = None());
+    const Option<Headers>& headers = None(),
+    const Option<std::string>& scheme = None());
 
 
 namespace streaming {
@@ -958,7 +1072,8 @@ Future<Response> get(
     const UPID& upid,
     const Option<std::string>& path = None(),
     const Option<std::string>& query = None(),
-    const Option<Headers>& headers = None());
+    const Option<Headers>& headers = None(),
+    const Option<std::string>& scheme = None());
 
 // Asynchronously sends an HTTP POST request to the specified URL
 // and returns the HTTP response of type 'PIPE' once the response
@@ -979,7 +1094,8 @@ Future<Response> post(
     const Option<std::string>& path = None(),
     const Option<Headers>& headers = None(),
     const Option<std::string>& body = None(),
-    const Option<std::string>& contentType = None());
+    const Option<std::string>& contentType = None(),
+    const Option<std::string>& scheme = None());
 
 } // namespace streaming {
 

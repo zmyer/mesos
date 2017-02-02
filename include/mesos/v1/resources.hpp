@@ -53,16 +53,6 @@
 namespace mesos {
 namespace v1 {
 
-// Forward declarations required for making
-// `convertJSON` a friend of `Resources`.
-class Resources;
-
-namespace internal {
-  Try<Resources> convertJSON(
-      const JSON::Array& resourcesJSON,
-      const std::string& defaultRole);
-}
-
 // NOTE: Resource objects stored in the class are always valid and
 // kept combined if possible. It is the caller's responsibility to
 // validate any Resource object or repeated Resource protobufs before
@@ -107,7 +97,7 @@ private:
     // Check whether this Resource_ object is empty.
     bool isEmpty() const;
 
-    // The `Resource_` arithmetric, comparison operators and `contains()`
+    // The `Resource_` arithmetic, comparison operators and `contains()`
     // method require the wrapped `resource` protobuf to have the same
     // sharedness.
     //
@@ -164,12 +154,11 @@ public:
   /**
    * Parses Resources from an input string.
    *
-   * Parses Resources from text in the form of a JSON array. If that fails,
-   * parses text in the form "name(role):value;name:value;...". Any resource
-   * that doesn't specify a role is assigned to the provided default role. See
-   * the `Resource` protobuf definition for precise JSON formatting.
-   *
-   * Example JSON: [{"name":cpus","type":"SCALAR","scalar":{"value":8}}]
+   * Parses Resources from text in the form of a JSON array or as a simple
+   * string in the form of "name(role):value;name:value;...". i.e., this
+   * method calls `fromJSON()` or `fromSimpleString()` and validates the
+   * resulting `vector<Resource>` before converting it to a `Resources`
+   * object.
    *
    * @param text The input string.
    * @param defaultRole The default role.
@@ -177,6 +166,50 @@ public:
    *     successful, or an Error otherwise.
    */
   static Try<Resources> parse(
+      const std::string& text,
+      const std::string& defaultRole = "*");
+
+  /**
+   * Parses an input JSON array into a vector of Resource objects.
+   *
+   * Parses into a vector of Resource objects from a JSON array. Any
+   * resource that doesn't specify a role is assigned to the provided
+   * default role. See the `Resource` protobuf definition for precise
+   * JSON formatting.
+   *
+   * Example JSON: [{"name":"cpus","type":"SCALAR","scalar":{"value":8}}]
+   *
+   * NOTE: The `Resource` objects in the result vector may not be valid
+   * semantically (i.e., they may not pass `Resources::validate()`). This
+   * is to allow additional handling of the parsing results in some cases.
+   *
+   * @param resourcesJSON The input JSON array.
+   * @param defaultRole The default role.
+   * @return A `Try` which contains the parsed vector of Resource objects
+   *     if parsing was successful, or an Error otherwise.
+   */
+  static Try<std::vector<Resource>> fromJSON(
+      const JSON::Array& resourcesJSON,
+      const std::string& defaultRole = "*");
+
+  /**
+   * Parses an input text string into a vector of Resource objects.
+   *
+   * Parses into a vector of Resource objects from text. Any resource that
+   * doesn't specify a role is assigned to the provided default role.
+   *
+   * Example text: name(role):value;name:value;...
+   *
+   * NOTE: The `Resource` objects in the result vector may not be valid
+   * semantically (i.e., they may not pass `Resources::validate()`). This
+   * is to allow additional handling of the parsing results in some cases.
+   *
+   * @param text The input text string.
+   * @param defaultRole The default role.
+   * @return A `Try` which contains the parsed vector of Resource objects
+   *     if parsing was successful, or an Error otherwise.
+   */
+  static Try<std::vector<Resource>> fromSimpleString(
       const std::string& text,
       const std::string& defaultRole = "*");
 
@@ -311,6 +344,14 @@ public:
   // - If the resource is not in the Resources object, the count is 0.
   size_t count(const Resource& that) const;
 
+  // Allocates the resources to the given role (by setting the
+  // `AllocationInfo.role`). Any existing allocation will be
+  // over-written.
+  void allocate(const std::string& role);
+
+  // Unallocates the resources.
+  void unallocate();
+
   // Filter resources based on the given predicate.
   Resources filter(
       const lambda::function<bool(const Resource&)>& predicate) const;
@@ -341,6 +382,10 @@ public:
   // Returns the non-shared resources.
   Resources nonShared() const;
 
+  // Returns the per-role allocations within these resource objects.
+  // This must be called only when the resources are allocated!
+  hashmap<std::string, Resources> allocations() const;
+
   // Returns a Resources object with the same amount of each resource
   // type as these Resources, but with all Resource objects marked as
   // the specified (role, reservation) pair. This is used to cross
@@ -359,11 +404,11 @@ public:
   Resources flatten() const;
 
   // Returns a Resources object that contains all the scalar resources
-  // in this object, but with their ReservationInfo and DiskInfo
-  // omitted. Note that the `role` and RevocableInfo, if any, are
-  // preserved. Because we clear ReservationInfo but preserve `role`,
-  // this means that stripping a dynamically reserved resource makes
-  // it effectively statically reserved.
+  // in this object, but with their ReservationInfo, AllocationInfo,
+  // and DiskInfo omitted. Note that the `role` and RevocableInfo,
+  // if any, are preserved. Because we clear ReservationInfo but
+  // preserve `role`, this means that stripping a dynamically
+  // reserved resource makes it effectively statically reserved.
   //
   // This is intended for code that would like to aggregate together
   // Resource values without regard for metadata like whether the
@@ -470,7 +515,7 @@ public:
   bool operator!=(const Resources& that) const;
 
   // NOTE: If any error occurs (e.g., input Resource is not valid or
-  // the first operand is not a superset of the second oprand while
+  // the first operand is not a superset of the second operand while
   // doing subtraction), the semantics is as though the second operand
   // was actually just an empty resource (as though you didn't do the
   // operation at all).
@@ -486,10 +531,6 @@ public:
 
   friend std::ostream& operator<<(
       std::ostream& stream, const Resource_& resource_);
-
-  friend Try<Resources> internal::convertJSON(
-      const JSON::Array& resourcesJSON,
-      const std::string& defaultRole);
 
 private:
   // Similar to 'contains(const Resource&)' but skips the validity
@@ -508,6 +549,9 @@ private:
 
   // Validation-free versions of += and -= `Resource_` operators.
   // These can be used when `r` is already validated.
+  //
+  // NOTE: `Resource` objects are implicitly converted to `Resource_`
+  // objects, so here the API can also accept a `Resource` object.
   void add(const Resource_& r);
   void subtract(const Resource_& r);
 

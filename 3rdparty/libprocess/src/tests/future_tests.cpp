@@ -18,6 +18,8 @@
 #include <process/future.hpp>
 #include <process/gtest.hpp>
 
+#include <stout/duration.hpp>
+#include <stout/nothing.hpp>
 #include <stout/try.hpp>
 
 using process::Clock;
@@ -256,6 +258,34 @@ TEST(FutureTest, After2)
 }
 
 
+// Verifies that a a future does not leak memory after calling
+// `after()`. This behavior ocurred because a future indirectly
+// kept a reference counted pointer to itself.
+TEST(FutureTest, After3)
+{
+  Future<Nothing> future;
+  process::WeakFuture<Nothing> weak_future(future);
+
+  EXPECT_SOME(weak_future.get());
+
+  {
+    // The original future disappears here. After this call the
+    // original future goes out of scope and should not be reachable
+    // anymore.
+    future = future
+      .after(Milliseconds(1), [](Future<Nothing> f) {
+        f.discard();
+        return Nothing();
+      });
+
+    AWAIT_READY(future);
+  }
+
+  EXPECT_NONE(weak_future.get());
+  EXPECT_FALSE(future.hasDiscard());
+}
+
+
 static Future<bool> readyFuture()
 {
   return true;
@@ -458,7 +488,8 @@ TEST(FutureTest, Discard3)
 }
 
 
-TEST(FutureTest, Select)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(FutureTest, Select)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 

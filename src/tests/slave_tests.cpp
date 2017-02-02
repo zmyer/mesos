@@ -14,7 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __WINDOWS__
 #include <unistd.h>
+#endif // __WINDOWS__
 
 #include <algorithm>
 #include <map>
@@ -37,6 +39,10 @@
 #include <process/reap.hpp>
 #include <process/subprocess.hpp>
 
+#include <stout/hashset.hpp>
+#include <stout/json.hpp>
+#include <stout/none.hpp>
+#include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
@@ -78,15 +84,21 @@ using mesos::internal::protobuf::createLabel;
 using mesos::master::detector::MasterDetector;
 using mesos::master::detector::StandaloneMasterDetector;
 
+using mesos::slave::ContainerTermination;
+
 using mesos::v1::scheduler::Call;
 using mesos::v1::scheduler::Mesos;
 
 using process::Clock;
+using process::Failure;
 using process::Future;
+using process::Message;
 using process::Owned;
 using process::PID;
 using process::Promise;
 using process::UPID;
+
+using process::filter;
 
 using process::http::InternalServerError;
 using process::http::OK;
@@ -179,14 +191,17 @@ TEST_F(SlaveTest, DuplicateTerminalUpdateBeforeAck)
 {
   Clock::pause();
 
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
   TestContainerizer containerizer(&exec);
 
+  slave::Flags agentFlags = CreateSlaveFlags();
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, agentFlags);
   ASSERT_SOME(slave);
 
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
@@ -206,6 +221,11 @@ TEST_F(SlaveTest, DuplicateTerminalUpdateBeforeAck)
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
+
+  // Advance the clock to trigger both agent registration and a batch
+  // allocation.
+  Clock::advance(agentFlags.registration_backoff_factor);
+  Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
   EXPECT_NE(0u, offers->size());
@@ -283,7 +303,7 @@ TEST_F(SlaveTest, DuplicateTerminalUpdateBeforeAck)
 }
 
 
-TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, ShutdownUnregisteredExecutor)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -299,7 +319,7 @@ TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, false, &fetcher);
 
-  CHECK_SOME(_containerizer);
+  ASSERT_SOME(_containerizer);
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -312,8 +332,7 @@ TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -333,7 +352,7 @@ TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
   task.mutable_resources()->MergeFrom(offers.get()[0].resources());
 
   CommandInfo command;
-  command.set_value("sleep 10");
+  command.set_value(SLEEP_COMMAND(10));
 
   task.mutable_command()->MergeFrom(command);
 
@@ -380,6 +399,7 @@ TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
 }
 
 
+#ifndef __WINDOWS__
 // This test verifies that mesos agent gets notified of task
 // launch failure triggered by the executor register timeout
 // caused by slow URI fetching.
@@ -411,7 +431,7 @@ TEST_F(SlaveTest, ExecutorTimeoutCausedBySlowFetch)
   Try<MesosContainerizer*> _containerizer = MesosContainerizer::create(
       flags, true, &fetcher);
 
-  CHECK_SOME(_containerizer);
+  ASSERT_SOME(_containerizer);
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -428,8 +448,7 @@ TEST_F(SlaveTest, ExecutorTimeoutCausedBySlowFetch)
       master.get()->pid,
       DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -450,7 +469,7 @@ TEST_F(SlaveTest, ExecutorTimeoutCausedBySlowFetch)
 
   // Using a dummy command value as it's a required field. The
   // command won't be invoked.
-  commandInfo.set_value("sleep 10");
+  commandInfo.set_value(SLEEP_COMMAND(10));
 
   ExecutorID executorId;
   executorId.set_value("test-executor-staging");
@@ -507,6 +526,7 @@ TEST_F(SlaveTest, ExecutorTimeoutCausedBySlowFetch)
   driver.stop();
   driver.join();
 }
+#endif // __WINDOWS__
 
 
 // This test verifies that when an executor terminates before
@@ -527,8 +547,7 @@ TEST_F(SlaveTest, RemoveUnregisteredTerminatedExecutor)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -587,7 +606,7 @@ TEST_F(SlaveTest, RemoveUnregisteredTerminatedExecutor)
 // mesos-executor args. For more details of this see MESOS-1873.
 //
 // This assumes the ability to execute '/bin/echo --author'.
-TEST_F(SlaveTest, CommandTaskWithArguments)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, CommandTaskWithArguments)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -601,7 +620,7 @@ TEST_F(SlaveTest, CommandTaskWithArguments)
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, false, &fetcher);
 
-  CHECK_SOME(_containerizer);
+  ASSERT_SOME(_containerizer);
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -614,8 +633,7 @@ TEST_F(SlaveTest, CommandTaskWithArguments)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -701,7 +719,7 @@ TEST_F(SlaveTest, CommandTaskWithKillPolicy)
   task.mutable_resources()->MergeFrom(offer.resources());
 
   CommandInfo command;
-  command.set_value("sleep 1000");
+  command.set_value(SLEEP_COMMAND(1000));
   task.mutable_command()->MergeFrom(command);
 
   // Set task's kill policy grace period to a large value.
@@ -744,7 +762,7 @@ TEST_F(SlaveTest, CommandTaskWithKillPolicy)
 
 // Don't let args from the CommandInfo struct bleed over into
 // mesos-executor forking. For more details of this see MESOS-1873.
-TEST_F(SlaveTest, GetExecutorInfo)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, GetExecutorInfo)
 {
   TestContainerizer containerizer;
   StandaloneMasterDetector detector;
@@ -803,7 +821,7 @@ TEST_F(SlaveTest, GetExecutorInfo)
 // Ensure getExecutorInfo for mesos-executor gets the ContainerInfo,
 // if present. This ensures the MesosContainerizer can get the
 // NetworkInfo even when using the command executor.
-TEST_F(SlaveTest, GetExecutorInfoForTaskWithContainer)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, GetExecutorInfoForTaskWithContainer)
 {
   TestContainerizer containerizer;
   StandaloneMasterDetector detector;
@@ -864,7 +882,7 @@ TEST_F(SlaveTest, GetExecutorInfoForTaskWithContainer)
 // MesosContainerizer would fail the launch.
 //
 // TODO(jieyu): Move this test to the mesos containerizer tests.
-TEST_F(SlaveTest, LaunchTaskInfoWithContainerInfo)
+TEST_F(SlaveTest, ROOT_LaunchTaskInfoWithContainerInfo)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -878,7 +896,7 @@ TEST_F(SlaveTest, LaunchTaskInfoWithContainerInfo)
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, false, &fetcher);
 
-  CHECK_SOME(_containerizer);
+  ASSERT_SOME(_containerizer);
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   StandaloneMasterDetector detector;
@@ -927,7 +945,7 @@ TEST_F(SlaveTest, LaunchTaskInfoWithContainerInfo)
       task,
       executor,
       sandbox.get(),
-      "test",
+      "nobody",
       slaveID,
       map<string, string>(),
       false);
@@ -961,7 +979,7 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, false, &fetcher);
 
-  CHECK_SOME(_containerizer);
+  ASSERT_SOME(_containerizer);
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -974,8 +992,7 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -995,8 +1012,8 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
   task.mutable_resources()->MergeFrom(offers.get()[0].resources());
 
   Result<string> user = os::user();
-  CHECK_SOME(user) << "Failed to get current user name"
-                   << (user.isError() ? ": " + user.error() : "");
+  ASSERT_SOME(user) << "Failed to get current user name"
+                    << (user.isError() ? ": " + user.error() : "");
 
   const string helper = getTestHelperPath("test-helper");
 
@@ -1033,6 +1050,7 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
 }
 
 
+#ifndef __WINDOWS__
 // This test runs a command _with_ the command user field set. The
 // command will verify the assumption that the command is run as the
 // specified user. We use (and assume the presence) of the
@@ -1061,7 +1079,7 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, false, &fetcher);
 
-  CHECK_SOME(_containerizer);
+  ASSERT_SOME(_containerizer);
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -1074,8 +1092,7 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
@@ -1103,8 +1120,8 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
       offers.get()[0].resources());
 
   Result<string> user = os::user();
-  CHECK_SOME(user) << "Failed to get current user name"
-                   << (user.isError() ? ": " + user.error() : "");
+  ASSERT_SOME(user) << "Failed to get current user name"
+                    << (user.isError() ? ": " + user.error() : "");
   // Current user should be root.
   EXPECT_EQ("root", user.get());
 
@@ -1179,6 +1196,7 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   driver.stop();
   driver.join();
 }
+#endif // __WINDOWS__
 
 
 // This test ensures that a status update acknowledgement from a
@@ -1199,8 +1217,7 @@ TEST_F(SlaveTest, IgnoreNonLeaderStatusUpdateAcknowledgement)
   MesosSchedulerDriver schedDriver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&schedDriver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&schedDriver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&schedDriver, _))
@@ -1221,9 +1238,7 @@ TEST_F(SlaveTest, IgnoreNonLeaderStatusUpdateAcknowledgement)
 
   TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
 
-  Future<ExecutorDriver*> execDriver;
-  EXPECT_CALL(exec, registered(_, _, _, _))
-    .WillOnce(FutureArg<0>(&execDriver));
+  EXPECT_CALL(exec, registered(_, _, _, _));
 
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -1400,7 +1415,7 @@ TEST_F(SlaveTest, MetricsSlaveLaunchErrors)
   TaskInfo task = createTask(
       offer.slave_id(),
       Resources::parse("cpus:1;mem:32").get(),
-      "sleep 1000",
+      SLEEP_COMMAND(1000),
       DEFAULT_EXECUTOR_ID);
 
   driver.launchTasks(offer.id(), {task});
@@ -1419,14 +1434,15 @@ TEST_F(SlaveTest, MetricsSlaveLaunchErrors)
 
 TEST_F(SlaveTest, StateEndpoint)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = this->CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
-  slave::Flags flags = this->CreateSlaveFlags();
+  slave::Flags agentFlags = this->CreateSlaveFlags();
 
-  flags.hostname = "localhost";
-  flags.resources = "cpus:4;gpus:0;mem:2048;disk:512;ports:[33000-34000]";
-  flags.attributes = "rack:abc;host:myhost";
+  agentFlags.hostname = "localhost";
+  agentFlags.resources = "cpus:4;gpus:0;mem:2048;disk:512;ports:[33000-34000]";
+  agentFlags.attributes = "rack:abc;host:myhost";
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
   TestContainerizer containerizer(&exec);
@@ -1439,7 +1455,7 @@ TEST_F(SlaveTest, StateEndpoint)
   Owned<MasterDetector> detector = master.get()->createDetector();
 
   Try<Owned<cluster::Slave>> slave =
-    StartSlave(detector.get(), &containerizer, flags);
+    StartSlave(detector.get(), &containerizer, agentFlags);
   ASSERT_SOME(slave);
 
   // Ensure slave has finished recovery.
@@ -1479,26 +1495,36 @@ TEST_F(SlaveTest, StateEndpoint)
   EXPECT_EQ(build::TIME, state.values["build_time"]);
   EXPECT_EQ(build::USER, state.values["build_user"]);
 
+  // Even with a paused clock, the value of `start_time` from the
+  // state endpoint can differ slightly from the actual start time
+  // since the value went through a number of conversions (`double` to
+  // `string` to `JSON::Value`).  Since `Clock::now` is a floating
+  // point value, the actual maximal possible difference between the
+  // real and observed value depends on both the mantissa and the
+  // exponent of the compared values; for simplicity we compare with
+  // an epsilon of `1` which allows for e.g., changes in the integer
+  // part of values close to an integer value.
   ASSERT_TRUE(state.values["start_time"].is<JSON::Number>());
-  EXPECT_EQ(
-      static_cast<int>(Clock::now().secs()),
-      state.values["start_time"].as<JSON::Number>().as<int>());
+  EXPECT_NEAR(
+      Clock::now().secs(),
+      state.values["start_time"].as<JSON::Number>().as<double>(),
+      1);
 
   // TODO(bmahler): The slave must register for the 'id'
   // to be non-empty.
   ASSERT_TRUE(state.values["id"].is<JSON::String>());
 
   EXPECT_EQ(stringify(slave.get()->pid), state.values["pid"]);
-  EXPECT_EQ(flags.hostname.get(), state.values["hostname"]);
+  EXPECT_EQ(agentFlags.hostname.get(), state.values["hostname"]);
 
   Try<Resources> resources = Resources::parse(
-      flags.resources.get(), flags.default_role);
+      agentFlags.resources.get(), agentFlags.default_role);
 
   ASSERT_SOME(resources);
 
   EXPECT_EQ(model(resources.get()), state.values["resources"]);
 
-  Attributes attributes = Attributes::parse(flags.attributes.get());
+  Attributes attributes = Attributes::parse(agentFlags.attributes.get());
 
   EXPECT_EQ(model(attributes), state.values["attributes"]);
 
@@ -1513,7 +1539,7 @@ TEST_F(SlaveTest, StateEndpoint)
   EXPECT_TRUE(
       state.values["completed_frameworks"].as<JSON::Array>().values.empty());
 
-  // TODO(bmahler): Ensure this contains all the flags.
+  // TODO(bmahler): Ensure this contains all the agentFlags.
   ASSERT_TRUE(state.values["flags"].is<JSON::Object>());
   EXPECT_FALSE(state.values["flags"].as<JSON::Object>().values.empty());
 
@@ -1521,8 +1547,7 @@ TEST_F(SlaveTest, StateEndpoint)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -1530,6 +1555,11 @@ TEST_F(SlaveTest, StateEndpoint)
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
+
+  // Advance the clock to trigger both agent registration and a batch
+  // allocation.
+  Clock::advance(agentFlags.registration_backoff_factor);
+  Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
   EXPECT_NE(0u, offers.get().size());
@@ -1544,8 +1574,7 @@ TEST_F(SlaveTest, StateEndpoint)
   task.mutable_resources()->MergeFrom(offers.get()[0].resources());
   task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
 
-  EXPECT_CALL(exec, registered(_, _, _, _))
-    .Times(1);
+  EXPECT_CALL(exec, registered(_, _, _, _));
 
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -1614,7 +1643,9 @@ TEST_F(SlaveTest, StateEndpoint)
 
 // This test checks that when a slave is in RECOVERING state it responds
 // to HTTP requests for "/state" endpoint with ServiceUnavailable.
-TEST_F(SlaveTest, StateEndpointUnavailableDuringRecovery)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    SlaveTest,
+    StateEndpointUnavailableDuringRecovery)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -1641,8 +1672,7 @@ TEST_F(SlaveTest, StateEndpointUnavailableDuringRecovery)
   MesosSchedulerDriver driver(
       &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 512, "*"))
@@ -1853,7 +1883,7 @@ TEST_F(SlaveTest, StatisticsEndpointMissingStatistics)
   TaskInfo task = createTask(
       offer.slave_id(),
       Resources::parse("cpus:0.1;mem:32").get(),
-      "sleep 1000",
+      SLEEP_COMMAND(1000),
       exec.id);
 
   EXPECT_CALL(exec, launchTask(_, _))
@@ -1960,7 +1990,7 @@ TEST_F(SlaveTest, StatisticsEndpointRunningExecutor)
   TaskInfo task = createTask(
       offer.slave_id(),
       Resources::parse("cpus:1;mem:32").get(),
-      "sleep 1000");
+      SLEEP_COMMAND(1000));
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -2126,7 +2156,7 @@ TEST_F(SlaveTest, ContainersEndpoint)
   TaskInfo task = createTask(
       offer.slave_id(),
       Resources::parse("cpus:0.1;mem:32").get(),
-      "sleep 1000",
+      SLEEP_COMMAND(1000),
       exec.id);
 
   EXPECT_CALL(exec, launchTask(_, _))
@@ -2148,6 +2178,13 @@ TEST_F(SlaveTest, ContainersEndpoint)
     .WillOnce(Return(statistics));
 
   ContainerStatus containerStatus;
+
+  ContainerID parent;
+  ContainerID child;
+  parent.set_value("parent");
+  child.set_value("child");
+  child.mutable_parent()->CopyFrom(parent);
+  containerStatus.mutable_container_id()->CopyFrom(child);
 
   CgroupInfo* cgroupInfo = containerStatus.mutable_cgroup_info();
   CgroupInfo::NetCls* netCls = cgroupInfo->mutable_net_cls();
@@ -2182,6 +2219,10 @@ TEST_F(SlaveTest, ContainersEndpoint)
               "\"mem_limit_bytes\":2048"
           "},"
           "\"status\":{"
+              "\"container_id\":{"
+                "\"parent\":{\"value\":\"parent\"},"
+                "\"value\":\"child\""
+              "},"
               "\"cgroup_info\":{\"net_cls\":{\"classid\":42}},"
               "\"network_infos\":[{"
                   "\"ip_addresses\":[{\"ip_address\":\"192.168.1.20\"}]"
@@ -2237,8 +2278,7 @@ TEST_F(SlaveTest, DISABLED_TerminatingSlaveDoesNotReregister)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   // Launch a task that uses less resource than the
   // default(cpus:2, mem:1024).
@@ -2246,8 +2286,7 @@ TEST_F(SlaveTest, DISABLED_TerminatingSlaveDoesNotReregister)
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, 1, 64, "*"))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
-  EXPECT_CALL(exec, registered(_, _, _, _))
-    .Times(1);
+  EXPECT_CALL(exec, registered(_, _, _, _));
 
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -2314,8 +2353,9 @@ TEST_F(SlaveTest, DISABLED_TerminatingSlaveDoesNotReregister)
 
 // This test verifies the slave will destroy a container if, when
 // receiving a terminal status task update, updating the container's
-// resources fails.
-TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFails)
+// resources fails. A non-partition-aware framework should receive
+// TASK_LOST in this situation.
+TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFailsWithLost)
 {
   // Start a master.
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -2331,6 +2371,7 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFails)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
   ASSERT_SOME(slave);
 
+  // Connect a non-partition-aware scheduler.
   MockScheduler sched;
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
@@ -2355,13 +2396,13 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFails)
   tasks.push_back(createTask(
       offer.slave_id(),
       Resources::parse("cpus:0.1;mem:32").get(),
-      "sleep 1000",
+      SLEEP_COMMAND(1000),
       exec.id));
 
   tasks.push_back(createTask(
       offer.slave_id(),
       Resources::parse("cpus:0.1;mem:32").get(),
-      "sleep 1000",
+      SLEEP_COMMAND(1000),
       exec.id));
 
   EXPECT_CALL(exec, launchTask(_, _))
@@ -2409,6 +2450,123 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFails)
   EXPECT_EQ(TaskStatus::REASON_CONTAINER_UPDATE_FAILED, status4->reason());
 
   AWAIT_READY(executorLost);
+
+  JSON::Object stats = Metrics();
+  EXPECT_EQ(0, stats.values["slave/tasks_gone"]);
+  EXPECT_EQ(1, stats.values["slave/tasks_lost"]);
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies the slave will destroy a container if, when
+// receiving a terminal status task update, updating the container's
+// resources fails. A partition-aware framework should receive
+// TASK_GONE in this situation.
+TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFailsWithGone)
+{
+  // Start a master.
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  // Start a slave.
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave);
+
+  // Connect a partition-aware scheduler.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_capabilities()->set_type(
+      FrameworkInfo::Capability::PARTITION_AWARE);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+  Offer offer = offers.get()[0];
+
+  // Start two tasks.
+  vector<TaskInfo> tasks;
+
+  tasks.push_back(createTask(
+      offer.slave_id(),
+      Resources::parse("cpus:0.1;mem:32").get(),
+      SLEEP_COMMAND(1000),
+      exec.id));
+
+  tasks.push_back(createTask(
+      offer.slave_id(),
+      Resources::parse("cpus:0.1;mem:32").get(),
+      SLEEP_COMMAND(1000),
+      exec.id));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status1, status2, status3, status4;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status1))
+    .WillOnce(FutureArg<1>(&status2))
+    .WillOnce(FutureArg<1>(&status3))
+    .WillOnce(FutureArg<1>(&status4));
+
+  driver.launchTasks(offer.id(), tasks);
+
+  AWAIT_READY(status1);
+  EXPECT_EQ(TASK_RUNNING, status1.get().state());
+
+  AWAIT_READY(status2);
+  EXPECT_EQ(TASK_RUNNING, status2.get().state());
+
+  // Set up the containerizer so the next update() will fail.
+  EXPECT_CALL(containerizer, update(_, _))
+    .WillOnce(Return(Failure("update() failed")))
+    .WillRepeatedly(Return(Nothing()));
+
+  EXPECT_CALL(exec, killTask(_, _))
+    .WillOnce(SendStatusUpdateFromTaskID(TASK_KILLED));
+
+  Future<Nothing> executorLost;
+  EXPECT_CALL(sched, executorLost(&driver, DEFAULT_EXECUTOR_ID, _, _))
+    .WillOnce(FutureSatisfy(&executorLost));
+
+  // Kill one of the tasks. The failed update should result in the
+  // second task going lost when the container is destroyed.
+  driver.killTask(tasks[0].task_id());
+
+  AWAIT_READY(status3);
+  EXPECT_EQ(TASK_KILLED, status3.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, status3.get().source());
+
+  AWAIT_READY(status4);
+  EXPECT_EQ(TASK_GONE, status4->state());
+  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status4->source());
+  EXPECT_EQ(TaskStatus::REASON_CONTAINER_UPDATE_FAILED, status4->reason());
+
+  AWAIT_READY(executorLost);
+
+  JSON::Object stats = Metrics();
+  EXPECT_EQ(1, stats.values["slave/tasks_gone"]);
+  EXPECT_EQ(0, stats.values["slave/tasks_lost"]);
 
   driver.stop();
   driver.join();
@@ -2552,7 +2710,8 @@ TEST_F(SlaveTest, PingTimeoutNoPings)
   Owned<MasterDetector> detector = master.get()->createDetector();
 
   // Start a slave.
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  slave::Flags agentFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), agentFlags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(slaveRegisteredMessage);
@@ -2573,8 +2732,9 @@ TEST_F(SlaveTest, PingTimeoutNoPings)
     FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
 
   Clock::advance(totalTimeout);
-
   AWAIT_READY(detected);
+
+  Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(slaveReregisteredMessage);
 }
 
@@ -2594,7 +2754,8 @@ TEST_F(SlaveTest, PingTimeoutSomePings)
   Owned<MasterDetector> detector = master.get()->createDetector();
 
   // Start a slave.
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  slave::Flags agentFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), agentFlags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(slaveRegisteredMessage);
@@ -2620,8 +2781,9 @@ TEST_F(SlaveTest, PingTimeoutSomePings)
     FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
 
   Clock::advance(slave::DEFAULT_MASTER_PING_TIMEOUT());
-
   AWAIT_READY(detected);
+
+  Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(slaveReregisteredMessage);
 }
 
@@ -2811,6 +2973,7 @@ TEST_F(SlaveTest, CancelSlaveRemoval)
 }
 
 
+#ifndef __WINDOWS__
 // This test checks that the master behaves correctly when a slave
 // fails health checks, but concurrently the slave unregisters from
 // the master.
@@ -2852,16 +3015,16 @@ TEST_F(SlaveTest, HealthCheckUnregisterRace)
   EXPECT_CALL(sched, slaveLost(&driver, _))
     .WillOnce(FutureSatisfy(&slaveLost));
 
-  // Cause the slave to shutdown gracefully by sending it SIGUSR1.
-  // This should result in the slave sending `UnregisterSlaveMessage`
-  // to the master.
+  // Cause the slave to shutdown gracefully. This should result in
+  // the slave sending `UnregisterSlaveMessage` to the master.
   Future<UnregisterSlaveMessage> unregisterSlaveMessage =
     FUTURE_PROTOBUF(
         UnregisterSlaveMessage(),
         slave.get()->pid,
         master.get()->pid);
 
-  kill(getpid(), SIGUSR1);
+  slave.get()->shutdown();
+  slave->reset();
 
   AWAIT_READY(unregisterSlaveMessage);
   AWAIT_READY(slaveLost);
@@ -2878,7 +3041,10 @@ TEST_F(SlaveTest, HealthCheckUnregisterRace)
   EXPECT_CALL(*master.get()->registrar.get(), apply(_))
     .Times(0);
 
-  process::dispatch(master.get()->pid, &Master::markUnreachable, slaveId);
+  process::dispatch(master.get()->pid,
+                    &Master::markUnreachable,
+                    slaveId,
+                    "dummy test case dispatch");
 
   Clock::settle();
   Clock::resume();
@@ -2886,8 +3052,10 @@ TEST_F(SlaveTest, HealthCheckUnregisterRace)
   driver.stop();
   driver.join();
 }
+#endif // __WINDOWS__
 
 
+#ifndef __WINDOWS__
 // This test checks that the master behaves correctly when a slave
 // fails health checks and is in the process of being marked
 // unreachable in the registry, but concurrently the slave unregisters
@@ -2964,10 +3132,10 @@ TEST_F(SlaveTest, UnreachableThenUnregisterRace)
       dynamic_cast<master::MarkSlaveUnreachable*>(
           markUnreachable.get().get()));
 
-  // Cause the slave to shutdown gracefully by sending it SIGUSR1.
-  // This should result in the slave sending `UnregisterSlaveMessage`
-  // to the master. Normally, the master would then remove the slave
-  // from the registry, but since the slave is already being marked
+  // Cause the slave to shutdown gracefully.  This should result in
+  // the slave sending `UnregisterSlaveMessage` to the master.
+  // Normally, the master would then remove the slave from the
+  // registry, but since the slave is already being marked
   // unreachable, the master should ignore the unregister message.
   Future<UnregisterSlaveMessage> unregisterSlaveMessage =
     FUTURE_PROTOBUF(
@@ -2978,7 +3146,8 @@ TEST_F(SlaveTest, UnreachableThenUnregisterRace)
   EXPECT_CALL(*master.get()->registrar.get(), apply(_))
     .Times(0);
 
-  kill(getpid(), SIGUSR1);
+  slave.get()->shutdown();
+  slave->reset();
 
   AWAIT_READY(unregisterSlaveMessage);
 
@@ -2997,6 +3166,7 @@ TEST_F(SlaveTest, UnreachableThenUnregisterRace)
   driver.stop();
   driver.join();
 }
+#endif // __WINDOWS__
 
 
 // This test checks that the master behaves correctly when a slave is
@@ -3141,8 +3311,7 @@ TEST_F(SlaveTest, KillTaskBetweenRunTaskParts)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -3319,12 +3488,171 @@ TEST_F(SlaveTest, KillTaskUnregisteredExecutor)
 }
 
 
+// This test ensures that if a `killTask()` for an HTTP based executor is
+// received by the agent before the executor registers, the executor is
+// properly cleaned up.
+TEST_F(SlaveTest, KillTaskUnregisteredHTTPExecutor)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+  auto executor = std::make_shared<v1::MockHTTPExecutor>();
+
+  Resources resources =
+    Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  ExecutorInfo executorInfo;
+  executorInfo.set_type(ExecutorInfo::DEFAULT);
+
+  executorInfo.mutable_executor_id()->CopyFrom(DEFAULT_EXECUTOR_ID);
+  executorInfo.mutable_resources()->CopyFrom(resources);
+
+  const ExecutorID& executorId = executorInfo.executor_id();
+  TestContainerizer containerizer(executorId, executor);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave);
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  {
+    Call call;
+    call.set_type(Call::SUBSCRIBE);
+
+    Call::Subscribe* subscribe = call.mutable_subscribe();
+    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
+
+    mesos.send(call);
+  }
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  // Update `executorInfo` with the subscribed `frameworkId`.
+  executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0, offers->offers().size());
+
+  const v1::Offer& offer = offers->offers(0);
+  const SlaveID slaveId = devolve(offer.agent_id());
+
+  Future<v1::executor::Mesos*> executorLib;
+  EXPECT_CALL(*executor, connected(_))
+    .WillOnce(FutureArg<0>(&executorLib));
+
+  v1::TaskInfo task1 =
+    evolve(createTask(slaveId, resources, ""));
+
+  v1::TaskInfo task2 =
+    evolve(createTask(slaveId, resources, ""));
+
+  v1::TaskGroupInfo taskGroup;
+  taskGroup.add_tasks()->CopyFrom(task1);
+  taskGroup.add_tasks()->CopyFrom(task2);
+
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(Call::ACCEPT);
+
+    Call::Accept* accept = call.mutable_accept();
+    accept->add_offer_ids()->CopyFrom(offers->offers(0).id());
+
+    v1::Offer::Operation* operation = accept->add_operations();
+    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
+
+    v1::Offer::Operation::LaunchGroup* launchGroup =
+      operation->mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(evolve(executorInfo));
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    mesos.send(call);
+  }
+
+  // Wait for the executor to be launched and then kill the task before
+  // the executor subscribes with the agent.
+  AWAIT_READY(executorLib);
+
+  Future<v1::scheduler::Event::Update> update1;
+  Future<v1::scheduler::Event::Update> update2;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&update1))
+    .WillOnce(FutureArg<1>(&update2));
+
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(Call::KILL);
+
+    Call::Kill* kill = call.mutable_kill();
+    kill->mutable_task_id()->CopyFrom(task1.task_id());
+    kill->mutable_agent_id()->CopyFrom(offer.agent_id());
+
+    mesos.send(call);
+  }
+
+  AWAIT_READY(update1);
+  AWAIT_READY(update2);
+
+  ASSERT_EQ(v1::TASK_KILLED, update1->status().state());
+  ASSERT_EQ(v1::TASK_KILLED, update2->status().state());
+
+  Future<Nothing> shutdown;
+  EXPECT_CALL(*executor, shutdown(_))
+    .WillOnce(FutureSatisfy(&shutdown));
+
+  // The executor should receive the shutdown event upon subscribing
+  // with the agent.
+  {
+    v1::executor::Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.mutable_executor_id()->CopyFrom(evolve(executorId));
+
+    call.set_type(v1::executor::Call::SUBSCRIBE);
+
+    call.mutable_subscribe();
+
+    executorLib.get()->send(call);
+  }
+
+  AWAIT_READY(shutdown);
+}
+
+
 // This test verifies that when a slave re-registers with the master
 // it correctly includes the latest and status update task states.
 TEST_F(SlaveTest, ReregisterWithStatusUpdateTaskState)
 {
+  Clock::pause();
+
   // Start a master.
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
@@ -3335,7 +3663,9 @@ TEST_F(SlaveTest, ReregisterWithStatusUpdateTaskState)
   StandaloneMasterDetector detector(master.get()->pid);
 
   // Start a slave.
-  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, &containerizer);
+  slave::Flags agentFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(&detector, &containerizer, agentFlags);
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -3363,8 +3693,7 @@ TEST_F(SlaveTest, ReregisterWithStatusUpdateTaskState)
 
   driver.start();
 
-  // Pause the clock to avoid status update retries.
-  Clock::pause();
+  Clock::advance(masterFlags.allocation_interval);
 
   // Wait until TASK_RUNNING is sent to the master.
   AWAIT_READY(statusUpdateMessage);
@@ -3394,7 +3723,12 @@ TEST_F(SlaveTest, ReregisterWithStatusUpdateTaskState)
   // so that the slave will do a re-registration.
   detector.appoint(master.get()->pid);
 
+  // Force evaluation of master detection before we advance clock to trigger
+  // agent registration.
+  Clock::settle();
+
   // Capture and inspect the slave reregistration message.
+  Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(reregisterSlaveMessage);
 
   ASSERT_EQ(1, reregisterSlaveMessage.get().tasks_size());
@@ -3456,7 +3790,7 @@ TEST_F(SlaveTest, ContainerizerUsageFailure)
   TaskInfo task = createTask(
       offer.slave_id(),
       Resources::parse("cpus:0.1;mem:32").get(),
-      "sleep 1000",
+      SLEEP_COMMAND(1000),
       exec.id);
 
   EXPECT_CALL(exec, launchTask(_, _))
@@ -3529,7 +3863,10 @@ TEST_F(SlaveTest, DiscoveryInfoAndPorts)
   AWAIT_READY(offers);
   EXPECT_NE(0u, offers.get().size());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 100", DEFAULT_EXECUTOR_ID);
+  TaskInfo task = createTask(
+      offers.get()[0],
+      SLEEP_COMMAND(100),
+      DEFAULT_EXECUTOR_ID);
 
   Labels labels1;
   labels1.add_labels()->CopyFrom(createLabel("ACTION", "port:7987 DENY"));
@@ -3623,8 +3960,7 @@ TEST_F(SlaveTest, ExecutorLabels)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -3650,8 +3986,7 @@ TEST_F(SlaveTest, ExecutorLabels)
   labels->add_labels()->CopyFrom(createLabel("key2", "value2"));
   labels->add_labels()->CopyFrom(createLabel("key1", "value3"));
 
-  EXPECT_CALL(exec, registered(_, _, _, _))
-    .Times(1);
+  EXPECT_CALL(exec, registered(_, _, _, _));
 
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -3717,8 +4052,7 @@ TEST_F(SlaveTest, TaskLabels)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -3744,8 +4078,7 @@ TEST_F(SlaveTest, TaskLabels)
   labels->add_labels()->CopyFrom(createLabel("bar", "baz"));
   labels->add_labels()->CopyFrom(createLabel("bar", "qux"));
 
-  EXPECT_CALL(exec, registered(_, _, _, _))
-    .Times(1);
+  EXPECT_CALL(exec, registered(_, _, _, _));
 
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -3823,8 +4156,7 @@ TEST_F(SlaveTest, TaskStatusLabels)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -3836,7 +4168,10 @@ TEST_F(SlaveTest, TaskStatusLabels)
   AWAIT_READY(offers);
   EXPECT_NE(0u, offers.get().size());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 100", DEFAULT_EXECUTOR_ID);
+  TaskInfo task = createTask(
+      offers.get()[0],
+      SLEEP_COMMAND(100),
+      DEFAULT_EXECUTOR_ID);
 
   ExecutorDriver* execDriver;
   EXPECT_CALL(exec, registered(_, _, _, _))
@@ -3926,8 +4261,7 @@ TEST_F(SlaveTest, TaskStatusContainerStatus)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -3939,11 +4273,12 @@ TEST_F(SlaveTest, TaskStatusContainerStatus)
   AWAIT_READY(offers);
   EXPECT_NE(0u, offers.get().size());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 100", DEFAULT_EXECUTOR_ID);
+  TaskInfo task = createTask(
+      offers.get()[0],
+      SLEEP_COMMAND(100),
+      DEFAULT_EXECUTOR_ID);
 
-  ExecutorDriver* execDriver;
-  EXPECT_CALL(exec, registered(_, _, _, _))
-    .WillOnce(SaveArg<0>(&execDriver));
+  EXPECT_CALL(exec, registered(_, _, _, _));
 
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
@@ -4002,7 +4337,7 @@ TEST_F(SlaveTest, TaskStatusContainerStatus)
 
 // Test that we can set the executors environment variables and it
 // won't inhert the slaves.
-TEST_F(SlaveTest, ExecutorEnvironmentVariables)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, ExecutorEnvironmentVariables)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -4024,8 +4359,7 @@ TEST_F(SlaveTest, ExecutorEnvironmentVariables)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -4322,7 +4656,7 @@ TEST_F(SlaveTest, HTTPSchedulerLiveUpgrade)
 // Ensures that the slave can restart when there is an empty
 // framework pid. Executor messages should go through the
 // master (instead of directly to the scheduler!).
-TEST_F(SlaveTest, HTTPSchedulerSlaveRestart)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, HTTPSchedulerSlaveRestart)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
   ASSERT_SOME(master);
@@ -4380,7 +4714,7 @@ TEST_F(SlaveTest, HTTPSchedulerSlaveRestart)
     .WillOnce(FutureArg<1>(&status))
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
@@ -4535,8 +4869,7 @@ TEST_F(SlaveTest, ExecutorShutdownGracePeriod)
   EXPECT_CALL(sched, statusUpdate(&driver, _))
     .WillOnce(FutureArg<1>(&statusRunning));
 
-  EXPECT_CALL(exec, registered(_, _, _, _))
-    .Times(1);
+  EXPECT_CALL(exec, registered(_, _, _, _));
 
   Future<TaskInfo> receivedTask;
   EXPECT_CALL(exec, launchTask(_, _))
@@ -4623,8 +4956,8 @@ TEST_F(SlaveTest, RunTaskGroup)
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  auto scheduler = std::make_shared<MockV1HTTPScheduler>();
-  auto executor = std::make_shared<MockV1HTTPExecutor>();
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+  auto executor = std::make_shared<v1::MockHTTPExecutor>();
 
   Resources resources =
     Resources::parse("cpus:0.1;mem:32;disk:32").get();
@@ -4645,8 +4978,10 @@ TEST_F(SlaveTest, RunTaskGroup)
   EXPECT_CALL(*scheduler, connected(_))
     .WillOnce(FutureSatisfy(&connected));
 
-  scheduler::TestV1Mesos mesos(
-      master.get()->pid, ContentType::PROTOBUF, scheduler);
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(connected);
 
@@ -4665,7 +5000,7 @@ TEST_F(SlaveTest, RunTaskGroup)
     Call call;
     call.set_type(Call::SUBSCRIBE);
     Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(DEFAULT_V1_FRAMEWORK_INFO);
+    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
 
     mesos.send(call);
   }
@@ -4681,7 +5016,7 @@ TEST_F(SlaveTest, RunTaskGroup)
   EXPECT_NE(0, offers->offers().size());
 
   EXPECT_CALL(*executor, connected(_))
-    .WillOnce(executor::SendSubscribe(frameworkId, evolve(executorId)));
+    .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
 
   EXPECT_CALL(*executor, subscribed(_, _));
 
@@ -4728,10 +5063,14 @@ TEST_F(SlaveTest, RunTaskGroup)
   AWAIT_READY(launchGroupEvent);
 
   ASSERT_EQ(2, launchGroupEvent->task_group().tasks().size());
-  EXPECT_EQ(taskInfo1.task_id(),
-            launchGroupEvent->task_group().tasks(0).task_id());
-  EXPECT_EQ(taskInfo2.task_id(),
-            launchGroupEvent->task_group().tasks(1).task_id());
+
+  const hashset<v1::TaskID> tasks{taskInfo1.task_id(), taskInfo2.task_id()};
+
+  const hashset<v1::TaskID> launchedTasks{
+      launchGroupEvent->task_group().tasks(0).task_id(),
+      launchGroupEvent->task_group().tasks(1).task_id()};
+
+  EXPECT_EQ(tasks, launchedTasks);
 
   EXPECT_CALL(*executor, shutdown(_))
     .Times(AtMost(1));
@@ -4747,8 +5086,8 @@ TEST_F(SlaveTest, KillTaskGroupBetweenRunTaskParts)
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  auto scheduler = std::make_shared<MockV1HTTPScheduler>();
-  auto executor = std::make_shared<MockV1HTTPExecutor>();
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+  auto executor = std::make_shared<v1::MockHTTPExecutor>();
 
   Resources resources =
     Resources::parse("cpus:0.1;mem:32;disk:32").get();
@@ -4770,8 +5109,10 @@ TEST_F(SlaveTest, KillTaskGroupBetweenRunTaskParts)
   EXPECT_CALL(*scheduler, connected(_))
     .WillOnce(FutureSatisfy(&connected));
 
-  scheduler::TestV1Mesos mesos(
-      master.get()->pid, ContentType::PROTOBUF, scheduler);
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(connected);
 
@@ -4791,7 +5132,7 @@ TEST_F(SlaveTest, KillTaskGroupBetweenRunTaskParts)
     Call call;
     call.set_type(Call::SUBSCRIBE);
     Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(DEFAULT_V1_FRAMEWORK_INFO);
+    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
 
     mesos.send(call);
   }
@@ -4864,6 +5205,8 @@ TEST_F(SlaveTest, KillTaskGroupBetweenRunTaskParts)
   taskGroup.add_tasks()->CopyFrom(taskInfo1);
   taskGroup.add_tasks()->CopyFrom(taskInfo2);
 
+  const hashset<v1::TaskID> tasks{taskInfo1.task_id(), taskInfo2.task_id()};
+
   {
     Call call;
     call.mutable_framework_id()->CopyFrom(frameworkId);
@@ -4920,11 +5263,12 @@ TEST_F(SlaveTest, KillTaskGroupBetweenRunTaskParts)
   AWAIT_READY(update1);
   AWAIT_READY(update2);
 
-  EXPECT_EQ(TASK_KILLED, update1->status().state());
-  EXPECT_EQ(taskInfo1.task_id(), update1->status().task_id());
+  const hashset<v1::TaskID> killedTasks{
+    update1->status().task_id(), update2->status().task_id()};
 
+  EXPECT_EQ(TASK_KILLED, update1->status().state());
   EXPECT_EQ(TASK_KILLED, update2->status().state());
-  EXPECT_EQ(taskInfo2.task_id(), update2->status().task_id());
+  EXPECT_EQ(tasks, killedTasks);
 
   terminate(slave);
   wait(slave);
@@ -4933,13 +5277,13 @@ TEST_F(SlaveTest, KillTaskGroupBetweenRunTaskParts)
 
 // This test verifies that the agent correctly populates the
 // command info for default executor.
-TEST_F(SlaveTest, DefaultExecutorCommandInfo)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, DefaultExecutorCommandInfo)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  auto scheduler = std::make_shared<MockV1HTTPScheduler>();
-  auto executor = std::make_shared<MockV1HTTPExecutor>();
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+  auto executor = std::make_shared<v1::MockHTTPExecutor>();
 
   Resources resources =
     Resources::parse("cpus:0.1;mem:32;disk:32").get();
@@ -4963,8 +5307,10 @@ TEST_F(SlaveTest, DefaultExecutorCommandInfo)
   EXPECT_CALL(*scheduler, connected(_))
     .WillOnce(FutureSatisfy(&connected));
 
-  scheduler::TestV1Mesos mesos(
-      master.get()->pid, ContentType::PROTOBUF, scheduler);
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(connected);
 
@@ -5051,8 +5397,8 @@ TEST_F(SlaveTest, KillQueuedTaskGroup)
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  auto scheduler = std::make_shared<MockV1HTTPScheduler>();
-  auto executor = std::make_shared<MockV1HTTPExecutor>();
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+  auto executor = std::make_shared<v1::MockHTTPExecutor>();
 
   Resources resources =
     Resources::parse("cpus:0.1;mem:32;disk:32").get();
@@ -5073,8 +5419,10 @@ TEST_F(SlaveTest, KillQueuedTaskGroup)
   EXPECT_CALL(*scheduler, connected(_))
     .WillOnce(FutureSatisfy(&connected));
 
-  scheduler::TestV1Mesos mesos(
-      master.get()->pid, ContentType::PROTOBUF, scheduler);
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(connected);
 
@@ -5094,7 +5442,7 @@ TEST_F(SlaveTest, KillQueuedTaskGroup)
     Call call;
     call.set_type(Call::SUBSCRIBE);
     Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(DEFAULT_V1_FRAMEWORK_INFO);
+    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
 
     mesos.send(call);
   }
@@ -5131,6 +5479,8 @@ TEST_F(SlaveTest, KillQueuedTaskGroup)
   v1::TaskGroupInfo taskGroup;
   taskGroup.add_tasks()->CopyFrom(taskInfo2);
   taskGroup.add_tasks()->CopyFrom(taskInfo3);
+
+  const hashset<v1::TaskID> tasks{taskInfo2.task_id(), taskInfo3.task_id()};
 
   {
     Call call;
@@ -5182,11 +5532,12 @@ TEST_F(SlaveTest, KillQueuedTaskGroup)
   AWAIT_READY(update1);
   AWAIT_READY(update2);
 
-  EXPECT_EQ(TASK_KILLED, update1->status().state());
-  EXPECT_EQ(taskInfo2.task_id(), update1->status().task_id());
+  const hashset<v1::TaskID> killedTasks{
+    update1->status().task_id(), update2->status().task_id()};
 
+  EXPECT_EQ(TASK_KILLED, update1->status().state());
   EXPECT_EQ(TASK_KILLED, update2->status().state());
-  EXPECT_EQ(taskInfo3.task_id(), update2->status().task_id());
+  EXPECT_EQ(tasks, killedTasks);
 
   EXPECT_CALL(*executor, subscribed(_, _));
 
@@ -5215,6 +5566,163 @@ TEST_F(SlaveTest, KillQueuedTaskGroup)
 
   EXPECT_CALL(*executor, shutdown(_))
     .Times(AtMost(1));
+}
+
+
+// Test the max_completed_executors_per_framework flag.
+TEST_F(SlaveTest, MaxCompletedExecutorsPerFrameworkFlag)
+{
+  Clock::pause();
+
+  // We verify that the proper amount of history is maintained
+  // by launching a single framework with exactly 2 executors. We
+  // do this when setting `max_completed_executors_per_framework`
+  // to 0, 1, and 2. This covers the cases of maintaining no
+  // history, some history less than the total number of executors
+  // launched, and history equal to the total number of executors
+  // launched.
+  const size_t totalExecutorsPerFramework = 2;
+  const size_t maxExecutorsPerFrameworkArray[] = {0, 1, 2};
+
+  foreach (const size_t maxExecutorsPerFramework,
+           maxExecutorsPerFrameworkArray) {
+    master::Flags masterFlags = MesosTest::CreateMasterFlags();
+    Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+    ASSERT_SOME(master);
+
+    hashmap<ExecutorID, Executor*> executorMap;
+    vector<Owned<MockExecutor>> executors;
+
+    vector<ExecutorInfo> executorInfos;
+
+    for (size_t i = 0; i < totalExecutorsPerFramework; i++) {
+      ExecutorInfo executorInfo = createExecutorInfo(stringify(i), "exit 1");
+
+      executorInfos.push_back(executorInfo);
+
+      Owned<MockExecutor> executor =
+        Owned<MockExecutor>(new MockExecutor(executorInfo.executor_id()));
+
+      executorMap.put(executorInfo.executor_id(), executor.get());
+      executors.push_back(executor);
+    }
+
+    TestContainerizer containerizer(executorMap);
+
+    slave::Flags agentFlags = CreateSlaveFlags();
+    agentFlags.max_completed_executors_per_framework = maxExecutorsPerFramework;
+
+    Owned<MasterDetector> detector = master.get()->createDetector();
+    Try<Owned<cluster::Slave>> agent =
+      StartSlave(detector.get(), &containerizer, agentFlags);
+
+    ASSERT_SOME(agent);
+
+    MockScheduler sched;
+    MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+    Future<Nothing> schedRegistered;
+    EXPECT_CALL(sched, registered(_, _, _))
+      .WillOnce(FutureSatisfy(&schedRegistered));
+
+    process::Queue<Offer> offers;
+    EXPECT_CALL(sched, resourceOffers(_, _))
+      .WillRepeatedly(EnqueueOffers(&offers));
+
+    driver.start();
+
+    AWAIT_READY(schedRegistered);
+
+    for (size_t i = 0; i < totalExecutorsPerFramework; i++) {
+      // Advance the clock to trigger both agent registration and a
+      // batch allocation.
+      Clock::advance(agentFlags.registration_backoff_factor);
+      Clock::advance(masterFlags.allocation_interval);
+
+      Future<Offer> offer = offers.get();
+      AWAIT_READY(offer);
+
+      TaskInfo task;
+      task.set_name("");
+      task.mutable_task_id()->set_value(stringify(i));
+      task.mutable_slave_id()->MergeFrom(offer->slave_id());
+      task.mutable_resources()->MergeFrom(offer->resources());
+      task.mutable_executor()->MergeFrom(executorInfos[i]);
+
+      EXPECT_CALL(*executors[i], registered(_, _, _, _));
+
+      // Make sure the task passes through its `TASK_FINISHED`
+      // state properly. We force this state change through
+      // the launchTask() callback on our MockExecutor.
+      Future<TaskStatus> statusFinished;
+
+      EXPECT_CALL(*executors[i], launchTask(_, _))
+        .WillOnce(SendStatusUpdateFromTask(TASK_FINISHED));
+
+      EXPECT_CALL(sched, statusUpdate(_, _))
+        .WillOnce(FutureArg<1>(&statusFinished));
+
+      driver.launchTasks(offer->id(), {task});
+
+      AWAIT_READY(statusFinished);
+      EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+      EXPECT_CALL(*executors[i], shutdown(_))
+        .Times(AtMost(1));
+    }
+
+    // Destroy all of the containers to complete the executors.
+    Future<hashset<ContainerID>> containerIds = containerizer.containers();
+    AWAIT_READY(containerIds);
+
+    foreach (const ContainerID& containerId, containerIds.get()) {
+      Future<Nothing> executorLost;
+      EXPECT_CALL(sched, executorLost(_, _, _, _))
+        .WillOnce(FutureSatisfy(&executorLost));
+
+      AWAIT_READY(containerizer.destroy(containerId));
+      AWAIT_READY(executorLost);
+    }
+
+    // Ensure the agent processes the executor terminations.
+    Clock::settle();
+
+    // At this point the agent would have considered the framework
+    // completed since it no longer has active executors.
+
+    Future<Response> response = process::http::get(
+      agent.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+    ASSERT_SOME(parse);
+    JSON::Object state = parse.get();
+
+    Result<JSON::Array> completedFrameworks =
+      state.values["completed_frameworks"].as<JSON::Array>();
+
+    // There should be only 1 framework.
+    ASSERT_EQ(1u, completedFrameworks->values.size());
+
+    JSON::Object completedFramework =
+      completedFrameworks->values[0].as<JSON::Object>();
+
+    Result<JSON::Array> completedExecutorsPerFramework =
+        completedFramework.values["completed_executors"].as<JSON::Array>();
+
+    // The number of completed executors in the completed framework
+    // should match the limit.
+    EXPECT_EQ(maxExecutorsPerFramework,
+              completedExecutorsPerFramework->values.size());
+
+    driver.stop();
+    driver.join();
+  }
 }
 
 } // namespace tests {

@@ -30,6 +30,9 @@
 
 #include <mesos/docker/spec.hpp>
 
+#include "slave/containerizer/mesos/provisioner/constants.hpp"
+#include "slave/containerizer/mesos/provisioner/utils.hpp"
+
 #include "slave/containerizer/mesos/provisioner/docker/metadata_manager.hpp"
 #include "slave/containerizer/mesos/provisioner/docker/paths.hpp"
 #include "slave/containerizer/mesos/provisioner/docker/puller.hpp"
@@ -66,22 +69,29 @@ public:
 
   Future<Nothing> recover();
 
-  Future<ImageInfo> get(const mesos::Image& image);
+  Future<ImageInfo> get(
+      const mesos::Image& image,
+      const string& backend);
 
 private:
   Future<Image> _get(
       const spec::ImageReference& reference,
-      const Option<Image>& image);
+      const Option<Image>& image,
+      const string& backend);
 
-  Future<ImageInfo> __get(const Image& image);
+  Future<ImageInfo> __get(
+      const Image& image,
+      const string& backend);
 
   Future<vector<string>> moveLayers(
       const string& staging,
-      const vector<string>& layerIds);
+      const vector<string>& layerIds,
+      const string& backend);
 
   Future<Nothing> moveLayer(
       const string& staging,
-      const string& layerId);
+      const string& layerId,
+      const string& backend);
 
   const Flags flags;
 
@@ -168,9 +178,11 @@ Future<Nothing> Store::recover()
 }
 
 
-Future<ImageInfo> Store::get(const mesos::Image& image)
+Future<ImageInfo> Store::get(
+    const mesos::Image& image,
+    const string& backend)
 {
-  return dispatch(process.get(), &StoreProcess::get, image);
+  return dispatch(process.get(), &StoreProcess::get, image, backend);
 }
 
 
@@ -180,7 +192,9 @@ Future<Nothing> StoreProcess::recover()
 }
 
 
-Future<ImageInfo> StoreProcess::get(const mesos::Image& image)
+Future<ImageInfo> StoreProcess::get(
+    const mesos::Image& image,
+    const string& backend)
 {
   if (image.type() != mesos::Image::DOCKER) {
     return Failure("Docker provisioner store only supports Docker images");
@@ -195,14 +209,15 @@ Future<ImageInfo> StoreProcess::get(const mesos::Image& image)
   }
 
   return metadataManager->get(reference.get(), image.cached())
-    .then(defer(self(), &Self::_get, reference.get(), lambda::_1))
-    .then(defer(self(), &Self::__get, lambda::_1));
+    .then(defer(self(), &Self::_get, reference.get(), lambda::_1, backend))
+    .then(defer(self(), &Self::__get, lambda::_1, backend));
 }
 
 
 Future<Image> StoreProcess::_get(
     const spec::ImageReference& reference,
-    const Option<Image>& image)
+    const Option<Image>& image,
+    const string& backend)
 {
   // NOTE: Here, we assume that image layers are not removed without
   // first removing the metadata in the metadata manager first.
@@ -211,7 +226,27 @@ Future<Image> StoreProcess::_get(
   // situation where a layer was returned to the provisioner but is
   // later evicted.
   if (image.isSome()) {
-    return image.get();
+    // It is possible that a layer is missed after recovery if the
+    // agent flag `--image_provisioner_backend` is changed from a
+    // specified backend to `None()`. We need to check that each
+    // layer exists for a cached image.
+    bool layerMissed = false;
+
+    foreach (const string& layerId, image.get().layer_ids()) {
+      const string rootfsPath = paths::getImageLayerRootfsPath(
+          flags.docker_store_dir,
+          layerId,
+          backend);
+
+      if (!os::exists(rootfsPath)) {
+        layerMissed = true;
+        break;
+      }
+    }
+
+    if (!layerMissed) {
+      return image.get();
+    }
   }
 
   Try<string> staging =
@@ -228,8 +263,12 @@ Future<Image> StoreProcess::_get(
   if (!pulling.contains(name)) {
     Owned<Promise<Image>> promise(new Promise<Image>());
 
-    Future<Image> future = puller->pull(reference, staging.get())
-      .then(defer(self(), &Self::moveLayers, staging.get(), lambda::_1))
+    Future<Image> future = puller->pull(reference, staging.get(), backend)
+      .then(defer(self(),
+                  &Self::moveLayers,
+                  staging.get(),
+                  lambda::_1,
+                  backend))
       .then(defer(self(), [=](const vector<string>& layerIds) {
         return metadataManager->put(reference, layerIds);
       }))
@@ -253,14 +292,18 @@ Future<Image> StoreProcess::_get(
 }
 
 
-Future<ImageInfo> StoreProcess::__get(const Image& image)
+Future<ImageInfo> StoreProcess::__get(
+    const Image& image,
+    const string& backend)
 {
   CHECK_LT(0, image.layer_ids_size());
 
   vector<string> layerPaths;
   foreach (const string& layerId, image.layer_ids()) {
-    layerPaths.push_back(
-        paths::getImageLayerRootfsPath(flags.docker_store_dir, layerId));
+    layerPaths.push_back(paths::getImageLayerRootfsPath(
+        flags.docker_store_dir,
+        layerId,
+        backend));
   }
 
   // Read the manifest from the last layer because all runtime config
@@ -287,11 +330,12 @@ Future<ImageInfo> StoreProcess::__get(const Image& image)
 
 Future<vector<string>> StoreProcess::moveLayers(
     const string& staging,
-    const vector<string>& layerIds)
+    const vector<string>& layerIds,
+    const string& backend)
 {
   list<Future<Nothing>> futures;
   foreach (const string& layerId, layerIds) {
-    futures.push_back(moveLayer(staging, layerId));
+    futures.push_back(moveLayer(staging, layerId, backend));
   }
 
   return collect(futures)
@@ -301,7 +345,8 @@ Future<vector<string>> StoreProcess::moveLayers(
 
 Future<Nothing> StoreProcess::moveLayer(
     const string& staging,
-    const string& layerId)
+    const string& layerId,
+    const string& backend)
 {
   const string source = path::join(staging, layerId);
 
@@ -313,29 +358,60 @@ Future<Nothing> StoreProcess::moveLayer(
     return Nothing();
   }
 
-  const string target = paths::getImageLayerPath(
+  const string targetRootfs = paths::getImageLayerRootfsPath(
       flags.docker_store_dir,
-      layerId);
+      layerId,
+      backend);
 
   // NOTE: Since the layer id is supposed to be unique. If the layer
   // already exists in the store, we'll skip the moving since they are
   // expected to be the same.
-  if (os::exists(target)) {
+  if (os::exists(targetRootfs)) {
     return Nothing();
   }
 
-  Try<Nothing> mkdir = os::mkdir(target);
-  if (mkdir.isError()) {
-    return Failure(
-        "Failed to create directory in store for layer '" +
-        layerId + "': " + mkdir.error());
-  }
+  const string sourceRootfs = paths::getImageLayerRootfsPath(source, backend);
+  const string target = paths::getImageLayerPath(
+      flags.docker_store_dir,
+      layerId);
 
-  Try<Nothing> rename = os::rename(source, target);
-  if (rename.isError()) {
-    return Failure(
-        "Failed to move layer from '" + source +
-        "' to '" + target + "': " + rename.error());
+#ifdef __linux__
+  // If the backend is "overlay", we need to convert
+  // AUFS whiteout files to OverlayFS whiteout files.
+  if (backend == OVERLAY_BACKEND) {
+    Try<Nothing> convert = convertWhiteouts(sourceRootfs);
+    if (convert.isError()) {
+      return Failure(
+          "Failed to convert the whiteout files under '" +
+          sourceRootfs + "': " + convert.error());
+    }
+  }
+#endif
+
+  if (!os::exists(target)) {
+    // This is the case that we pull the layer for the first time.
+    Try<Nothing> mkdir = os::mkdir(target);
+    if (mkdir.isError()) {
+      return Failure(
+          "Failed to create directory in store for layer '" +
+          layerId + "': " + mkdir.error());
+    }
+
+    Try<Nothing> rename = os::rename(source, target);
+    if (rename.isError()) {
+      return Failure(
+          "Failed to move layer from '" + source +
+          "' to '" + target + "': " + rename.error());
+    }
+  } else {
+    // This is the case where the layer has already been pulled with a
+    // different backend.
+    Try<Nothing> rename = os::rename(sourceRootfs, targetRootfs);
+    if (rename.isError()) {
+      return Failure(
+          "Failed to move rootfs from '" + sourceRootfs +
+          "' to '" + targetRootfs + "': " + rename.error());
+    }
   }
 
   return Nothing();

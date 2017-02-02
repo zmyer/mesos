@@ -14,12 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <algorithm>
+#include "master/validation.hpp"
+
 #include <string>
 #include <vector>
 
 #include <glog/logging.h>
 
+#include <mesos/roles.hpp>
 #include <mesos/type_utils.hpp>
 
 #include <stout/foreach.hpp>
@@ -29,10 +31,13 @@
 #include <stout/none.hpp>
 #include <stout/stringify.hpp>
 
-#include "health-check/health_checker.hpp"
+#include "checks/checker.hpp"
+#include "checks/health_checker.hpp"
+
+#include "common/protobuf_utils.hpp"
+#include "common/validation.hpp"
 
 #include "master/master.hpp"
-#include "master/validation.hpp"
 
 using std::string;
 using std::vector;
@@ -43,15 +48,6 @@ namespace mesos {
 namespace internal {
 namespace master {
 namespace validation {
-
-// A helper function which returns true if the given character is not
-// suitable for an ID.
-static bool invalidCharacter(char c)
-{
-  return iscntrl(c) || c == '/' || c == '\\';
-}
-
-
 namespace master {
 namespace call {
 
@@ -137,6 +133,9 @@ Option<Error> validate(
     case mesos::master::Call::GET_MASTER:
       return None();
 
+    case mesos::master::Call::SUBSCRIBE:
+      return None();
+
     case mesos::master::Call::RESERVE_RESOURCES: {
       if (!call.has_reserve_resources()) {
         return Error("Expecting 'reserve_resources' to be present");
@@ -217,9 +216,6 @@ Option<Error> validate(
         return Error("Expecting 'remove_quota' to be present");
       }
       return None();
-
-    case mesos::master::Call::SUBSCRIBE:
-      return None();
   }
 
   UNREACHABLE();
@@ -227,6 +223,84 @@ Option<Error> validate(
 
 } // namespace call {
 } // namespace master {
+
+
+namespace framework {
+namespace internal {
+
+Option<Error> validateRoles(const FrameworkInfo& frameworkInfo)
+{
+  bool multiRole = protobuf::frameworkHasCapability(
+      frameworkInfo,
+      FrameworkInfo::Capability::MULTI_ROLE);
+
+  // Ensure that the right fields are used.
+  if (multiRole) {
+    if (frameworkInfo.has_role()) {
+      return Error("'FrameworkInfo.role' must not be set when the"
+                   " framework is MULTI_ROLE capable");
+     }
+  } else {
+    if (frameworkInfo.roles_size() > 0) {
+      return Error("'FrameworkInfo.roles' must not be set when the"
+                   " framework is not MULTI_ROLE capable");
+    }
+  }
+
+  // Check for duplicate entries.
+  //
+  // TODO(bmahler): Use a generic duplicate check function.
+  if (multiRole) {
+    const hashset<string> duplicateRoles = [&]() {
+      hashset<string> roles;
+      hashset<string> duplicates;
+
+      foreach (const string& role, frameworkInfo.roles()) {
+        if (roles.contains(role)) {
+          duplicates.insert(role);
+        } else {
+          roles.insert(role);
+        }
+      }
+
+      return duplicates;
+    }();
+
+    if (!duplicateRoles.empty()) {
+      return Error("'FrameworkInfo.roles' contains duplicate items: " +
+                   stringify(duplicateRoles));
+     }
+  }
+
+  // Validate the role(s).
+  if (multiRole) {
+    foreach (const string& role, frameworkInfo.roles()) {
+      Option<Error> error = roles::validate(role);
+      if (error.isSome()) {
+        return Error("'FrameworkInfo.roles' contains invalid role: " +
+                     error->message);
+      }
+    }
+  } else {
+    Option<Error> error = roles::validate(frameworkInfo.role());
+    if (error.isSome()) {
+      return Error("'FrameworkInfo.role' is not a valid role: " +
+                   error->message);
+    }
+  }
+
+  return None();
+}
+
+} // namespace internal {
+
+Option<Error> validate(const mesos::FrameworkInfo& frameworkInfo)
+{
+  return internal::validateRoles(frameworkInfo);
+}
+
+} // namespace framework {
+
 
 namespace scheduler {
 namespace call {
@@ -421,17 +495,16 @@ Option<Error> validateDiskInfo(const RepeatedPtrField<Resource>& resources)
       if (!resource.disk().has_volume()) {
         return Error("Expecting 'volume' to be set for persistent volume");
       }
-      if (resource.disk().volume().mode() == Volume::RO) {
-        return Error("Read-only persistent volume not supported");
-      }
       if (resource.disk().volume().has_host_path()) {
         return Error("Expecting 'host_path' to be unset for persistent volume");
       }
 
-      // Ensure persistence ID does not have invalid characters.
-      string id = resource.disk().persistence().id();
-      if (std::any_of(id.begin(), id.end(), invalidCharacter)) {
-        return Error("Persistence ID '" + id + "' contains invalid characters");
+      // Ensure persistence ID meets common ID requirements.
+      Option<Error> error =
+        common::validation::validateID(resource.disk().persistence().id());
+      if (error.isSome()) {
+        return Error("Invalid persistence ID for persistent volume: " +
+                     error->message);
       }
     } else if (resource.disk().has_volume()) {
       return Error("Non-persistent volume not supported");
@@ -498,6 +571,10 @@ Option<Error> validatePersistentVolume(
       return Error("Resource " + stringify(volume) + " does not have DiskInfo");
     } else if (!volume.disk().has_persistence()) {
       return Error("'persistence' is not set in DiskInfo");
+    } else if (!volume.disk().has_volume()) {
+      return Error("Expecting 'volume' to be set for persistent volume");
+    } else if (volume.disk().volume().mode() == Volume::RO) {
+      return Error("Read-only persistent volume not supported");
     }
   }
 
@@ -535,6 +612,14 @@ Option<Error> validate(const RepeatedPtrField<Resource>& resources)
 
 namespace executor {
 namespace internal {
+
+Option<Error> validateExecutorID(const ExecutorInfo& executor)
+{
+  // Delegate to the common ExecutorID validation. Here we wrap
+  // around it to be consistent with other executor validators.
+  return common::validation::validateExecutorID(executor.executor_id());
+}
+
 
 Option<Error> validateType(const ExecutorInfo& executor)
 {
@@ -659,6 +744,21 @@ Option<Error> validateResources(const ExecutorInfo& executor)
 }
 
 
+// Validates the `CommandInfo` contained within an `ExecutorInfo`.
+Option<Error> validateCommandInfo(const ExecutorInfo& executor)
+{
+  if (executor.has_command()) {
+    Option<Error> error =
+      common::validation::validateCommandInfo(executor.command());
+    if (error.isSome()) {
+      return Error("Executor's `CommandInfo` is invalid: " + error->message);
+    }
+  }
+
+  return None();
+}
+
+
 Option<Error> validate(
     const ExecutorInfo& executor,
     Framework* framework,
@@ -669,11 +769,13 @@ Option<Error> validate(
 
   vector<lambda::function<Option<Error>()>> validators = {
     lambda::bind(internal::validateType, executor),
+    lambda::bind(internal::validateExecutorID, executor),
     lambda::bind(internal::validateFrameworkID, executor, framework),
     lambda::bind(internal::validateShutdownGracePeriod, executor),
     lambda::bind(internal::validateResources, executor),
     lambda::bind(
-        internal::validateCompatibleExecutorInfo, executor, framework, slave)
+        internal::validateCompatibleExecutorInfo, executor, framework, slave),
+    lambda::bind(internal::validateCommandInfo, executor)
   };
 
   foreach (const lambda::function<Option<Error>()>& validator, validators) {
@@ -694,28 +796,30 @@ namespace task {
 
 namespace internal {
 
-// Validates that a task id is valid, i.e., contains only valid
-// characters.
 Option<Error> validateTaskID(const TaskInfo& task)
 {
-  const string& id = task.task_id().value();
-
-  if (std::any_of(id.begin(), id.end(), invalidCharacter)) {
-    return Error("TaskID '" + id + "' contains invalid characters");
-  }
-
-  return None();
+  // Delegate to the common TaskID validation. Here we wrap
+  // around it to be consistent with other task validators.
+  return common::validation::validateTaskID(task.task_id());
 }
 
 
-// Validates that the TaskID does not collide with any existing tasks
-// for the framework.
+// Validates that the TaskID does not collide with the ID of a running
+// or unreachable task for this framework.
 Option<Error> validateUniqueTaskID(const TaskInfo& task, Framework* framework)
 {
   const TaskID& taskId = task.task_id();
 
   if (framework->tasks.contains(taskId)) {
     return Error("Task has duplicate ID: " + taskId.value());
+  }
+
+  // TODO(neilc): `unreachableTasks` is a fixed-size cache and is not
+  // preserved across master failover, so we cannot avoid all possible
+  // task ID collisions (MESOS-6785).
+  if (framework->unreachableTasks.contains(taskId)) {
+    return Error("Task reuses the ID of an unreachable task: " +
+                 taskId.value());
   }
 
   return None();
@@ -748,10 +852,23 @@ Option<Error> validateKillPolicy(const TaskInfo& task)
 }
 
 
+Option<Error> validateCheck(const TaskInfo& task)
+{
+  if (task.has_check()) {
+    Option<Error> error = checks::validation::checkInfo(task.check());
+    if (error.isSome()) {
+      return Error("Task uses invalid check: " + error->message);
+    }
+  }
+
+  return None();
+}
+
+
 Option<Error> validateHealthCheck(const TaskInfo& task)
 {
   if (task.has_health_check()) {
-    Option<Error> error = health::validation::healthCheck(task.health_check());
+    Option<Error> error = checks::validation::healthCheck(task.health_check());
     if (error.isSome()) {
       return Error("Task uses invalid health check: " + error->message);
     }
@@ -818,6 +935,21 @@ Option<Error> validateTaskAndExecutorResources(const TaskInfo& task)
 }
 
 
+// Validates the `CommandInfo` contained within a `TaskInfo`.
+Option<Error> validateCommandInfo(const TaskInfo& task)
+{
+  if (task.has_command()) {
+    Option<Error> error =
+      common::validation::validateCommandInfo(task.command());
+    if (error.isSome()) {
+      return Error("Task's `CommandInfo` is invalid: " + error->message);
+    }
+  }
+
+  return None();
+}
+
+
 // Validates task specific fields except its executor (if it exists).
 Option<Error> validateTask(
     const TaskInfo& task,
@@ -834,11 +966,11 @@ Option<Error> validateTask(
     lambda::bind(internal::validateUniqueTaskID, task, framework),
     lambda::bind(internal::validateSlaveID, task, slave),
     lambda::bind(internal::validateKillPolicy, task),
+    lambda::bind(internal::validateCheck, task),
     lambda::bind(internal::validateHealthCheck, task),
-    lambda::bind(internal::validateResources, task)
+    lambda::bind(internal::validateResources, task),
+    lambda::bind(internal::validateCommandInfo, task)
   };
-
-  // TODO(jieyu): Add a validateCommandInfo function.
 
   foreach (const lambda::function<Option<Error>()>& validator, validators) {
     Option<Error> error = validator();
@@ -1007,8 +1139,8 @@ Option<Error> validateTask(
 
   // Now do `TaskGroup` specific validation.
 
-  if (task.has_executor()) {
-    return Error("'TaskInfo.executor' must not be set");
+  if (!task.has_executor()) {
+    return Error("'TaskInfo.executor' must be set");
   }
 
   if (task.has_container()) {
@@ -1083,6 +1215,17 @@ Option<Error> validateExecutor(
     return Error("Docker ContainerInfo is not supported on the executor");
   }
 
+  // Validate the `ExecutorInfo` in all tasks are same.
+
+  foreach (const TaskInfo& task, taskGroup.tasks()) {
+    if (task.has_executor() && task.executor() != executor) {
+      return Error(
+          "The `ExecutorInfo` of "
+          "task '" + stringify(task.task_id()) + "' is different from "
+          "executor '" + stringify(executor.executor_id()) + "'");
+    }
+  }
+
   const Resources& executorResources = executor.resources();
 
   // Validate minimal cpus and memory resources of executor.
@@ -1132,6 +1275,16 @@ Option<Error> validateExecutor(
     return Error(
         "Total resources " + stringify(total) + " required by task group and"
         " its executor are more than available " + stringify(offered));
+  }
+
+  if (executor.has_command()) {
+    Option<Error> error =
+      common::validation::validateCommandInfo(executor.command());
+    if (error.isSome()) {
+      return Error(
+          "Executor '" + stringify(executor.executor_id()) + "'" +
+          "contains an invalid command: " + error->message);
+    }
   }
 
   return None();
@@ -1231,8 +1384,8 @@ Try<FrameworkID> getFrameworkId(Master* master, const OfferID& offerId)
 
 
 Option<Error> validateOfferIds(
-    Master* master,
-    const RepeatedPtrField<OfferID>& offerIds)
+    const RepeatedPtrField<OfferID>& offerIds,
+    Master* master)
 {
   foreach (const OfferID& offerId, offerIds) {
     Offer* offer = getOffer(master, offerId);
@@ -1246,8 +1399,8 @@ Option<Error> validateOfferIds(
 
 
 Option<Error> validateInverseOfferIds(
-    Master* master,
-    const RepeatedPtrField<OfferID>& offerIds)
+    const RepeatedPtrField<OfferID>& offerIds,
+    Master* master)
 {
   foreach (const OfferID& offerId, offerIds) {
     InverseOffer* inverseOffer = getInverseOffer(master, offerId);
@@ -1355,7 +1508,7 @@ Option<Error> validate(
 
   vector<lambda::function<Option<Error>()>> validators = {
     lambda::bind(validateUniqueOfferID, offerIds),
-    lambda::bind(validateOfferIds, master, offerIds),
+    lambda::bind(validateOfferIds, offerIds, master),
     lambda::bind(validateFramework, offerIds, master, framework),
     lambda::bind(validateSlave, offerIds, master)
   };
@@ -1381,7 +1534,7 @@ Option<Error> validateInverseOffers(
 
   vector<lambda::function<Option<Error>()>> validators = {
     lambda::bind(validateUniqueOfferID, offerIds),
-    lambda::bind(validateInverseOfferIds, master, offerIds),
+    lambda::bind(validateInverseOfferIds, offerIds, master),
     lambda::bind(validateFramework, offerIds, master, framework),
     lambda::bind(validateSlave, offerIds, master)
   };
@@ -1403,8 +1556,15 @@ namespace operation {
 
 Option<Error> validate(
     const Offer::Operation::Reserve& reserve,
-    const Option<string>& principal)
+    const Option<string>& principal,
+    const Option<string>& frameworkRole)
 {
+  if (frameworkRole.isSome() && frameworkRole.get() == "*") {
+    return Error(
+        "A reserve operation was attempted by a framework with role"
+        " '*', but frameworks with that role cannot reserve resources");
+  }
+
   Option<Error> error = resource::validate(reserve.resources());
   if (error.isSome()) {
     return Error("Invalid resources: " + error.get().message);
@@ -1420,17 +1580,24 @@ Option<Error> validate(
       if (!resource.reservation().has_principal()) {
         return Error(
             "A reserve operation was attempted by principal '" +
-            principal.get() + "', but there is a reserved resource in the "
-            "request with no principal set in `ReservationInfo`");
+            principal.get() + "', but there is a reserved resource in the"
+            " request with no principal set in `ReservationInfo`");
       }
 
       if (resource.reservation().principal() != principal.get()) {
         return Error(
             "A reserve operation was attempted by principal '" +
-            principal.get() + "', but there is a reserved resource in the "
-            "request with principal '" + resource.reservation().principal() +
+            principal.get() + "', but there is a reserved resource in the"
+            " request with principal '" + resource.reservation().principal() +
             "' set in `ReservationInfo`");
       }
+    }
+
+    if (frameworkRole.isSome() && resource.role() != frameworkRole.get()) {
+      return Error(
+          "A reserve operation was attempted for a resource with role"
+          " '" + resource.role() + "', but the framework can only reserve"
+          " resources with role '" + frameworkRole.get() + "'");
     }
 
     // NOTE: This check would be covered by 'contains' since there
@@ -1482,7 +1649,8 @@ Option<Error> validate(const Offer::Operation::Unreserve& unreserve)
 Option<Error> validate(
     const Offer::Operation::Create& create,
     const Resources& checkpointedResources,
-    const Option<string>& principal)
+    const Option<string>& principal,
+    const Option<FrameworkInfo>& frameworkInfo)
 {
   Option<Error> error = resource::validate(create.volumes());
   if (error.isSome()) {
@@ -1501,9 +1669,23 @@ Option<Error> validate(
     return error;
   }
 
-  // Ensure that the provided principals match. If `principal` is `None`, then
-  // we allow `volume.disk().persistence().principal()` to take any value.
   foreach (const Resource& volume, create.volumes()) {
+    // If the volume being created is a shared persistent volume, we
+    // allow it only if the framework has opted in for SHARED_RESOURCES.
+    if (frameworkInfo.isSome() &&
+        volume.has_shared() &&
+        !protobuf::frameworkHasCapability(
+            frameworkInfo.get(),
+            FrameworkInfo::Capability::SHARED_RESOURCES)) {
+      return Error(
+          "Create volume operation for '" + stringify(volume) +
+          "' has been attempted by framework '" +
+          stringify(frameworkInfo.get().id()) +
+          "' with no SHARED_RESOURCES capability");
+    }
+
+    // Ensure that the provided principals match. If `principal` is `None`,
+    // we allow `volume.disk().persistence().principal()` to take any value.
     if (principal.isSome()) {
       if (!volume.disk().persistence().has_principal()) {
         return Error(

@@ -33,6 +33,8 @@
 
 #include <memory>
 
+#include <glog/logging.h>
+
 
 #ifdef _UNICODE
 // Much of the core Windows API is available both in `string` and `wstring`
@@ -139,9 +141,7 @@ inline BOOL GetMessage(
 #define O_APPEND _O_APPEND
 #define O_CLOEXEC _O_NOINHERIT
 
-// TODO(hausdorff): (MESOS-3398) Not defined on Windows. This value is
-// temporary.
-#define MAXHOSTNAMELEN 64
+#define MAXHOSTNAMELEN NI_MAXHOST
 
 #define PATH_MAX _MAX_PATH
 
@@ -171,6 +171,8 @@ typedef SSIZE_T ssize_t;
 // the Windows versions of these flags to their POSIX equivalents so we don't
 // have to change any socket code.
 constexpr int SHUT_RD = SD_RECEIVE;
+constexpr int SHUT_WR = SD_SEND;
+constexpr int SHUT_RDWR = SD_BOTH;
 constexpr int MSG_NOSIGNAL = 0; // `SIGPIPE` signal does not exist on Windows.
 
 // The following functions are usually macros on POSIX; we provide them here as
@@ -344,10 +346,10 @@ decltype(_chdir(path))
 }
 
 
-inline auto getcwd(char* path, int maxlen) ->
-decltype(_getcwd(path, maxlen))
+inline char * getcwd(char* path, size_t maxlen)
 {
-  return _getcwd(path, maxlen);
+  CHECK_LE(maxlen, INT_MAX);
+  return _getcwd(path, static_cast<int>(maxlen));
 }
 
 
@@ -396,6 +398,16 @@ inline auto access(const char* fileName, int accessMode) ->
 decltype(_access(fileName, accessMode))
 {
   return _access(fileName, accessMode);
+}
+
+
+// NOTE: Signals do not exist on Windows, so all signals are unknown.
+// If the signal number is unknown, the Posix specification leaves the
+// return value of `strsignal` unspecified.
+inline const char* strsignal(int signum)
+{
+  static const char UNKNOWN_STRSIGNAL[] = "Unknown signal";
+  return UNKNOWN_STRSIGNAL;
 }
 
 

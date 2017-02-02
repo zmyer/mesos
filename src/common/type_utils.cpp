@@ -318,7 +318,9 @@ bool operator==(const DiscoveryInfo& left, const DiscoveryInfo& right)
 
 bool operator==(const ExecutorInfo& left, const ExecutorInfo& right)
 {
-  return left.executor_id() == right.executor_id() &&
+  return left.has_type() == right.has_type() &&
+    (!left.has_type() || left.type() == right.type()) &&
+    left.executor_id() == right.executor_id() &&
     left.data() == right.data() &&
     Resources(left.resources()) == Resources(right.resources()) &&
     left.command() == right.command() &&
@@ -327,6 +329,12 @@ bool operator==(const ExecutorInfo& left, const ExecutorInfo& right)
     left.source() == right.source() &&
     left.container() == right.container() &&
     left.discovery() == right.discovery();
+}
+
+
+bool operator!=(const ExecutorInfo& left, const ExecutorInfo& right)
+{
+  return !(left == right);
 }
 
 
@@ -442,9 +450,35 @@ bool operator!=(const TaskStatus& left, const TaskStatus& right)
 }
 
 
+bool operator==(const CheckStatusInfo& left, const CheckStatusInfo& right)
+{
+  return left.SerializeAsString() == right.SerializeAsString();
+}
+
+
+bool operator!=(const CheckStatusInfo& left, const CheckStatusInfo& right)
+{
+  return !(left == right);
+}
+
+
+ostream& operator<<(std::ostream& stream, const CapabilityInfo& capabilityInfo)
+{
+  return stream << JSON::protobuf(capabilityInfo);
+}
+
+
+ostream& operator<<(ostream& stream, const CommandInfo& commandInfo)
+{
+  return stream << JSON::protobuf(commandInfo);
+}
+
+
 ostream& operator<<(ostream& stream, const ContainerID& containerId)
 {
-  return stream << containerId.value();
+  return containerId.has_parent()
+    ? stream << containerId.parent() << "." << containerId.value()
+    : stream << containerId.value();
 }
 
 
@@ -457,12 +491,6 @@ ostream& operator<<(ostream& stream, const ContainerInfo& containerInfo)
 ostream& operator<<(ostream& stream, const ExecutorID& executorId)
 {
   return stream << executorId.value();
-}
-
-
-ostream& operator<<(std::ostream& stream, const CapabilityInfo& capabilityInfo)
-{
-  return stream << stringify(JSON::protobuf(capabilityInfo));
 }
 
 
@@ -493,6 +521,12 @@ ostream& operator<<(ostream& stream, const OfferID& offerId)
 ostream& operator<<(ostream& stream, const RateLimits& limits)
 {
   return stream << limits.DebugString();
+}
+
+
+ostream& operator<<(ostream& stream, const RLimitInfo& rlimitInfo)
+{
+  return stream << JSON::protobuf(rlimitInfo);
 }
 
 

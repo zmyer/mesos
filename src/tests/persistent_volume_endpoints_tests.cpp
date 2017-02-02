@@ -495,7 +495,7 @@ TEST_F(PersistentVolumeEndpointsTest, InvalidVolume)
 
   // This volume has role "*", which is not allowed.
   Try<Resource> disk = Resources::parse("disk", "64", "*");
-  CHECK_SOME(disk);
+  ASSERT_SOME(disk);
   Resource volume = createPersistentVolume(
       disk.get(),
       "id1",
@@ -519,7 +519,7 @@ TEST_F(PersistentVolumeEndpointsTest, InvalidVolume)
         body);
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response);
-    CHECK_EQ(response->body,
+    ASSERT_EQ(response->body,
              "Invalid reservation: role \"*\" cannot be dynamically reserved");
   }
 
@@ -531,7 +531,7 @@ TEST_F(PersistentVolumeEndpointsTest, InvalidVolume)
         body);
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response);
-    CHECK_EQ(response->body,
+    ASSERT_EQ(response->body,
              "Invalid reservation: role \"*\" cannot be dynamically reserved");
   }
 }
@@ -851,6 +851,9 @@ TEST_F(PersistentVolumeEndpointsTest, GoodCreateAndDestroyACL)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
   ASSERT_SOME(slave);
 
+  // Advance clock to trigger agent registration befor we HTTP POST.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
   process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
 
   Resources volume = createPersistentVolume(
@@ -886,7 +889,7 @@ TEST_F(PersistentVolumeEndpointsTest, GoodCreateAndDestroyACL)
   driver.start();
 
   Clock::settle();
-  Clock::advance(DEFAULT_ALLOCATION_INTERVAL);
+  Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
 
@@ -912,7 +915,7 @@ TEST_F(PersistentVolumeEndpointsTest, GoodCreateAndDestroyACL)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, destroyResponse);
 
   Clock::settle();
-  Clock::advance(DEFAULT_ALLOCATION_INTERVAL);
+  Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(rescindedOfferId);
 
@@ -1055,6 +1058,9 @@ TEST_F(PersistentVolumeEndpointsTest, BadCreateAndDestroyACL)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
   ASSERT_SOME(slave);
 
+  // Advance clock to trigger agent registration befor we HTTP POST.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
   // The failed creation attempt.
   {
     Resources volume = createPersistentVolume(
@@ -1111,7 +1117,7 @@ TEST_F(PersistentVolumeEndpointsTest, BadCreateAndDestroyACL)
   driver.start();
 
   Clock::settle();
-  Clock::advance(DEFAULT_ALLOCATION_INTERVAL);
+  Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
 
@@ -1270,6 +1276,9 @@ TEST_F(PersistentVolumeEndpointsTest, GoodCreateAndDestroyACLBadCredential)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
   ASSERT_SOME(slave);
 
+  // Advance clock to trigger agent registration befor we HTTP POST.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
   Resources volume = createPersistentVolume(
       Megabytes(64),
       "role1",
@@ -1315,7 +1324,7 @@ TEST_F(PersistentVolumeEndpointsTest, GoodCreateAndDestroyACLBadCredential)
   driver.start();
 
   Clock::settle();
-  Clock::advance(DEFAULT_ALLOCATION_INTERVAL);
+  Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
 
@@ -1559,7 +1568,7 @@ TEST_F(PersistentVolumeEndpointsTest, OfferCreateThenEndpointRemove)
       frameworkInfo.role(),
       createReservationInfo(DEFAULT_CREDENTIAL.principal())).get();
 
-  EXPECT_CALL(allocator, addFramework(_, _, _));
+  EXPECT_CALL(allocator, addFramework(_, _, _, _));
 
   EXPECT_CALL(sched, registered(_, _, _));
 
@@ -1857,7 +1866,7 @@ TEST_F(PersistentVolumeEndpointsTest, ReserveAndSlaveRemoval)
   MesosSchedulerDriver driver(
       &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(allocator, addFramework(_, _, _));
+  EXPECT_CALL(allocator, addFramework(_, _, _, _));
 
   EXPECT_CALL(sched, registered(_, _, _));
 

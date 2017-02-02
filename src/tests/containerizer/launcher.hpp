@@ -67,8 +67,8 @@ public:
           const process::Subprocess::IO& err,
           const flags::FlagsBase* flags,
           const Option<std::map<std::string, std::string>>& env,
-          const Option<int>& namespaces,
-          std::vector<process::Subprocess::ParentHook> parentHooks));
+          const Option<int>& enterNamespaces,
+          const Option<int>& cloneNamespaces));
 
   MOCK_METHOD1(
       destroy,

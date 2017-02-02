@@ -43,6 +43,7 @@ using process::Owned;
 using process::PID;
 using process::Shared;
 
+using mesos::slave::ContainerClass;
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::Isolator;
@@ -62,10 +63,25 @@ VolumeImageIsolatorProcess::VolumeImageIsolatorProcess(
 VolumeImageIsolatorProcess::~VolumeImageIsolatorProcess() {}
 
 
+bool VolumeImageIsolatorProcess::supportsNesting()
+{
+  return true;
+}
+
+
 Try<Isolator*> VolumeImageIsolatorProcess::create(
     const Flags& flags,
     const Shared<Provisioner>& provisioner)
 {
+  // Make sure 'filesystem/linux' isolator is used.
+  // NOTE: 'filesystem/linux' isolator will make sure mounts in the
+  // child mount namespace will not be propagated back to the host
+  // mount namespace.
+  if (!strings::contains(flags.isolation, "filesystem/linux")) {
+    return Error("'filesystem/linux' must be enabled"
+                 " to create the volume image isolator");
+  }
+
   process::Owned<MesosIsolatorProcess> process(
       new VolumeImageIsolatorProcess(flags, provisioner));
 
@@ -77,24 +93,27 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::prepare(
     const ContainerID& containerId,
     const ContainerConfig& containerConfig)
 {
-  const ExecutorInfo& executorInfo = containerConfig.executor_info();
-
-  if (!executorInfo.has_container()) {
+  if (!containerConfig.has_container_info()) {
     return None();
   }
 
-  if (executorInfo.container().type() != ContainerInfo::MESOS) {
+  if (containerConfig.container_info().type() != ContainerInfo::MESOS) {
     return Failure("Can only prepare image volumes for a MESOS container");
   }
 
   vector<string> targets;
   list<Future<ProvisionInfo>> futures;
 
-  for (int i = 0; i < executorInfo.container().volumes_size(); i++) {
-    const Volume& volume = executorInfo.container().volumes(i);
+  for (int i = 0; i < containerConfig.container_info().volumes_size(); i++) {
+    const Volume& volume = containerConfig.container_info().volumes(i);
 
     if (!volume.has_image()) {
       continue;
+    }
+
+    if (containerConfig.has_container_class() &&
+        containerConfig.container_class() == ContainerClass::DEBUG) {
+      return Failure("Image volume is not supported for DEBUG containers");
     }
 
     // Determine the target of the mount. The mount target
@@ -176,7 +195,6 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::_prepare(
     const list<Future<ProvisionInfo>>& futures)
 {
   ContainerLaunchInfo launchInfo;
-  launchInfo.set_namespaces(CLONE_NEWNS);
 
   vector<string> messages;
   vector<string> sources;

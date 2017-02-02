@@ -14,22 +14,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "tests/utils.hpp"
+
 #include <gtest/gtest.h>
 
 #include <mesos/http.hpp>
 
+#include <process/address.hpp>
 #include <process/future.hpp>
 #include <process/gtest.hpp>
 #include <process/http.hpp>
 #include <process/pid.hpp>
 #include <process/process.hpp>
+#include <process/socket.hpp>
 
 #include <stout/gtest.hpp>
 
 #include "tests/flags.hpp"
-#include "tests/utils.hpp"
+
+namespace http = process::http;
+namespace inet = process::network::inet;
 
 using std::string;
+
+using process::Future;
+using process::UPID;
 
 namespace mesos {
 namespace internal {
@@ -43,12 +52,14 @@ const bool searchInstallationDirectory = false;
 
 JSON::Object Metrics()
 {
-  process::UPID upid("metrics", process::address());
+  UPID upid("metrics", process::address());
 
-  process::Future<process::http::Response> response =
-      process::http::get(upid, "snapshot");
+  // TODO(neilc): This request might timeout if the current value of a
+  // metric cannot be determined. In tests, a common cause for this is
+  // MESOS-6231 when multiple scheduler drivers are in use.
+  Future<http::Response> response = http::get(upid, "snapshot");
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
 
   Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
@@ -57,12 +68,32 @@ JSON::Object Metrics()
   return parse.get();
 }
 
+
+Try<uint16_t> getFreePort()
+{
+  // Bind to port=0 to obtain a random unused port.
+  Try<inet::Socket> socket = inet::Socket::create();
+
+  if (socket.isError()) {
+    return Error(socket.error());
+  }
+
+  Try<inet::Address> address = socket->bind(inet::Address::ANY_ANY());
+
+  if (address.isError()) {
+    return Error(address.error());
+  }
+
+  return address->port;
+
+  // No explicit cleanup of `socket` as we rely on the implementation
+  // of `Socket` to close the socket on destruction.
+}
+
+
 string getModulePath(const string& name)
 {
-  string path = path::join(
-      tests::flags.build_dir,
-      "src",
-      ".libs");
+  string path = path::join(tests::flags.build_dir, "src", ".libs");
 
   if (!os::exists(path) && searchInstallationDirectory) {
     path = PKGMODULEDIR;
@@ -80,9 +111,7 @@ string getLibMesosPath()
       os::libraries::expandName("mesos-" VERSION));
 
   if (!os::exists(path) && searchInstallationDirectory) {
-    path = path::join(
-        LIBDIR,
-        os::libraries::expandName("mesos-" VERSION));
+    path = path::join(LIBDIR, os::libraries::expandName("mesos-" VERSION));
   }
 
   return path;
@@ -90,9 +119,7 @@ string getLibMesosPath()
 
 string getLauncherDir()
 {
-  string path = path::join(
-      tests::flags.build_dir,
-      "src");
+  string path = path::join(tests::flags.build_dir, "src");
 
   if (!os::exists(path) && searchInstallationDirectory) {
     path = PKGLIBEXECDIR;
@@ -103,15 +130,10 @@ string getLauncherDir()
 
 string getTestHelperPath(const string& name)
 {
-  string path = path::join(
-      tests::flags.build_dir,
-      "src",
-      name);
+  string path = path::join(tests::flags.build_dir, "src", name);
 
   if (!os::exists(path) && searchInstallationDirectory) {
-    path = path::join(
-        TESTLIBEXECDIR,
-        name);
+    path = path::join(TESTLIBEXECDIR, name);
   }
 
   return path;
@@ -119,29 +141,21 @@ string getTestHelperPath(const string& name)
 
 string getTestHelperDir()
 {
-  string path = path::join(
-      tests::flags.build_dir,
-      "src");
+  string path = path::join(tests::flags.build_dir, "src");
 
   if (!os::exists(path) && searchInstallationDirectory) {
-      return TESTLIBEXECDIR;
+    path = TESTLIBEXECDIR;
   }
 
   return path;
 }
 
-string getTestScriptPath(const string& script)
+string getTestScriptPath(const string& name)
 {
-  string path = path::join(
-      flags.source_dir,
-      "src",
-      "tests",
-      script);
+  string path = path::join(flags.source_dir, "src", "tests", name);
 
   if (!os::exists(path) && searchInstallationDirectory) {
-    path = path::join(
-        TESTLIBEXECDIR,
-        script);
+    path = path::join(TESTLIBEXECDIR, name);
   }
 
   return path;
@@ -149,12 +163,10 @@ string getTestScriptPath(const string& script)
 
 string getSbinDir()
 {
-  string path = path::join(
-      tests::flags.build_dir,
-      "src");
+  string path = path::join(tests::flags.build_dir, "src");
 
   if (!os::exists(path) && searchInstallationDirectory) {
-      return SBINDIR;
+    path = SBINDIR;
   }
 
   return path;
@@ -162,15 +174,10 @@ string getSbinDir()
 
 string getWebUIDir()
 {
-  string path = path::join(
-      flags.source_dir,
-      "src",
-      "webui");
+  string path = path::join(flags.source_dir, "src", "webui");
 
   if (!os::exists(path) && searchInstallationDirectory) {
-    path = path::join(
-        PKGDATADIR,
-        "webui");
+    path = path::join(PKGDATADIR, "webui");
   }
 
   return path;

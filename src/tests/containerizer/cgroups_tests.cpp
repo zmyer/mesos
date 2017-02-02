@@ -37,6 +37,7 @@
 #include <process/gtest.hpp>
 #include <process/latch.hpp>
 #include <process/owned.hpp>
+#include <process/reap.hpp>
 
 #include <stout/gtest.hpp>
 #include <stout/hashmap.hpp>
@@ -166,7 +167,7 @@ protected:
       }
 
       Try<vector<string>> cgroups = cgroups::get(hierarchy);
-      CHECK_SOME(cgroups);
+      ASSERT_SOME(cgroups);
 
       foreach (const string& cgroup, cgroups.get()) {
         // Remove any cgroups that start with TEST_CGROUPS_ROOT.
@@ -184,7 +185,7 @@ protected:
       string hierarchy = path::join(baseHierarchy, subsystem);
 
       Try<vector<string>> cgroups = cgroups::get(hierarchy);
-      CHECK_SOME(cgroups);
+      ASSERT_SOME(cgroups);
 
       foreach (const string& cgroup, cgroups.get()) {
         // Remove any cgroups that start with TEST_CGROUPS_ROOT.
@@ -502,10 +503,7 @@ TEST_F(CgroupsAnyHierarchyTest, ROOT_CGROUPS_Write)
   ASSERT_NE(-1, ::kill(pid, SIGKILL));
 
   // Wait for the child process.
-  int status;
-  EXPECT_NE(-1, ::waitpid((pid_t) -1, &status, 0));
-  ASSERT_TRUE(WIFSIGNALED(status));
-  EXPECT_EQ(SIGKILL, WTERMSIG(status));
+  AWAIT_EXPECT_WTERMSIG_EQ(SIGKILL, reap(pid));
 }
 
 
@@ -671,10 +669,7 @@ TEST_F(CgroupsAnyHierarchyWithFreezerTest, ROOT_CGROUPS_Freeze)
   ASSERT_NE(-1, ::kill(pid, SIGKILL));
 
   // Wait for the child process.
-  int status;
-  EXPECT_NE(-1, ::waitpid((pid_t) -1, &status, 0));
-  ASSERT_TRUE(WIFSIGNALED(status));
-  EXPECT_EQ(SIGKILL, WTERMSIG(status));
+  AWAIT_EXPECT_WTERMSIG_EQ(SIGKILL, reap(pid));
 }
 
 
@@ -717,10 +712,7 @@ TEST_F(CgroupsAnyHierarchyWithFreezerTest, ROOT_CGROUPS_Kill)
     Try<Nothing> kill = cgroups::kill(hierarchy, TEST_CGROUPS_ROOT, SIGKILL);
     EXPECT_SOME(kill);
 
-    int status;
-    EXPECT_NE(-1, ::waitpid((pid_t) -1, &status, 0));
-    ASSERT_TRUE(WIFSIGNALED(status));
-    EXPECT_EQ(SIGKILL, WTERMSIG(status));
+    AWAIT_EXPECT_WTERMSIG_EQ(SIGKILL, reap(pid));
   } else {
     // In child process.
 
@@ -848,7 +840,7 @@ TEST_F(CgroupsAnyHierarchyWithFreezerTest, ROOT_CGROUPS_AssignThreads)
   EXPECT_EQ(0u, cgroupThreads->size());
 
   // Assign ourselves to the test cgroup.
-  CHECK_SOME(cgroups::assign(hierarchy, TEST_CGROUPS_ROOT, ::getpid()));
+  ASSERT_SOME(cgroups::assign(hierarchy, TEST_CGROUPS_ROOT, ::getpid()));
 
   // Get our threads (may be more than the numThreads we created if
   // other threads are running).
@@ -871,7 +863,7 @@ TEST_F(CgroupsAnyHierarchyWithFreezerTest, ROOT_CGROUPS_AssignThreads)
   delete latch;
 
   // Move ourselves to the root cgroup.
-  CHECK_SOME(cgroups::assign(hierarchy, "", ::getpid()));
+  ASSERT_SOME(cgroups::assign(hierarchy, "", ::getpid()));
 
   // Destroy the cgroup.
   AWAIT_READY(cgroups::destroy(hierarchy, TEST_CGROUPS_ROOT));
@@ -1042,10 +1034,7 @@ TEST_F(CgroupsAnyHierarchyWithPerfEventTest, ROOT_CGROUPS_PERF_PerfTest)
   ASSERT_NE(-1, ::kill(pid, SIGKILL));
 
   // Wait for the child process.
-  int status;
-  EXPECT_NE(-1, ::waitpid((pid_t) -1, &status, 0));
-  ASSERT_TRUE(WIFSIGNALED(status));
-  EXPECT_EQ(SIGKILL, WTERMSIG(status));
+  AWAIT_EXPECT_WTERMSIG_EQ(SIGKILL, reap(pid));
 
   // Destroy the cgroup.
   Future<Nothing> destroy = cgroups::destroy(hierarchy, TEST_CGROUPS_ROOT);
@@ -1269,12 +1258,12 @@ TEST_F(CgroupsAnyHierarchyWithCpuAcctMemoryTest, ROOT_CGROUPS_CpuAcctsStats)
   const string hierarchy = path::join(baseHierarchy, "cpuacct");
   ASSERT_SOME(cgroups::create(hierarchy, TEST_CGROUPS_ROOT));
 
-  CHECK_SOME(cgroups::assign(hierarchy, TEST_CGROUPS_ROOT, ::getpid()));
+  ASSERT_SOME(cgroups::assign(hierarchy, TEST_CGROUPS_ROOT, ::getpid()));
 
   ASSERT_SOME(cgroups::cpuacct::stat(hierarchy, TEST_CGROUPS_ROOT));
 
   // Move ourselves to the root cgroup.
-  CHECK_SOME(cgroups::assign(hierarchy, "", ::getpid()));
+  ASSERT_SOME(cgroups::assign(hierarchy, "", ::getpid()));
 
   AWAIT_READY(cgroups::destroy(hierarchy, TEST_CGROUPS_ROOT));
 }
@@ -1339,7 +1328,7 @@ TEST_F(CgroupsAnyHierarchyDevicesTest, ROOT_CGROUPS_Devices)
   ASSERT_SOME(cgroups::create(hierarchy, TEST_CGROUPS_ROOT));
 
   // Assign ourselves to the cgroup.
-  CHECK_SOME(cgroups::assign(hierarchy, TEST_CGROUPS_ROOT, ::getpid()));
+  ASSERT_SOME(cgroups::assign(hierarchy, TEST_CGROUPS_ROOT, ::getpid()));
 
   // When a devices cgroup is first created, its whitelist inherits
   // all devices from its parent's whitelist (i.e., "a *:* rwm" by
@@ -1409,7 +1398,7 @@ TEST_F(CgroupsAnyHierarchyDevicesTest, ROOT_CGROUPS_Devices)
   EXPECT_SOME(write);
 
   // Move ourselves to the root cgroup.
-  CHECK_SOME(cgroups::assign(hierarchy, "", ::getpid()));
+  ASSERT_SOME(cgroups::assign(hierarchy, "", ::getpid()));
 }
 
 } // namespace tests {

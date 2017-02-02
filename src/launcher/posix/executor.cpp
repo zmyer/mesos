@@ -22,20 +22,12 @@
 #include <stout/protobuf.hpp>
 #include <stout/strings.hpp>
 
-#include <stout/os/raw/argv.hpp>
+#include <mesos/slave/containerizer.hpp>
 
 #include "launcher/posix/executor.hpp"
 
-#ifdef __linux__
-#include "linux/fs.hpp"
-#endif
-
 #include "slave/containerizer/mesos/constants.hpp"
 #include "slave/containerizer/mesos/launch.hpp"
-
-#ifdef __linux__
-namespace fs = mesos::internal::fs;
-#endif
 
 using process::Subprocess;
 
@@ -48,6 +40,8 @@ using std::vector;
 using mesos::internal::slave::MESOS_CONTAINERIZER;
 using mesos::internal::slave::MesosContainerizerLaunch;
 
+using mesos::slave::ContainerLaunchInfo;
+
 namespace mesos {
 namespace internal {
 
@@ -57,22 +51,21 @@ pid_t launchTaskPosix(
     const Option<string>& user,
     const Option<string>& rootfs,
     const Option<string>& sandboxDirectory,
-    const Option<string>& workingDirectory)
+    const Option<string>& workingDirectory,
+    const Option<CapabilityInfo>& capabilities)
 {
   // Prepare the flags to pass to the launch process.
   MesosContainerizerLaunch::Flags launchFlags;
+
+  ContainerLaunchInfo launchInfo;
+  launchInfo.mutable_command()->CopyFrom(command);
 
   if (rootfs.isSome()) {
     // The command executor is responsible for chrooting into the
     // root filesystem and changing the user before exec-ing the
     // user process.
 #ifdef __linux__
-    Result<string> _user = os::user();
-    if (_user.isError()) {
-      ABORT("Failed to get current user: " + _user.error());
-    } else if (_user.isNone()) {
-      ABORT("Current username is not found");
-    } else if (_user.get() != "root") {
+    if (geteuid() != 0) {
       ABORT("The command executor requires root with rootfs");
     }
 
@@ -83,19 +76,40 @@ pid_t launchTaskPosix(
 #else
     ABORT("Not expecting root volume with non-linux platform");
 #endif // __linux__
-  }
 
-  launchFlags.command = JSON::protobuf(command);
+    launchInfo.set_rootfs(rootfs.get());
 
-  if (rootfs.isSome()) {
     CHECK_SOME(sandboxDirectory);
-    launchFlags.working_directory = workingDirectory.isSome()
-      ? workingDirectory
-      : sandboxDirectory;
+
+    launchInfo.set_working_directory(workingDirectory.isSome()
+      ? workingDirectory.get()
+      : sandboxDirectory.get());
+
+    // TODO(jieyu): If the task has a rootfs, the executor itself will
+    // be running as root. Its sandbox is owned by root as well. In
+    // order for the task to be able to access to its sandbox, we need
+    // to make sure the owner of the sandbox is 'user'. However, this
+    // is still a workaround. The owner of the files downloaded by the
+    // fetcher is still not correct (i.e., root).
+    if (user.isSome()) {
+      // NOTE: We only chown the sandbox directory (non-recursively).
+      Try<Nothing> chown = os::chown(user.get(), os::getcwd(), false);
+      if (chown.isError()) {
+        ABORT("Failed to chown sandbox to user " +
+              user.get() + ": " + chown.error());
+      }
+    }
   }
 
-  launchFlags.rootfs = rootfs;
-  launchFlags.user = user;
+  if (user.isSome()) {
+    launchInfo.set_user(user.get());
+  }
+
+  if (capabilities.isSome()) {
+    launchInfo.mutable_capabilities()->CopyFrom(capabilities.get());
+  }
+
+  launchFlags.launch_info = JSON::protobuf(launchInfo);
 
   string commandString = strings::format(
       "%s %s %s",

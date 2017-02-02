@@ -55,6 +55,30 @@ namespace v1 {
 /////////////////////////////////////////////////
 
 bool operator==(
+    const Resource::AllocationInfo& left,
+    const Resource::AllocationInfo& right)
+{
+  if (left.has_role() != right.has_role()) {
+    return false;
+  }
+
+  if (left.has_role() && left.role() != right.role()) {
+    return false;
+  }
+
+  return true;
+}
+
+
+bool operator!=(
+    const Resource::AllocationInfo& left,
+    const Resource::AllocationInfo& right)
+{
+  return !(left == right);
+}
+
+
+bool operator==(
     const Resource::ReservationInfo& left,
     const Resource::ReservationInfo& right)
 {
@@ -187,6 +211,16 @@ bool operator==(const Resource& left, const Resource& right)
     return false;
   }
 
+  // Check AllocationInfo.
+  if (left.has_allocation_info() != right.has_allocation_info()) {
+    return false;
+  }
+
+  if (left.has_allocation_info() &&
+      left.allocation_info() != right.allocation_info()) {
+    return false;
+  }
+
   // Check ReservationInfo.
   if (left.has_reservation() != right.has_reservation()) {
     return false;
@@ -257,6 +291,16 @@ static bool addable(const Resource& left, const Resource& right)
     return false;
   }
 
+  // Check AllocationInfo.
+  if (left.has_allocation_info() != right.has_allocation_info()) {
+    return false;
+  }
+
+  if (left.has_allocation_info() &&
+      left.allocation_info() != right.allocation_info()) {
+    return false;
+  }
+
   // Check ReservationInfo.
   if (left.has_reservation() != right.has_reservation()) {
     return false;
@@ -322,6 +366,16 @@ static bool subtractable(const Resource& left, const Resource& right)
   if (left.name() != right.name() ||
       left.type() != right.type() ||
       left.role() != right.role()) {
+    return false;
+  }
+
+  // Check AllocationInfo.
+  if (left.has_allocation_info() != right.has_allocation_info()) {
+    return false;
+  }
+
+  if (left.has_allocation_info() &&
+      left.allocation_info() != right.allocation_info()) {
     return false;
   }
 
@@ -432,65 +486,6 @@ static Option<Error> validateCommandLineResources(const Resources& resources)
   return None();
 }
 
-
-/**
- * Converts a JSON Array to a Resources object.
- *
- * Converts a JSON Array to a Resources object. This uses JSON to protobuf
- * conversion, so the Array should contain JSON Objects, each of which follows
- * the format of the Resource protobuf message. If no role is specified, the
- * provided default role will be assigned. `Resources::validate()` is used to
- * validate the input objects, and empty Resource objects will return an error.
- *
- * Example: [{"name":cpus","type":"SCALAR","scalar":{"value":8}}]
- *
- * @param resourcesJSON The input JSON Array.
- * @param defaultRole The default role.
- * @return A `Try` containing a Resources object if conversion was successful,
- *     or an Error otherwise.
- */
-inline Try<Resources> convertJSON(
-    const JSON::Array& resourcesJSON,
-    const string& defaultRole)
-{
-  // Convert the JSON Array into a protobuf message and use
-  // that to construct a new Resources object.
-  Try<RepeatedPtrField<Resource>> resourcesProtobuf =
-      protobuf::parse<RepeatedPtrField<Resource>>(resourcesJSON);
-
-  if (resourcesProtobuf.isError()) {
-    return Error(
-        "Some JSON resources were not formatted properly: "
-        + resourcesProtobuf.error());
-  }
-
-  // TODO(greggomann): Refactor this `RepeatedPtrField<Resource>` to `Resources`
-  // conversion if/when there is a factory function for Resources. Use of the
-  // `Resources(RepeatedPtrField<Resource>)` constructor is avoided here because
-  // it doesn't allow us to catch errors that occur during construction.
-  // Note: the related JIRA ticket is MESOS-3852.
-  Resources result;
-
-  foreach (Resource& resource, resourcesProtobuf.get()) {
-    // Set the default role if none was specified.
-    if (!resource.has_role()) {
-      resource.set_role(defaultRole);
-    }
-
-    // Validate the Resource and make sure it isn't empty.
-    Option<Error> error = Resources::validate(resource);
-    if (error.isSome()) {
-      return error.get();
-    } else if (Resources::isEmpty(resource)) {
-      return Error("Some JSON resources were empty: " + stringify(resource));
-    }
-
-    result.add(resource);
-  }
-
-  return result;
-}
-
 } // namespace internal {
 
 
@@ -586,53 +581,28 @@ Try<Resources> Resources::parse(
     const string& text,
     const string& defaultRole)
 {
+  // Try to parse as a JSON Array. Otherwise, parse as a text string.
+  Try<JSON::Array> json = JSON::parse<JSON::Array>(text);
+
+  Try<vector<Resource>> resources = json.isSome() ?
+    Resources::fromJSON(json.get(), defaultRole) :
+    Resources::fromSimpleString(text, defaultRole);
+
+  if (resources.isError()) {
+    return Error(resources.error());
+  }
+
   Resources result;
 
-  // Try to parse as a JSON Array.
-  Try<JSON::Array> resourcesJSON = JSON::parse<JSON::Array>(text);
-  if (resourcesJSON.isSome()) {
-    Try<Resources> resources =
-      internal::convertJSON(resourcesJSON.get(), defaultRole);
-    if (resources.isError()) {
-      return resources;
+  // Validate individual Resource objects.
+  foreach(const Resource& resource, resources.get()) {
+    // If invalid, propgate error instead of skipping the resource.
+    Option<Error> error = Resources::validate(resource);
+    if (error.isSome()) {
+      return error.get();
     }
 
-    result = resources.get();
-  } else {
-    foreach (const string& token, strings::tokenize(text, ";")) {
-      vector<string> pair = strings::tokenize(token, ":");
-      if (pair.size() != 2) {
-        return Error(
-            "Bad value for resources, missing or extra ':' in " + token);
-      }
-
-      string name;
-      string role;
-      size_t openParen = pair[0].find("(");
-      if (openParen == string::npos) {
-        name = strings::trim(pair[0]);
-        role = defaultRole;
-      } else {
-        size_t closeParen = pair[0].find(")");
-        if (closeParen == string::npos || closeParen < openParen) {
-          return Error(
-              "Bad value for resources, mismatched parentheses in " + token);
-        }
-
-        name = strings::trim(pair[0].substr(0, openParen));
-
-        role = strings::trim(pair[0].substr(
-            openParen + 1,
-            closeParen - openParen - 1));
-      }
-
-      Try<Resource> resource = Resources::parse(name, pair[1], role);
-      if (resource.isError()) {
-        return Error(resource.error());
-      }
-
-      result += resource.get();
-    }
+    result.add(resource);
   }
 
   // TODO(jmlvanre): Move this up into `Containerizer::resources`.
@@ -642,6 +612,83 @@ Try<Resources> Resources::parse(
   }
 
   return result;
+}
+
+
+Try<vector<Resource>> Resources::fromJSON(
+    const JSON::Array& resourcesJSON,
+    const string& defaultRole)
+{
+  // Convert the JSON Array into a protobuf message and use
+  // that to construct a vector of Resource object.
+  Try<RepeatedPtrField<Resource>> resourcesProtobuf =
+    protobuf::parse<RepeatedPtrField<Resource>>(resourcesJSON);
+
+  if (resourcesProtobuf.isError()) {
+    return Error(
+        "Some JSON resources were not formatted properly: " +
+        resourcesProtobuf.error());
+  }
+
+  vector<Resource> result;
+
+  foreach (Resource& resource, resourcesProtobuf.get()) {
+    // Set the default role if none was specified.
+    if (!resource.has_role()) {
+      resource.set_role(defaultRole);
+    }
+
+    // We add the Resource object even if it is empty or invalid.
+    result.push_back(resource);
+  }
+
+  return result;
+}
+
+
+Try<vector<Resource>> Resources::fromSimpleString(
+    const string& text,
+    const string& defaultRole)
+{
+  vector<Resource> resources;
+
+  foreach (const string& token, strings::tokenize(text, ";")) {
+    vector<string> pair = strings::tokenize(token, ":");
+    if (pair.size() != 2) {
+      return Error(
+          "Bad value for resources, missing or extra ':' in " + token);
+    }
+
+    string name;
+    string role;
+    size_t openParen = pair[0].find('(');
+    if (openParen == string::npos) {
+      name = strings::trim(pair[0]);
+      role = defaultRole;
+    } else {
+      size_t closeParen = pair[0].find(')');
+      if (closeParen == string::npos || closeParen < openParen) {
+        return Error(
+            "Bad value for resources, mismatched parentheses in " + token);
+      }
+
+      name = strings::trim(pair[0].substr(0, openParen));
+
+      role = strings::trim(pair[0].substr(
+          openParen + 1,
+          closeParen - openParen - 1));
+    }
+
+    Try<Resource> resource = Resources::parse(name, pair[1], role);
+    if (resource.isError()) {
+      return Error(resource.error());
+    }
+
+    // We add the Resource object even if it is empty or invalid.
+    resources.push_back(resource.get());
+  }
+
+  return resources;
 }
 
 
@@ -1009,6 +1056,24 @@ size_t Resources::count(const Resource& that) const
 }
 
 
+void Resources::allocate(const string& role)
+{
+  foreach (Resource_& resource_, resources) {
+    resource_.resource.mutable_allocation_info()->set_role(role);
+  }
+}
+
+
+void Resources::unallocate()
+{
+  foreach (Resource_& resource_, resources) {
+    if (resource_.resource.has_allocation_info()) {
+      resource_.resource.clear_allocation_info();
+    }
+  }
+}
+
+
 Resources Resources::filter(
     const lambda::function<bool(const Resource&)>& predicate) const
 {
@@ -1080,6 +1145,22 @@ Resources Resources::nonShared() const
 }
 
 
+hashmap<string, Resources> Resources::allocations() const
+{
+  hashmap<string, Resources> result;
+
+  foreach (const Resource_& resource_, resources) {
+    // We require that this is called only when
+    // the resources are allocated.
+    CHECK(resource_.resource.has_allocation_info());
+    CHECK(resource_.resource.allocation_info().has_role());
+    result[resource_.resource.allocation_info().role()].add(resource_);
+  }
+
+  return result;
+}
+
+
 Try<Resources> Resources::flatten(
     const string& role,
     const Option<Resource::ReservationInfo>& reservation) const
@@ -1129,6 +1210,7 @@ Resources Resources::createStrippedScalarQuantity() const
   foreach (const Resource& resource, resources) {
     if (resource.type() == Value::SCALAR) {
       Resource scalar = resource;
+      scalar.clear_allocation_info();
       scalar.clear_reservation();
       scalar.clear_disk();
       scalar.clear_shared();
@@ -1851,6 +1933,10 @@ ostream& operator<<(ostream& stream, const Resource& resource)
   }
 
   stream << ")";
+
+  if (resource.has_allocation_info()) {
+    stream << "(allocated: " << resource.allocation_info().role() << ")";
+  }
 
   if (resource.has_disk()) {
     stream << "[" << resource.disk() << "]";

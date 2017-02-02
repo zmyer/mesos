@@ -55,19 +55,14 @@ public:
   // This is a noop.  The sandbox container logger has nothing to initialize.
   virtual Try<Nothing> initialize();
 
-  // This is a noop.  The agent recovery process already exposes all files
-  // in a recovered executor's sandbox.
-  virtual process::Future<Nothing> recover(
-      const ExecutorInfo& executorInfo,
-      const std::string& sandboxDirectory);
-
   // Tells the subprocess to redirect the executor/task's stdout and stderr
   // to separate "stdout" and "stderr" files in the sandbox.
   // The `path`, `argv`, and `environment` are not changed.
   virtual process::Future<mesos::slave::ContainerLogger::SubprocessInfo>
   prepare(
       const ExecutorInfo& executorInfo,
-      const std::string& sandboxDirectory);
+      const std::string& sandboxDirectory,
+      const Option<std::string>& user);
 
 protected:
   process::Owned<SandboxContainerLoggerProcess> process;

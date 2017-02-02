@@ -33,6 +33,8 @@
 #include <process/protobuf.hpp>
 #include <process/timer.hpp>
 
+#include <process/ssl/flags.hpp>
+
 #include <stout/duration.hpp>
 #include <stout/lambda.hpp>
 #include <stout/nothing.hpp>
@@ -95,7 +97,8 @@ class ShutdownProcess : public process::Process<ShutdownProcess>
 {
 public:
   explicit ShutdownProcess(const Duration& _gracePeriod)
-    : gracePeriod(_gracePeriod) {}
+    : ProcessBase(generate("__shutdown_executor__")),
+      gracePeriod(_gracePeriod) {}
 
 protected:
   virtual void initialize()
@@ -205,8 +208,16 @@ public:
     UPID upid(value.get());
     CHECK(upid) << "Failed to parse MESOS_SLAVE_PID '" << value.get() << "'";
 
+    string scheme = "http";
+
+#ifdef USE_SSL_SOCKET
+    if (process::network::openssl::flags().enabled) {
+      scheme = "https";
+    }
+#endif // USE_SSL_SOCKET
+
     agent = ::URL(
-        "http",
+        scheme,
         upid.address.ip,
         upid.address.port,
         upid.id +
@@ -478,10 +489,7 @@ protected:
       // Backoff and reconnect only if framework checkpointing is enabled.
       backoff();
     } else {
-      Event event;
-      event.set_type(Event::SHUTDOWN);
-
-      receive(event, true);
+      shutdown();
     }
   }
 
@@ -721,11 +729,19 @@ protected:
     }
 
     if (event.type() == Event::SHUTDOWN) {
-      shutdown();
+      _shutdown();
     }
   }
 
   void shutdown()
+  {
+    Event event;
+    event.set_type(Event::SHUTDOWN);
+
+    receive(event, true);
+  }
+
+  void _shutdown()
   {
     if (!local) {
       spawn(new ShutdownProcess(shutdownGracePeriod), true);

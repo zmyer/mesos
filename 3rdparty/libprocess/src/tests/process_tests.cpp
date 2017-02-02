@@ -13,12 +13,16 @@
 #include <errno.h>
 #include <time.h>
 
+#ifndef __WINDOWS__
 #include <arpa/inet.h>
+#endif // __WINDOWS__
 
 #include <gmock/gmock.h>
 
+#ifndef __WINDOWS__
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#endif // __WINDOWS__
 
 #include <atomic>
 #include <sstream>
@@ -58,6 +62,7 @@
 #include <stout/try.hpp>
 
 #include <stout/os/killtree.hpp>
+#include <stout/os/write.hpp>
 
 #include "encoder.hpp"
 
@@ -88,8 +93,8 @@ using process::UPID;
 using process::firewall::DisabledEndpointsFirewallRule;
 using process::firewall::FirewallRule;
 
-using process::network::Address;
-using process::network::Socket;
+using process::network::inet::Address;
+using process::network::inet::Socket;
 
 using std::move;
 using std::string;
@@ -120,7 +125,8 @@ public:
 };
 
 
-TEST(ProcessTest, Spawn)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Spawn)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -154,7 +160,8 @@ public:
 };
 
 
-TEST(ProcessTest, Dispatch)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Dispatch)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -190,7 +197,8 @@ TEST(ProcessTest, Dispatch)
 }
 
 
-TEST(ProcessTest, Defer1)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Defer1)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -288,7 +296,8 @@ private:
 };
 
 
-TEST(ProcessTest, Defer2)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Defer2)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -322,7 +331,8 @@ void set(T* t1, const T& t2)
 }
 
 
-TEST(ProcessTest, Defer3)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Defer3)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -356,7 +366,8 @@ public:
 };
 
 
-TEST(ProcessTest, Handlers)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Handlers)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -381,7 +392,8 @@ TEST(ProcessTest, Handlers)
 
 // Tests DROP_MESSAGE and DROP_DISPATCH and in particular that an
 // event can get dropped before being processed.
-TEST(ProcessTest, Expect)
+// NOTE: GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Expect)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -412,7 +424,8 @@ TEST(ProcessTest, Expect)
 
 
 // Tests the FutureArg<N> action.
-TEST(ProcessTest, Action)
+// NOTE: GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Action)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -459,7 +472,8 @@ public:
 };
 
 
-TEST(ProcessTest, Inheritance)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Inheritance)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -490,7 +504,8 @@ TEST(ProcessTest, Inheritance)
 }
 
 
-TEST(ProcessTest, Thunk)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Thunk)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -535,7 +550,8 @@ public:
 };
 
 
-TEST(ProcessTest, Delegate)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Delegate)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -568,7 +584,8 @@ public:
 };
 
 
-TEST(ProcessTest, Delay)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Delay)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -607,7 +624,8 @@ public:
 };
 
 
-TEST(ProcessTest, Order)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Order)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -662,7 +680,8 @@ public:
 };
 
 
-TEST(ProcessTest, Donate)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Donate)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -813,7 +832,9 @@ public:
 
 // Verifies that linking to a remote process will correctly detect
 // the associated `ExitedEvent`.
-TEST_F(ProcessRemoteLinkTest, RemoteLink)
+// TODO(hausdorff): Test fails on Windows. Fix and enable. Linkee never sends a
+// message because "no such program exists". See MESOS-5941.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLink)
 {
   // Link to the remote subprocess.
   ExitedProcess process(pid);
@@ -866,7 +887,9 @@ private:
 // Verifies that calling `link` with "relink" semantics will have the
 // same behavior as `link` with "normal" semantics, when there is no
 // existing persistent connection.
-TEST_F(ProcessRemoteLinkTest, RemoteRelink)
+// TODO(hausdorff): Test fails on Windows. Fix and enable. Linkee never sends a
+// message because "no such program exists". See MESOS-5941.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteRelink)
 {
   RemoteLinkTestProcess process(pid);
 
@@ -891,7 +914,9 @@ TEST_F(ProcessRemoteLinkTest, RemoteRelink)
 
 // Verifies that linking and relinking a process will retain monitoring
 // on the linkee.
-TEST_F(ProcessRemoteLinkTest, RemoteLinkRelink)
+// TODO(hausdorff): Test fails on Windows. Fix and enable. Linkee never sends a
+// message because "no such program exists". See MESOS-5941.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLinkRelink)
 {
   RemoteLinkTestProcess process(pid);
 
@@ -917,7 +942,9 @@ TEST_F(ProcessRemoteLinkTest, RemoteLinkRelink)
 
 // Verifies that relinking a remote process will not affect the
 // monitoring of the process by other linkers.
-TEST_F(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
+// TODO(hausdorff): Test fails on Windows. Fix and enable. Linkee never sends a
+// message because "no such program exists". See MESOS-5941.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
 {
   ExitedProcess linker(pid);
   RemoteLinkTestProcess relinker(pid);
@@ -951,6 +978,40 @@ TEST_F(ProcessRemoteLinkTest, RemoteDoubleLinkRelink)
 }
 
 
+// Verifies that remote links will trigger an `ExitedEvent` if the link
+// fails during socket creation. The test instigates a socket creation
+// failure by hogging all available file descriptors.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(ProcessRemoteLinkTest, RemoteLinkLeak)
+{
+  RemoteLinkTestProcess relinker(pid);
+  Future<UPID> relinkerExitedPid;
+
+  EXPECT_CALL(relinker, exited(pid))
+    .WillOnce(FutureArg<0>(&relinkerExitedPid));
+
+  spawn(relinker);
+
+  // Open enough sockets to fill up all available FDs.
+  vector<Socket> fdHogs;
+  while (true) {
+    Try<Socket> hog = Socket::create();
+
+    if (hog.isError()) {
+      break;
+    }
+
+    fdHogs.push_back(hog.get());
+  }
+
+  relinker.linkup();
+
+  AWAIT_ASSERT_EQ(pid, relinkerExitedPid);
+
+  terminate(relinker);
+  wait(relinker);
+}
+
+
 namespace process {
 
 // Forward declare the `get_persistent_socket` function since we want
@@ -960,6 +1021,9 @@ Option<int> get_persistent_socket(const UPID& to);
 } // namespace process {
 
 
+// TODO(hausdorff): Test disabled temporarily because `SHUT_WR` does not exist
+// on Windows. See MESOS-5817.
+#ifndef __WINDOWS__
 // Verifies that sending a message over a socket will fail if the
 // link to the target is broken (i.e. closed) outside of the
 // `SocketManager`s knowledge.
@@ -1013,8 +1077,12 @@ TEST_F(ProcessRemoteLinkTest, RemoteUseStaleLink)
   terminate(process);
   wait(process);
 }
+#endif // __WINDOWS__
 
 
+// TODO(hausdorff): Test disabled temporarily because `SHUT_WR` does not exist
+// on Windows. See MESOS-5817.
+#ifndef __WINDOWS__
 // Verifies that, in a situation where an existing remote link has become
 // "stale", "relinking" prior to sending a message will lead to successful
 // message passing. The existing remote link is broken in the same way as
@@ -1075,6 +1143,7 @@ TEST_F(ProcessRemoteLinkTest, RemoteStaleLinkRelink)
   terminate(process);
   wait(process);
 }
+#endif // __WINDOWS__
 
 
 class SettleProcess : public Process<SettleProcess>
@@ -1108,7 +1177,8 @@ public:
 };
 
 
-TEST(ProcessTest, Settle)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Settle)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -1123,7 +1193,8 @@ TEST(ProcessTest, Settle)
 }
 
 
-TEST(ProcessTest, Pid)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Pid)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -1158,7 +1229,8 @@ public:
 };
 
 
-TEST(ProcessTest, Listener)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Listener)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -1188,7 +1260,8 @@ public:
 };
 
 
-TEST(ProcessTest, Executor)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Executor)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -1236,7 +1309,8 @@ public:
 };
 
 
-TEST(ProcessTest, Remote)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Remote)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -1271,7 +1345,8 @@ TEST(ProcessTest, Remote)
 
 
 // Like the 'remote' test but uses http::connect.
-TEST(ProcessTest, Http1)
+// NOTE: GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Http1)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -1323,7 +1398,8 @@ TEST(ProcessTest, Http1)
 
 // Like 'http1' but uses the 'Libprocess-From' header. We can
 // also use http::post here since we expect a 202 response.
-TEST(ProcessTest, Http2)
+// NOTE: GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Http2)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -1336,7 +1412,7 @@ TEST(ProcessTest, Http2)
 
   Socket socket = create.get();
 
-  ASSERT_SOME(socket.bind(Address()));
+  ASSERT_SOME(socket.bind(Address::ANY_ANY()));
 
   // Create a UPID for 'Libprocess-From' based on the IP and port we
   // got assigned.
@@ -1419,12 +1495,6 @@ static int foo4(int a, int b, int c, int d)
 }
 
 
-static void bar(int a)
-{
-  return;
-}
-
-
 static Future<string> itoa1(int* const& i)
 {
   std::ostringstream out;
@@ -1441,7 +1511,8 @@ static string itoa2(int* const& i)
 }
 
 
-TEST(ProcessTest, Async)
+// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Async)
 {
   ASSERT_TRUE(GTEST_IS_THREADSAFE);
 
@@ -1476,7 +1547,10 @@ public:
 };
 
 
-TEST(ProcessTest, Provide)
+// TODO(hausdorff): Enable test when `os::rmdir` is semantically equivalent to
+// the POSIX version. In this case, it behaves poorly when we try to use it to
+// delete a file instead of a directory. See MESOS-5942.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, Provide)
 {
   const Try<string> mkdtemp = os::mkdtemp();
   ASSERT_SOME(mkdtemp);
@@ -1515,6 +1589,8 @@ static int baz(string s) { return 42; }
 static Future<int> bam(string s) { return 42; }
 
 
+// MSVC can't compile the call to std::invoke.
+#ifndef __WINDOWS__
 TEST(ProcessTest, Defers)
 {
   {
@@ -1571,7 +1647,7 @@ TEST(ProcessTest, Defers)
   }
 
 //   {
-//     // CAN NOT DO IN CLANG!
+//     // CANNOT DO IN CLANG!
 //     std::function<void(string)> f =
 //       defer(std::bind(baz, std::placeholders::_1));
 
@@ -1583,7 +1659,7 @@ TEST(ProcessTest, Defers)
 //   }
 
 //   {
-//     // CAN NOT DO WITH GCC OR CLANG!
+//     // CANNOT DO WITH GCC OR CLANG!
 //     std::function<int(int)> f =
 //       defer(std::bind(baz, std::placeholders::_1));
 //   }
@@ -1652,6 +1728,7 @@ TEST(ProcessTest, Defers)
   Future<int> future13 = Future<string>().then(
       defer(functor));
 }
+#endif // __WINDOWS__
 
 
 class PercentEncodedIDProcess : public Process<PercentEncodedIDProcess>
@@ -1756,7 +1833,9 @@ public:
 
 // Sets firewall rules which disable endpoints on a process and then
 // attempts to connect to those endpoints.
-TEST(ProcessTest, FirewallDisablePaths)
+// TODO(hausdorff): Routing logic is broken on Windows. Fix and enable test. In
+// this case, we fail to set up the firewall routes. See MESOS-5904.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, FirewallDisablePaths)
 {
   const string id = "testprocess";
 
@@ -1841,7 +1920,9 @@ TEST(ProcessTest, FirewallDisablePaths)
 
 // Test that firewall rules can be changed by changing the vector.
 // An empty vector should allow all paths.
-TEST(ProcessTest, FirewallUninstall)
+// TODO(hausdorff): Routing logic is broken on Windows. Fix and enable test. In
+// this case, we fail to set up the firewall routes. See MESOS-5904.
+TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, FirewallUninstall)
 {
   const string id = "testprocess";
 

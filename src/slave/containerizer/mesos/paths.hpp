@@ -17,9 +17,19 @@
 #ifndef __MESOS_CONTAINERIZER_PATHS_HPP__
 #define __MESOS_CONTAINERIZER_PATHS_HPP__
 
+#include <sys/types.h>
+
 #include <string>
+#include <vector>
+
+#include <process/address.hpp>
+
+#include <stout/result.hpp>
+#include <stout/try.hpp>
 
 #include <mesos/mesos.hpp>
+
+#include <mesos/slave/containerizer.hpp>
 
 namespace mesos {
 namespace internal {
@@ -29,20 +39,33 @@ namespace paths {
 
 constexpr char PID_FILE[] = "pid";
 constexpr char STATUS_FILE[] = "status";
+constexpr char TERMINATION_FILE[] = "termination";
+constexpr char SOCKET_FILE[] = "socket";
+constexpr char FORCE_DESTROY_ON_RECOVERY_FILE[] = "force_destroy_on_recovery";
+constexpr char IO_SWITCHBOARD_DIRECTORY[] = "io_switchboard";
 constexpr char CONTAINER_DIRECTORY[] = "containers";
 
+
+enum Mode
+{
+  PREFIX,
+  SUFFIX,
+  JOIN,
+};
 
 // Returns a path representation of a ContainerID that can be used for
 // creating cgroups or writing to the filesystem. A ContainerID can
 // represent a nested container (i.e, it has a parent ContainerID) and
 // the path representation includes all of the parents as directories
-// in the path. The `prefix` parameter is prepended to each
-// ContainerID as we build the path. For example, given two
-// containers, one with ID 'a9dd' and one nested within 'a9dd' with ID
-// '4e3a' and a prefix of 'foo' we'd get: 'foo/a9dd/foo/4e3a').
+// in the path. Depending on the 'mode', the result can be the
+// following for a nested container 'xxx.yyy':
+//   1) mode == PREFIX: '<separator>/xxx/<separator>/yyy'
+//   2) mode == SUFFIX: 'xxx/<separator>/yyy/<separator>'
+//   3) mode == JOIN:   'xxx/<separator>/yyy'
 std::string buildPath(
     const ContainerID& containerId,
-    const std::string& prefix = "");
+    const std::string& separator,
+    const Mode& mode);
 
 
 // The containerizer uses the runtime directory (flag 'runtime_dir')
@@ -73,6 +96,79 @@ Result<pid_t> getContainerPid(
 Result<int> getContainerStatus(
     const std::string& runtimeDir,
     const ContainerID& containerId);
+
+
+#ifndef __WINDOWS__
+// The helper method to get the io switchboard directory path.
+std::string getContainerIOSwitchboardPath(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+
+
+// The helper method to get the io switchboard pid file path.
+std::string getContainerIOSwitchboardPidPath(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+
+
+// The helper method to get the io switchboard pid.
+Result<pid_t> getContainerIOSwitchboardPid(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+
+
+// The helper method to get the socket file path.
+std::string getContainerIOSwitchboardSocketPath(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+
+
+// The helper method to read the io switchboard socket file.
+Result<process::network::unix::Address> getContainerIOSwitchboardAddress(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+#endif
+
+
+// The helper method to get the destroy on recovery file path.
+std::string getContainerForceDestroyOnRecoveryPath(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+
+
+// The helper method to check if we should
+// destroy a container on recovery or not.
+bool getContainerForceDestroyOnRecovery(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+
+
+// The helper method to read the container termination state.
+Result<mesos::slave::ContainerTermination> getContainerTermination(
+    const std::string& runtimeDir,
+    const ContainerID& containerId);
+
+
+// The helper method to list all container IDs (including nested
+// containers) from the container runtime directory. The order of
+// returned vector is a result of pre-ordering walk (i.e., parent
+// is inserted before its children).
+Try<std::vector<ContainerID>> getContainerIds(
+    const std::string& runtimeDir);
+
+
+// The helper method to get the sandbox path.
+std::string getSandboxPath(
+    const std::string& rootSandboxPath,
+    const ContainerID& containerId);
+
+
+// The helper method parses a given 'path' and returns the container
+// ID of the container whose sandbox contains 'path'.
+Try<ContainerID> parseSandboxPath(
+    const ContainerID& rootContainerId,
+    const std::string& rootSandboxPath,
+    const std::string& path);
 
 } // namespace paths {
 } // namespace containerizer {

@@ -37,6 +37,7 @@
 #include <stout/duration.hpp>
 #include <stout/foreach.hpp>
 #include <stout/protobuf.hpp>
+#include <stout/recordio.hpp>
 #include <stout/stringify.hpp>
 #include <stout/unreachable.hpp>
 
@@ -72,6 +73,9 @@ ostream& operator<<(ostream& stream, ContentType contentType)
     case ContentType::JSON: {
       return stream << APPLICATION_JSON;
     }
+    case ContentType::RECORDIO: {
+      return stream << APPLICATION_RECORDIO;
+    }
   }
 
   UNREACHABLE();
@@ -103,6 +107,26 @@ string serialize(
       JSON::Object object = JSON::protobuf(message);
       return stringify(object);
     }
+    case ContentType::RECORDIO: {
+      LOG(FATAL) << "Serializing a RecordIO stream is not supported";
+    }
+  }
+
+  UNREACHABLE();
+}
+
+
+bool streamingMediaType(ContentType contentType)
+{
+  switch(contentType) {
+    case ContentType::PROTOBUF:
+    case ContentType::JSON: {
+      return false;
+    }
+
+    case ContentType::RECORDIO: {
+      return true;
+    }
   }
 
   UNREACHABLE();
@@ -117,7 +141,7 @@ string serialize(
 static JSON::Value value(
     const string& name,
     const Value::Type& type,
-    Resources resources)
+    const Resources& resources)
 {
   switch (type) {
     case Value::SCALAR:
@@ -244,6 +268,10 @@ JSON::Object model(const NetworkInfo& info)
 JSON::Object model(const ContainerStatus& status)
 {
   JSON::Object object;
+
+  if (status.has_container_id()) {
+    object.values["container_id"] = JSON::protobuf(status.container_id());
+  }
 
   if (status.network_infos().size() > 0) {
     JSON::Array array;
@@ -509,6 +537,10 @@ void json(JSON::ObjectWriter* writer, const CommandInfo& command)
 
 static void json(JSON::ObjectWriter* writer, const ContainerStatus& status)
 {
+  if (status.has_container_id()) {
+    writer->field("container_id", JSON::Protobuf(status.container_id()));
+  }
+
   if (status.network_infos().size() > 0) {
     writer->field("network_infos", status.network_infos());
   }
@@ -529,6 +561,10 @@ void json(JSON::ObjectWriter* writer, const ExecutorInfo& executorInfo)
 
   if (executorInfo.has_labels()) {
     writer->field("labels", executorInfo.labels());
+  }
+
+  if (executorInfo.has_type()) {
+    writer->field("type", ExecutorInfo::Type_Name(executorInfo.type()));
   }
 }
 

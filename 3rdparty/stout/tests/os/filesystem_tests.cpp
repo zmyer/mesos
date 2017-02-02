@@ -31,6 +31,7 @@
 #include <stout/os/rm.hpp>
 #include <stout/os/touch.hpp>
 #include <stout/os/write.hpp>
+#include <stout/os/xattr.hpp>
 
 #include <stout/tests/utils.hpp>
 
@@ -398,22 +399,22 @@ TEST_F(FsTest, Close)
   DWORD bytes_written;
   BOOL written = WriteFile(
       open_valid_handle,
-      test_message1.c_str(), // Data to write.
-      test_message1.size(),  // Bytes to write.
-      &bytes_written,        // Bytes written.
-      nullptr);              // No overlapped I/O.
-  ASSERT_TRUE(written);
+      test_message1.c_str(),                     // Data to write.
+      static_cast<DWORD>(test_message1.size()),  // Bytes to write.
+      &bytes_written,                            // Bytes written.
+      nullptr);                                  // No overlapped I/O.
+  ASSERT_TRUE(written == TRUE);
   ASSERT_EQ(test_message1.size(), bytes_written);
 
   EXPECT_SOME(os::close(open_valid_handle));
 
   written = WriteFile(
       open_valid_handle,
-      error_message.c_str(), // Data to write.
-      error_message.size(),  // Bytes to write.
-      &bytes_written,        // Bytes written.
-      nullptr);              // No overlapped I/O.
-  ASSERT_FALSE(written);
+      error_message.c_str(),                     // Data to write.
+      static_cast<DWORD>(error_message.size()),  // Bytes to write.
+      &bytes_written,                            // Bytes written.
+      nullptr);                                  // No overlapped I/O.
+  ASSERT_TRUE(written == FALSE);
   ASSERT_EQ(0, bytes_written);
 
   const Result<string> read_valid_handle = os::read(testfile);
@@ -436,3 +437,40 @@ TEST_F(FsTest, Close)
   _CrtSetReportMode(_CRT_ASSERT, previous_report_mode);
 #endif // __WINDOWS__
 }
+
+
+#if defined(__linux__) || defined(__APPLE__)
+TEST_F(FsTest, Xattr)
+{
+  const string file = path::join(os::getcwd(), UUID::random().toString());
+
+  // Create file.
+  ASSERT_SOME(os::touch(file));
+  ASSERT_TRUE(os::exists(file));
+
+  // Set an extended attribute.
+  Try<Nothing> setxattr = os::setxattr(
+      file,
+      "user.mesos.test",
+      "y",
+      0);
+
+  // Only run this test if extended attribute is supported.
+  if (setxattr.isError() && setxattr.error() == os::strerror(ENOTSUP)) {
+    return;
+  }
+
+  ASSERT_SOME(setxattr);
+
+  // Get the extended attribute.
+  Try<string> value = os::getxattr(file, "user.mesos.test");
+  ASSERT_SOME(value);
+  EXPECT_EQ(value.get(), "y");
+
+  // Remove the extended attribute.
+  ASSERT_SOME(os::removexattr(file, "user.mesos.test"));
+
+  // Get the extended attribute again which should not exist.
+  ASSERT_ERROR(os::getxattr(file, "user.mesos.test"));
+}
+#endif // __linux__ || __APPLE__

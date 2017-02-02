@@ -40,11 +40,11 @@ const string MesosContainerizerMount::MAKE_RSLAVE = "make-rslave";
 
 MesosContainerizerMount::Flags::Flags()
 {
-  add(&operation,
+  add(&Flags::operation,
       "operation",
       "The mount operation to apply.");
 
-  add(&path,
+  add(&Flags::path,
       "path",
       "The path to apply mount operation to.");
 }
@@ -52,6 +52,11 @@ MesosContainerizerMount::Flags::Flags()
 
 int MesosContainerizerMount::execute()
 {
+  if (flags.help) {
+    cerr << flags.usage();
+    return EXIT_SUCCESS;
+  }
+
 #ifdef __linux__
   if (flags.operation.isNone()) {
     cerr << "Flag --operation is not specified" << endl;

@@ -37,6 +37,7 @@ nobase_include_HEADERS =		\
   process/latch.hpp			\
   process/limiter.hpp			\
   process/logging.hpp			\
+  process/loop.hpp			\
   process/message.hpp			\
   process/mime.hpp			\
   process/mutex.hpp			\
@@ -70,5 +71,4 @@ nobase_include_HEADERS =		\
   process/timeout.hpp			\
   process/timer.hpp			\
   process/timeseries.hpp		\
-  process/windows/subprocess.hpp	\
-  process/windows/winsock.hpp
+  process/windows/subprocess.hpp

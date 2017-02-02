@@ -69,7 +69,7 @@ inline Try<double> usage(const std::string& path = "/")
         "Error invoking 'GetDiskFreeSpaceEx' on '" + path + "'");
   }
 
-  double used = total_bytes.QuadPart - free_bytes.QuadPart;
+  double used = static_cast<double>(total_bytes.QuadPart - free_bytes.QuadPart);
   return used / total_bytes.QuadPart;
 }
 
@@ -119,8 +119,8 @@ inline Try<std::list<std::string>> list(const std::string& pattern)
   ::FindClose(search_handle);
 
   if (error != ERROR_NO_MORE_FILES) {
-    ::SetLastError(error);
     return WindowsError(
+        error,
         "'fs::list': 'FindNextFile' failed when searching for files with "
         "'pattern '" + pattern + "'");
   }

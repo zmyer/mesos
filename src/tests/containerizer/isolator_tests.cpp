@@ -16,330 +16,116 @@
 
 #include <unistd.h>
 
-#include <functional>
-#include <iostream>
 #include <string>
-#include <vector>
-
-#include <gmock/gmock.h>
-
-#include <mesos/resources.hpp>
-
-#include <mesos/module/isolator.hpp>
-
-#include <mesos/slave/isolator.hpp>
 
 #include <process/future.hpp>
-#include <process/io.hpp>
 #include <process/owned.hpp>
-#include <process/reap.hpp>
 
-#include <stout/abort.hpp>
-#include <stout/duration.hpp>
 #include <stout/gtest.hpp>
-#include <stout/hashset.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
+#include <stout/stringify.hpp>
+#include <stout/strings.hpp>
+#include <stout/uuid.hpp>
+
+#include <mesos/mesos.hpp>
 
 #ifdef __linux__
 #include "linux/ns.hpp"
-#endif // __linux__
+#endif
 
-#include "master/master.hpp"
-
-#include "slave/flags.hpp"
-#include "slave/gc.hpp"
-#include "slave/slave.hpp"
-
-#ifdef __linux__
-#include "slave/containerizer/mesos/isolators/filesystem/shared.hpp"
-#endif // __linux__
-#include "slave/containerizer/mesos/isolators/posix.hpp"
-
-#include "slave/containerizer/mesos/launcher.hpp"
-#ifdef __linux__
 #include "slave/containerizer/fetcher.hpp"
+
 #include "slave/containerizer/mesos/containerizer.hpp"
-#include "slave/containerizer/mesos/launch.hpp"
-#include "slave/containerizer/mesos/linux_launcher.hpp"
-#endif // __linux__
 
-#include "tests/flags.hpp"
 #include "tests/mesos.hpp"
-#include "tests/module.hpp"
-#include "tests/utils.hpp"
 
-using namespace process;
-
-using mesos::internal::master::Master;
-#ifdef __linux__
-using mesos::internal::slave::Fetcher;
-using mesos::internal::slave::LinuxLauncher;
-using mesos::internal::slave::SharedFilesystemIsolatorProcess;
-#endif // __linux__
-using mesos::internal::slave::Launcher;
-using mesos::internal::slave::MesosContainerizer;
-using mesos::internal::slave::PosixLauncher;
-using mesos::internal::slave::Slave;
-
-using mesos::master::detector::MasterDetector;
-
-using mesos::slave::ContainerConfig;
-using mesos::slave::ContainerLaunchInfo;
-using mesos::slave::ContainerTermination;
-using mesos::slave::Isolator;
-
-using std::ostringstream;
-using std::set;
 using std::string;
-using std::vector;
+
+using process::Future;
+using process::Owned;
+
+using mesos::internal::slave::Fetcher;
+using mesos::internal::slave::MesosContainerizer;
+
+using mesos::slave::ContainerTermination;
 
 namespace mesos {
 namespace internal {
 namespace tests {
 
 #ifdef __linux__
-class SharedFilesystemIsolatorTest : public MesosTest {};
-
-
-// Test that a container can create a private view of a system
-// directory (/var/tmp). Check that a file written by a process inside
-// the container doesn't appear on the host filesystem but does appear
-// under the container's work directory.
-// This test is disabled since we're planning to remove the shared
-// filesystem isolator and this test is not working on other distros
-// such as CentOS 7.1
-// TODO(tnachen): Remove this test when shared filesystem isolator
-// is removed.
-TEST_F(SharedFilesystemIsolatorTest, DISABLED_ROOT_RelativeVolume)
+class NamespacesIsolatorTest : public MesosTest
 {
-  slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/shared";
+public:
+  virtual void SetUp()
+  {
+    MesosTest::SetUp();
 
-  Try<Isolator*> _isolator = SharedFilesystemIsolatorProcess::create(flags);
-  ASSERT_SOME(_isolator);
-  Owned<Isolator> isolator(_isolator.get());
-
-  Try<Launcher*> _launcher = LinuxLauncher::create(flags);
-  ASSERT_SOME(_launcher);
-  Owned<Launcher> launcher(_launcher.get());
-
-  // Use /var/tmp so we don't mask the work directory (under /tmp).
-  const string containerPath = "/var/tmp";
-  ASSERT_TRUE(os::stat::isdir(containerPath));
-
-  // Use a host path relative to the container work directory.
-  const string hostPath = strings::remove(containerPath, "/", strings::PREFIX);
-
-  ContainerInfo containerInfo;
-  containerInfo.set_type(ContainerInfo::MESOS);
-  containerInfo.add_volumes()->CopyFrom(
-      CREATE_VOLUME(containerPath, hostPath, Volume::RW));
-
-  ExecutorInfo executorInfo;
-  executorInfo.mutable_container()->CopyFrom(containerInfo);
-
-  ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
-
-  ContainerConfig containerConfig;
-  containerConfig.mutable_executor_info()->CopyFrom(executorInfo);
-  containerConfig.set_directory(flags.work_dir);
-
-  Future<Option<ContainerLaunchInfo>> prepare =
-    isolator->prepare(
-        containerId,
-        containerConfig);
-
-  AWAIT_READY(prepare);
-  ASSERT_SOME(prepare.get());
-  ASSERT_EQ(1, prepare.get().get().pre_exec_commands().size());
-  EXPECT_TRUE(prepare.get().get().has_namespaces());
-
-  // The test will touch a file in container path.
-  const string file = path::join(containerPath, UUID::random().toString());
-  ASSERT_FALSE(os::exists(file));
-
-  // Manually run the isolator's preparation command first, then touch
-  // the file.
-  vector<string> args;
-  args.push_back("sh");
-  args.push_back("-x");
-  args.push_back("-c");
-  args.push_back(
-      prepare.get().get().pre_exec_commands(0).value() + " && touch " + file);
-
-  Try<pid_t> pid = launcher->fork(
-      containerId,
-      "sh",
-      args,
-      Subprocess::FD(STDIN_FILENO),
-      Subprocess::FD(STDOUT_FILENO),
-      Subprocess::FD(STDERR_FILENO),
-      nullptr,
-      None(),
-      prepare.get().get().namespaces());
-  ASSERT_SOME(pid);
-
-  // Set up the reaper to wait on the forked child.
-  Future<Option<int>> status = process::reap(pid.get());
-
-  AWAIT_READY(status);
-  EXPECT_SOME_EQ(0, status.get());
-
-  // Check the correct hierarchy was created under the container work
-  // directory.
-  string dir = "/";
-  foreach (const string& subdir, strings::tokenize(containerPath, "/")) {
-    dir = path::join(dir, subdir);
-
-    struct stat hostStat;
-    EXPECT_EQ(0, ::stat(dir.c_str(), &hostStat));
-
-    struct stat containerStat;
-    EXPECT_EQ(0,
-              ::stat(path::join(flags.work_dir, dir).c_str(), &containerStat));
-
-    EXPECT_EQ(hostStat.st_mode, containerStat.st_mode);
-    EXPECT_EQ(hostStat.st_uid, containerStat.st_uid);
-    EXPECT_EQ(hostStat.st_gid, containerStat.st_gid);
+    directory = os::getcwd(); // We're inside a temporary sandbox.
+    containerId.set_value(UUID::random().toString());
   }
 
-  // Check it did *not* create a file in the host namespace.
-  EXPECT_FALSE(os::exists(file));
+  Try<Owned<MesosContainerizer>> createContainerizer(const string& isolation)
+  {
+    slave::Flags flags = CreateSlaveFlags();
+    flags.isolation = isolation;
 
-  // Check it did create the file under the container's work directory
-  // on the host.
-  EXPECT_TRUE(os::exists(path::join(flags.work_dir, file)));
-}
+    Try<MesosContainerizer*> _containerizer =
+      MesosContainerizer::create(flags, false, &fetcher);
 
+    if (_containerizer.isError()) {
+      return Error(_containerizer.error());
+    }
 
-// This test is disabled since we're planning to remove the shared
-// filesystem isolator and this test is not working on other distros
-// such as CentOS 7.1
-// TODO(tnachen): Remove this test when shared filesystem isolator
-// is removed.
-TEST_F(SharedFilesystemIsolatorTest, DISABLED_ROOT_AbsoluteVolume)
-{
-  slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/shared";
+    return Owned<MesosContainerizer>(_containerizer.get());
+  }
 
-  Try<Isolator*> _isolator = SharedFilesystemIsolatorProcess::create(flags);
-  ASSERT_SOME(_isolator);
-  Owned<Isolator> isolator(_isolator.get());
+  // Read a uint64_t value from the given path.
+  Try<uint64_t> readValue(const string& path)
+  {
+    Try<string> value = os::read(path);
 
-  Try<Launcher*> _launcher = LinuxLauncher::create(flags);
-  ASSERT_SOME(_launcher);
-  Owned<Launcher> launcher(_launcher.get());
+    if (value.isError()) {
+      return Error("Failed to read '" + path + "': " + value.error());
+    }
 
-  // We'll mount the absolute test work directory as /var/tmp in the
-  // container.
-  const string hostPath = flags.work_dir;
-  const string containerPath = "/var/tmp";
+    return numify<uint64_t>(strings::trim(value.get()));
+  }
 
-  ContainerInfo containerInfo;
-  containerInfo.set_type(ContainerInfo::MESOS);
-  containerInfo.add_volumes()->CopyFrom(
-      CREATE_VOLUME(containerPath, hostPath, Volume::RW));
-
-  ExecutorInfo executorInfo;
-  executorInfo.mutable_container()->CopyFrom(containerInfo);
-
-  ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
-
-  ContainerConfig containerConfig;
-  containerConfig.mutable_executor_info()->CopyFrom(executorInfo);
-  containerConfig.set_directory(flags.work_dir);
-
-  Future<Option<ContainerLaunchInfo>> prepare =
-    isolator->prepare(
-        containerId,
-        containerConfig);
-
-  AWAIT_READY(prepare);
-  ASSERT_SOME(prepare.get());
-  ASSERT_EQ(1, prepare.get().get().pre_exec_commands().size());
-  EXPECT_TRUE(prepare.get().get().has_namespaces());
-
-  // Test the volume mounting by touching a file in the container's
-  // /tmp, which should then be in flags.work_dir.
-  const string filename = UUID::random().toString();
-  ASSERT_FALSE(os::exists(path::join(containerPath, filename)));
-
-  vector<string> args;
-  args.push_back("sh");
-  args.push_back("-x");
-  args.push_back("-c");
-  args.push_back(prepare.get().get().pre_exec_commands(0).value() +
-                 " && touch " +
-                 path::join(containerPath, filename));
-
-  Try<pid_t> pid = launcher->fork(
-      containerId,
-      "sh",
-      args,
-      Subprocess::FD(STDIN_FILENO),
-      Subprocess::FD(STDOUT_FILENO),
-      Subprocess::FD(STDERR_FILENO),
-      nullptr,
-      None(),
-      prepare.get().get().namespaces());
-  ASSERT_SOME(pid);
-
-  // Set up the reaper to wait on the forked child.
-  Future<Option<int>> status = process::reap(pid.get());
-
-  AWAIT_READY(status);
-  EXPECT_SOME_EQ(0, status.get());
-
-  // Check the file was created in flags.work_dir.
-  EXPECT_TRUE(os::exists(path::join(hostPath, filename)));
-
-  // Check it didn't get created in the host's view of containerPath.
-  EXPECT_FALSE(os::exists(path::join(containerPath, filename)));
-}
-
-
-class NamespacesPidIsolatorTest : public MesosTest {};
-
-
-TEST_F(NamespacesPidIsolatorTest, ROOT_PidNamespace)
-{
-  slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "filesystem/linux,namespaces/pid";
-
-  string directory = os::getcwd(); // We're inside a temporary sandbox.
-
+  string directory;
   Fetcher fetcher;
-
-  Try<MesosContainerizer*> _containerizer =
-    MesosContainerizer::create(flags, false, &fetcher);
-
-  ASSERT_SOME(_containerizer);
-  Owned<MesosContainerizer> containerizer(_containerizer.get());
-
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+};
+
+
+TEST_F(NamespacesIsolatorTest, ROOT_PidNamespace)
+{
+  Try<Owned<MesosContainerizer>> containerizer =
+    createContainerizer("filesystem/linux,namespaces/pid");
+  ASSERT_SOME(containerizer);
 
   // Write the command's pid namespace inode and init name to files.
   const string command =
     "stat -c %i /proc/self/ns/pid > ns && (cat /proc/1/comm > init)";
 
-  process::Future<bool> launch = containerizer->launch(
+  process::Future<bool> launch = containerizer.get()->launch(
       containerId,
       None(),
-      CREATE_EXECUTOR_INFO("executor", command),
+      createExecutorInfo("executor", command),
       directory,
       None(),
       SlaveID(),
       std::map<string, string>(),
       false);
+
   AWAIT_READY(launch);
   ASSERT_TRUE(launch.get());
 
   // Wait on the container.
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> wait =
+    containerizer.get()->wait(containerId);
+
   AWAIT_READY(wait);
   ASSERT_SOME(wait.get());
 
@@ -364,6 +150,75 @@ TEST_F(NamespacesPidIsolatorTest, ROOT_PidNamespace)
   ASSERT_SOME(init);
 
   EXPECT_TRUE(strings::contains(init.get(), "mesos"));
+}
+
+
+// The IPC namespace has its own copy of the svipc(7) tunables. We verify
+// that we are correctly entering the IPC namespace by verifying that we
+// can set shmmax some different value than that of the host namespace.
+TEST_F(NamespacesIsolatorTest, ROOT_IPCNamespace)
+{
+  Try<Owned<MesosContainerizer>> containerizer =
+    createContainerizer("namespaces/ipc");
+  ASSERT_SOME(containerizer);
+
+  // Value we will set the child namespace shmmax to.
+  uint64_t shmmaxValue = static_cast<uint64_t>(::getpid());
+
+  Try<uint64_t> hostShmmax = readValue("/proc/sys/kernel/shmmax");
+  ASSERT_SOME(hostShmmax);
+
+  // Verify that the host namespace shmmax is different.
+  ASSERT_NE(hostShmmax.get(), shmmaxValue);
+
+  const string command =
+    "stat -c %i /proc/self/ns/ipc > ns;"
+    "echo " + stringify(shmmaxValue) + " > /proc/sys/kernel/shmmax;"
+    "cp /proc/sys/kernel/shmmax shmmax";
+
+  process::Future<bool> launch = containerizer.get()->launch(
+      containerId,
+      None(),
+      createExecutorInfo("executor", command),
+      directory,
+      None(),
+      SlaveID(),
+      std::map<string, string>(),
+      false);
+
+  AWAIT_READY(launch);
+  ASSERT_TRUE(launch.get());
+
+  // Wait on the container.
+  Future<Option<ContainerTermination>> wait =
+    containerizer.get()->wait(containerId);
+
+  AWAIT_READY(wait);
+  ASSERT_SOME(wait.get());
+
+  // Check the executor exited correctly.
+  EXPECT_TRUE(wait->get().has_status());
+  EXPECT_EQ(0, wait->get().status());
+
+  // Check that the command was run in a different IPC namespace.
+  Try<ino_t> testIPCNamespace = ns::getns(::getpid(), "ipc");
+  ASSERT_SOME(testIPCNamespace);
+
+  Try<string> containerIPCNamespace = os::read(path::join(directory, "ns"));
+  ASSERT_SOME(containerIPCNamespace);
+
+  EXPECT_NE(stringify(testIPCNamespace.get()),
+            strings::trim(containerIPCNamespace.get()));
+
+  // Check that we modified the IPC shmmax of the namespace, not the host.
+  Try<uint64_t> childShmmax = readValue("shmmax");
+  ASSERT_SOME(childShmmax);
+
+  // Verify that we didn't modify shmmax in the host namespace.
+  ASSERT_EQ(hostShmmax.get(), readValue("/proc/sys/kernel/shmmax").get());
+
+  EXPECT_NE(hostShmmax.get(), childShmmax.get());
+  EXPECT_EQ(shmmaxValue, childShmmax.get());
 }
 #endif // __linux__
 

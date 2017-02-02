@@ -118,7 +118,7 @@ void DRFSorter::remove(const string& name)
 
 void DRFSorter::activate(const string& name)
 {
-  CHECK(allocations.contains(name));
+  CHECK(contains(name));
 
   set<Client, DRFComparator>::iterator it = find(name);
   if (it == clients.end()) {
@@ -352,7 +352,8 @@ void DRFSorter::remove(const SlaveID& slaveId, const Resources& resources)
 {
   if (!resources.empty()) {
     CHECK(total_.resources.contains(slaveId));
-    CHECK(total_.resources[slaveId].contains(resources));
+    CHECK(total_.resources[slaveId].contains(resources))
+      << total_.resources[slaveId] << " does not contain " << resources;
 
     total_.resources[slaveId] -= resources;
 

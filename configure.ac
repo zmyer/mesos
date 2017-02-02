@@ -18,7 +18,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [1.1.0])
+AC_INIT([mesos], [1.2.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
@@ -148,38 +148,44 @@ AC_CONFIG_FILES([mpi/mpiexec-mesos], [chmod +x mpi/mpiexec-mesos])
 # Optional features.
 ###############################################################################
 
+AC_ARG_ENABLE([hardening],
+              AS_HELP_STRING([--disable-hardening],
+                             [disables security measures such as stack
+                             protection and position independent library code]),
+                             [], [enable_hardening=yes])
+
 AC_ARG_ENABLE([bundled],
               AS_HELP_STRING([--disable-bundled],
                              [build against preinstalled dependencies instead
                               of bundled libraries]),
-              [enable_bundled=no], [enable_bundled=yes])
+              [], [enable_bundled=yes])
 
 AC_ARG_ENABLE([bundled-pip],
               AS_HELP_STRING([--disable-bundled-pip],
                              [excludes building and using the bundled pip
                               package in lieu of an installed version in
                               PYTHONPATH]),
-              [without_bundled_pip=yes], [])
+              [], [enable_bundled_pip=yes])
 
 AC_ARG_ENABLE([bundled-setuptools],
               AS_HELP_STRING([--disable-bundled-setuptools],
                              [excludes building and using the bundled setuptools
                               package in lieu of an installed version in
                               PYTHONPATH]),
-              [without_bundled_setuptools=yes], [])
+              [], [enable_bundled_setuptools=yes])
 
 AC_ARG_ENABLE([bundled-wheel],
               AS_HELP_STRING([--disable-bundled-wheel],
                              [excludes building and using the bundled wheel
                               package in lieu of an installed version in
                               PYTHONPATH]),
-              [without_bundled_wheel=yes], [])
+              [], [enable_bundled_wheel=yes])
 
 AC_ARG_ENABLE([debug],
               AS_HELP_STRING([--enable-debug],
                              [enable debugging. If CFLAGS/CXXFLAGS are set, this
-                              option won't change them default: no]),
-              [enable_debug=yes], [])
+                              option won't change them]),
+              [], [enable_debug=no])
 
 AC_ARG_ENABLE([java],
               AS_HELP_STRING([--disable-java],
@@ -188,25 +194,25 @@ AC_ARG_ENABLE([java],
 
 AC_ARG_ENABLE([libevent],
               AS_HELP_STRING([--enable-libevent],
-                             [use libevent instead of libev default: no]),
-              [enable_libevent=yes], [])
+                             [use libevent instead of libev]),
+              [], [enable_libevent=no])
 
 AC_ARG_ENABLE([install-module-dependencies],
               AS_HELP_STRING([--enable-install-module-dependencies],
                              [Install third-party bundled dependencies required
-                              for module development default: no]),
-              [enable_install_module_dependencies=yes], [])
+                              for module development]),
+              [], [enable_install_module_dependencies=no])
 
 AC_ARG_ENABLE([optimize],
               AS_HELP_STRING([--enable-optimize],
                              [enable optimizations. If CFLAGS/CXXFLAGS are set,
-                              this option won't change them default: no]),
-              [enable_optimize=yes], [])
+                              this option won't change them]),
+              [], [enable_optimize=no])
 
 AC_ARG_ENABLE([perftools],
               AS_HELP_STRING([--enable-perftools],
-                             [enable google perftools]),
-              [gperftools=yes])
+                             [enable Google perftools]),
+              [], [enable_perftools=no])
 
 AC_ARG_ENABLE([python],
               AS_HELP_STRING([--disable-python],
@@ -221,38 +227,39 @@ AC_ARG_ENABLE([python-dependency-install],
                              [when the python packages are installed during
                               make install, no external dependencies are
                               downloaded or installed]),
-              [without_python_deps=yes], [])
+              [], [enable_python_dependency_install=yes])
 
 AC_ARG_ENABLE([ssl],
               AS_HELP_STRING([--enable-ssl],
-                             [use ssl for libprocess communication
-                             default: no]),
-              [enable_ssl=yes], [])
+                             [use ssl for libprocess communication]),
+              [], [enable_ssl=no])
 
 AC_ARG_ENABLE([static-unimplemented],
               AS_HELP_STRING([--enable-static-unimplemented],
                              [generate static assertion errors for unimplemented
-                             functions default: no]),
-              [enable_static_unimplemented=yes], [])
+                             functions]),
+              [], [enable_static_unimplemented=no])
 
 AC_ARG_ENABLE([tests-install],
               AS_HELP_STRING([--enable-tests-install],
-                             [build and install tests and their helper tools
-                              default: no]),
+                             [build and install tests and their helper tools]),
               [], [enable_tests_install=no])
 
 AC_ARG_ENABLE([xfs-disk-isolator],
               AS_HELP_STRING([--enable-xfs-disk-isolator],
-                             [builds the XFS disk isolator
-                             default: no]),
+                             [builds the XFS disk isolator]),
               [], [enable_xfs_disk_isolator=no])
 
 AC_ARG_ENABLE([zlib],
             AS_HELP_STRING([--disable-zlib],
                            [disables zlib compression, which means the webui
                            will be far less responsive; not recommended]),
-            [enable_zlib=no], [enable_zlib=yes])
+            [], [enable_zlib=yes])
 
+AC_ARG_ENABLE([parallel_test_execution],
+              AS_HELP_STRING([--enable-parallel-test-execution],
+                             [execute tests in parallel where possible]),
+            [], [enable_parallel_test_execution=no])
 
 ###############################################################################
 # Optional packages.
@@ -426,6 +433,9 @@ AS_IF([test "x${ac_cv_env_CXXFLAGS_set}" = "x"],
 # Compiler checks.
 ###############################################################################
 
+# Check to see if we should harden or not.
+AM_CONDITIONAL([ENABLE_HARDENING], [test x"$enable_hardening" = "xyes"])
+
 AS_CASE($ax_cv_cxx_compiler_vendor,
   [clang], [
     # Check if -Wno-unused-local-typedef is needed by checking a sample
@@ -478,6 +488,12 @@ AS_CASE($ax_cv_cxx_compiler_vendor,
     AC_MSG_WARN([$ax_cv_cxx_compiler_vendor is an unsupported compiler])
   ]
 )
+
+# If our compiler supports strong stack protection, use it.
+# If not, use a lesser form of stack protection.
+AX_CHECK_COMPILE_FLAG([-fstack-protector-strong],
+  [AC_SUBST(STACK_PROTECTOR, "-fstack-protector-strong")],
+  [AC_SUBST(STACK_PROTECTOR, "-fstack-protector")])
 
 # Ensure that CXX supports C++11 (with "strict" conformance), and set
 # "--std=" flag and CXXFLAGS environment variable as appropriate.
@@ -539,12 +555,16 @@ case "$host_os" in
     # FreeBSD needs GTEST_HAS_PTHREAD for this version of gmock/gtest and
     # _WITH_GETLINE for getline().
     CXXFLAGS="$CXXFLAGS -DGTEST_HAS_PTHREAD -D_WITH_GETLINE"
+
+    # Add no-sentinal so that stout builds with system clang on 11.0 and later
+    # (3.8+).
+    CXXFLAGS="$CXXFLAGS -Wno-sentinel"
     ;;
 esac
 
 
 ###############################################################################
-# Miscellaneous flags/library/tool checks
+# Miscellaneous flags/library/tool checks.
 ###############################################################################
 
 AC_ARG_VAR([JAVA_HOME], [location of Java Development Kit (JDK)])
@@ -558,6 +578,8 @@ AC_ARG_VAR([MAVEN_HOME], [looks for mvn at MAVEN_HOME/bin/mvn])
 AC_ARG_VAR([PROTOBUF_JAR], [full path to protobuf jar on prefixed builds])
 
 AC_ARG_VAR([PYTHON], [which Python interpreter to use])
+
+AC_ARG_VAR([TEST_DRIVER], [executable and arguments of a test driver])
 
 # Check for pthreads (uses m4/ax_pthread.m4).
 AX_PTHREAD([], [AC_MSG_ERROR([failed to find pthreads])])
@@ -593,7 +615,7 @@ AM_CONDITIONAL([OS_LINUX], [test "x$OS_NAME" = "xlinux"])
 AM_CONDITIONAL([OS_FREEBSD], [test "x$OS_NAME" = "xfreebsd"])
 
 AM_CONDITIONAL([GIT_REPO], [test -d ${srcdir}"/.git"])
-AM_CONDITIONAL([HAS_GPERFTOOLS], [test "x$gperftools" = "xyes"])
+AM_CONDITIONAL([HAS_GPERFTOOLS], [test "x$enable_perftools" = "xyes"])
 
 AM_CONDITIONAL([INSTALL_MODULE_DEPENDENCIES],
                [test x"$enable_install_module_dependencies" = "xyes"])
@@ -604,6 +626,17 @@ AS_IF([test "x$enable_install_module_dependencies" = "xyes"],
 AM_CONDITIONAL([INSTALL_TESTS], [test x"$enable_tests_install" = "xyes"])
 AS_IF([test x"$enable_tests_install" = "xyes"],
       [AC_DEFINE([MESOS_INSTALL_TESTS], [1])])
+
+# If we use our own test runner to parallelize gtests we can run
+# everything but ROOT tests in parallel.
+# We here set up `TEST_DRIVER` to contain an unexpanded automake
+# variable name; this allows us to reuse the test runner to run bundled
+# 3rdparty checks. The special quoting ensures that this containing a
+# space is not expanded by autoconf.
+# TODO(bbannier): Make this more readible by using autoconf/m4 magic.
+AS_IF([test "x$enable_parallel_test_execution" = "xyes"],
+      [AC_SUBST([TEST_DRIVER],
+       '${abs_top_srcdir}/support/mesos-gtest-runner.py'[' --sequential='*ROOT_*'']]))
 
 # Check for libunwind, and link it in if present.
 if test "x$OS_NAME" = "xfreebsd"; then
@@ -661,6 +694,15 @@ on this system (e.g., musl), a separate FTS package must be installed.
 # (--with-XXX=DIR) or asked us to attempt to detect them
 # (--disable-bundled).
 
+
+# On OS X, if `--with-apr` was not provided, we try to use an available
+# brew installed version.
+if test -z "`echo $with_apr`" &&
+   test "$OS_NAME" = "darwin" &&
+   test -n "`command -v brew`" &&
+   test -n "`brew list --versions apr`"; then
+  with_apr=`brew --prefix apr`/libexec
+fi
 
 # Check if libapr-1 prefix path was provided, and if so, add it to
 # the CPPFLAGS and LDFLAGS with respective /include/apr-1 and /lib path
@@ -949,7 +991,7 @@ if test "x$enable_java" = "xyes"; then
     AC_PATH_PROG([JAVA], [java], [$JAVA])
 
     if test "x$JAVA" = "x" || test "x$JAVAC" = "x"; then
-      AC_MSG_ERROR([can not guess JAVA_HOME (no 'java' or 'javac' found)])
+      AC_MSG_ERROR([cannot guess JAVA_HOME (no 'java' or 'javac' found)])
     fi
 
     AC_MSG_CHECKING([value of Java system property 'java.home'])
@@ -1009,7 +1051,7 @@ __EOF__
       dir="$JAVA_HOME/jre/lib/$arch/server"
       if test -e "$dir"; then
 	# Note that these are libtool specific flags.
-	JAVA_TEST_LDFLAGS="-L$dir -R$dir -Wl,-ljvm"
+	JAVA_TEST_LDFLAGS="-L$dir -R$dir -pthread -Wl,-ljvm"
 	JAVA_JVM_LIBRARY=$dir/libjvm.so
 	break;
       fi
@@ -1082,7 +1124,7 @@ __EOF__
     AC_PATH_PROG([MVN], [mvn], [$MVN])
 
     if test "x$MVN" = "x"; then
-      AC_MSG_ERROR([can not find mvn on your path
+      AC_MSG_ERROR([cannot find mvn on your path
 -------------------------------------------------------------------
 You may want verify that Maven has been correctly installed and
 added to your PATH or set the MAVEN_HOME environment variable
@@ -1094,7 +1136,7 @@ to point to your Maven installation.
     AC_PATH_PROGS([MVN], [mvn], [$MVN], [$MAVEN_HOME/bin])
 
     if test "x$MVN" = "x"; then
-      AC_MSG_ERROR([can not find mvn inside $MAVEN_HOME/bin
+      AC_MSG_ERROR([cannot find mvn inside $MAVEN_HOME/bin
 -------------------------------------------------------------------
 You may want verify the MAVEN_HOME validity or check that Maven
 has been correctly installed.
@@ -1469,323 +1511,6 @@ if test -z "`echo $with_libevent`" &&
   with_libevent=`brew --prefix libevent`
 fi
 
-# Perform necessary configuration for building with Python.
-if test "x$enable_python" = "xyes"; then
-  # If the user specified PYTHON_VERSION then assume that is the
-  # Python that they want and construct PYTHON using the canonical
-  # name (failing if PYTHON is also set since we can't easily check
-  # that PYTHON and PYTHON_VERSION are compatible). This bit of
-  # tomfoolery is mostly to match the semantics of AC_PYTHON_DEVEL
-  # (used below). If we don't do this then it's possible that a user
-  # will specify PYTHON_VERSION which will get ignored (and likely
-  # replaced) via AM_PATH_PYTHON.
-  # TODO(benh): Consolidate AM_PATH_PYTHON and AC_PYTHON_DEVEL into a
-  # single macro that both iterates through potential 'python' options
-  # looking for an acceptable version (i.e., AM_PATH_PYTHON) and
-  # checks for Python.h (i.e., AC_PYTHON_DEVEL).
-  if test -n "$PYTHON_VERSION"; then
-    if test -n "$PYTHON"; then
-      AC_MSG_ERROR([only specify one of PYTHON or PYTHON_VERSION])
-    fi
-    PYTHON=python$PYTHON_VERSION
-  fi
-
-  # Check if PYTHON is at least 2.6 or try and find one that is if
-  # PYTHON is not set (necessary to run our examples).
-  AM_PATH_PYTHON([2.6],,
-                 [AC_MSG_ERROR([mesos requires Python >= 2.6
--------------------------------------------------------------------
-If you already have Python 2.6 installed (and it's on the path),
-you might want to check if you have the PYTHON environment variable
-set to an older version of Python.
--------------------------------------------------------------------
-  ])])
-
-  # Next we ensure we have the Python development libraries.
-  AX_PYTHON_DEVEL([>= '2.6'])
-
-  # Ensure that we can build a native Python egg linking against a
-  # static library that imports from the standard C++ library.
-  # This was added due to MESOS-799.
-  AC_MSG_CHECKING([whether we can build usable Python eggs])
-
-  # Render code that imports from the standard C++ library.
-  cat <<__EOF__ >testlib.cpp [
-#include <string>
-std::string test()
-{
-  return std::string("42");
-}]
-__EOF__
-
-  # Build a static library from the above code.
-  $CXX -x c++ -fPIC -c testlib.cpp $CPPFLAGS $CFLAGS $CXXFLAGS \
-    $LDFLAGS -o testlib.o
-  ar rcs libtest.a testlib.o
-
-  # Render a native Python module that imports from that library.
-  cat <<__EOF__ >testpyegg.cpp [
-#include <Python.h>
-#include <string>
-
-std::string test();
-PyMODINIT_FUNC initminimal();
-
-static PyObject *minimal_test(PyObject *self, PyObject* args)
-{
-  return PyString_FromString(test().c_str());
-}
-
-static PyMethodDef minimal_methods[] = {
-  { "test", minimal_test, METH_NOARGS, "Test." },
-  { NULL, NULL }
-};
-
-PyMODINIT_FUNC initminimal()
-{
-  PyImport_AddModule("minimal");
-  Py_InitModule("minimal", minimal_methods);
-}]
-__EOF__
-
-  # Render a distutils setup for building the Python egg.
-  cat <<__EOF__ >setup.py [
-from distutils.core import setup, Extension;
-setup(name = 'MinimalTest',
-      version = '1.0',
-      description = 'foo',
-      ext_modules = [ Extension('minimal',
-                                 extra_objects = ['libtest.a'],
-                                 sources = ['testpyegg.cpp'] ) ] )
-]
-__EOF__
-
-  # Build that Python egg that links against that library. The build
-  # settings are propagated to distutils.
-  # NOTE: We need to embed our CXXFLAGS in CFLAGS because distutils
-  # doesn't pull out CXXFLAGS automagically.
-  CXX="$CXX" CC="$CC" CFLAGS="$CFLAGS $CXXFLAGS" \
-    LDFLAGS="$LDFLAGS" $PYTHON setup.py build_ext --inplace \
-    --build-temp ./ 2>&1 >/dev/null
-
-  # Run a test-script that makes use of the Python egg.
-  pyeggtest=`$PYTHON -c "import minimal; print(minimal.test())" 2>&1`
-
-  # Validate the test-script output.
-  AS_IF([test "x$pyeggtest" = "x42"], [pyeggbuild=yes])
-
-  # Clean up all leftovers from this test.
-  rm -f testlib.cpp testlib.o libtest.a
-  rm -f testpyegg.cpp testpyegg.o setup.py minimal.so
-
-  AS_IF([test "x$pyeggbuild" = "xyes"],
-        [AC_MSG_RESULT([yes])],
-        [AS_IF([test "x$OS_NAME" = "xdarwin"],
-               [AC_MSG_ERROR([no
--------------------------------------------------------------------
-It appears we were unable to build a usable native Python egg. You
-might be using the default Mac OS X Python distribution which is
-incompatible for building native eggs using this compiler setup.
-For more details, see:
-    https://issues.apache.org/jira/browse/MESOS-799
-
-There are two possible workarounds for this issue:
-    1. Disable python bindings by configuring with --disable-python.
-    2. Use an alternative Python installation that was built using
-       the same build setup as Mesos.
--------------------------------------------------------------------])],
-               [AC_MSG_ERROR([no
--------------------------------------------------------------------
-It appears we were unable to build a usable native Python egg.
-
-There are two possible workarounds for this issue:
-    1. Disable python bindings by configuring with --disable-python.
-    2. Use an alternative Python installation that was built using
-       the same build setup as Mesos.
--------------------------------------------------------------------])])
-        ])
-
-  AC_MSG_CHECKING([for an old installation of the Mesos egg (before 0.20.0)])
-
-  $PYTHON -c "import mesos; mesos._mesos" &> /dev/null
-
-  if test $? = 0; then
-    pymodulelocation=`python -c \
-      "import mesos; import os; print os.path.dirname(mesos.__path__[[0]])" \
-      2> /dev/null`
-  fi
-
-  AS_IF([test -z "$pymodulelocation"],
-        [AC_MSG_RESULT([no])],
-        [AC_MSG_ERROR([yes
--------------------------------------------------------------------
-It appears that you currently have a native Python egg installed
-from a version before 0.20.0. This conflicts with the egg in this
-version.
-
-There are two possible workarounds for this issue:
-    1. Disable Python bindings by configuring with --disable-python.
-    2. Uninstall the legacy egg from your Python installation. This
-       might require you doing:
-         rm -rf $pymodulelocation
--------------------------------------------------------------------])])
-
-  # Determine how the generated Python egg's will get named, used in
-  # the Makefile to keep the targets from being rerun.
-  PYTHON_EGG_POSTFIX=`$PYTHON -c \
-    'import sys; \
-     from distutils.util import get_platform; \
-     print "-py" + sys.version[[0:3]] + "-" + get_platform()'`
-
-  PYTHON_EGG_PUREPY_POSTFIX=`$PYTHON -c \
-    'import sys; \
-     from distutils.util import get_platform; \
-     print "-py" + sys.version[[0:3]]'`
-
-  PYTHON_WHL_POSTFIX=`$PYTHON -c \
-    'import sys; \
-     from distutils.util import get_platform; \
-     print "-cp" + sys.version[[0:3]].replace(".", "") + "-none-" \
-       + get_platform().replace(".", "_").replace("-", "_")'`
-
-  PYTHON_WHL_PUREPY_POSTFIX=`$PYTHON -c \
-    'import sys; \
-     print "-py" + sys.version[[0]] + "-none-any"'`
-
-  AC_CONFIG_FILES([src/examples/python/test-executor],
-                  [chmod +x src/examples/python/test-executor])
-  AC_CONFIG_FILES([src/examples/python/test-framework],
-                  [chmod +x src/examples/python/test-framework])
-  AC_CONFIG_FILES([src/python/setup.py])
-  AC_CONFIG_FILES([src/python/cli/setup.py])
-  AC_CONFIG_FILES([src/python/interface/setup.py])
-  AC_CONFIG_FILES([src/python/native_common/ext_modules.py])
-  AC_CONFIG_FILES([src/python/executor/setup.py])
-  AC_CONFIG_FILES([src/python/native/setup.py])
-  AC_CONFIG_FILES([src/python/scheduler/setup.py])
-
-  AC_CONFIG_LINKS([src/python/executor/ext_modules.py:src/python/native_common/ext_modules.py])
-  AC_CONFIG_LINKS([src/python/scheduler/ext_modules.py:src/python/native_common/ext_modules.py])
-
-  # When clang is being used, make sure that the distutils python-
-  # config cflags extraction does not cause build errors (MESOS-1079).
-  # TODO(tillt): Remove this once Apple distributed an updated Python.
-  PYTHON_CPPFLAGS="$CPPFLAGS"
-  PYTHON_CFLAGS="$CFLAGS $CXXFLAGS" # distutils requires we embed CXXFLAGS.
-  PYTHON_LDFLAGS="$LDFLAGS $GFLAGS_LIBS"
-
-  AS_IF([test "x$ax_cv_cxx_compiler_vendor" = "xclang"],
-	[PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -Qunused-arguments"
-         PYTHON_CFLAGS="$PYTHON_CFLAGS -Qunused-arguments"])
-
-  AC_SUBST([PYTHON_CPPFLAGS])
-  AC_SUBST([PYTHON_CFLAGS])
-  AC_SUBST([PYTHON_EGG_POSTFIX])
-  AC_SUBST([PYTHON_EGG_PUREPY_POSTFIX])
-  AC_SUBST([PYTHON_WHL_POSTFIX])
-  AC_SUBST([PYTHON_WHL_PUREPY_POSTFIX])
-  AC_SUBST([PYTHON]) # Used by the example shell scripts and src/Makefile.am.
-
-  AC_DEFINE([MESOS_HAS_PYTHON])
-
-  # Check if user has asked us to use a preinstalled setuptools, or if
-  # they asked us to ignore all bundled libraries while compiling and linking.
-  if test "x$without_bundled_setuptools" = "xyes" || \
-     test "x$enable_bundled" != "xyes"; then
-
-    AC_PYTHON_MODULE([distutils], [no])
-    if test "x$HAVE_PYMOD_distutils" = "xno"; then
-      AC_PYTHON_MODULE([setuptools], [no])
-
-      if test "x$HAVE_PYMOD_setuptools" = "xyes"; then
-        found_setuptools=yes
-      fi
-
-    else
-      found_setuptools=yes
-    fi
-
-    if test "x$found_setuptools" = "xyes"; then
-      with_bundled_setuptools=no
-    else
-      AC_MSG_ERROR([cannot find setuptools
--------------------------------------------------------------------
-You have requested the use of a non-bundled setuptools but no suitable
-setuptools could be found.
-
-You may want specify the location of setuptools by providing a prefix
-path via --with-setuptools=DIR, or check that the path you provided is
-correct if you're already doing this.
--------------------------------------------------------------------
-])
-    fi
-  else
-    with_bundled_setuptools=yes
-  fi
-
-  # Check if user has asked us to use a preinstalled pip, or if
-  # they asked us to ignore all bundled libraries while compiling and linking.
-  if test "x$without_bundled_pip" = "xyes" || \
-     test "x$enable_bundled" != "xyes"; then
-
-    AC_PYTHON_MODULE([pip], [no])
-    if test "x$HAVE_PYMOD_pip" = "xno"; then
-      AC_MSG_ERROR([cannot find pip
--------------------------------------------------------------------
-You have requested the use of a non-bundled pip but no suitable
-pip could be found.
-
-You may want specify the location of pip by providing a prefix
-path via --with-pip=DIR, or check that the path you provided is
-correct if you're already doing this.
--------------------------------------------------------------------
-])
-    else
-      with_bundled_pip=no
-    fi
-  else
-    with_bundled_pip=yes
-  fi
-
-  # Check if user has asked us to use a preinstalled wheel, or if
-  # they asked us to ignore all bundled libraries while compiling and linking.
-  if test "x$without_bundled_wheel" = "xyes" || \
-     test "x$enable_bundled" != "xyes"; then
-
-    AC_PYTHON_MODULE([wheel], [no])
-    if test "x$HAVE_PYMOD_wheel" = "xno"; then
-      AC_MSG_ERROR([cannot find wheel
--------------------------------------------------------------------
-You have requested the use of a non-bundled wheel but no suitable
-wheel could be found.
-
-You may want specify the location of wheel by providing a prefix
-path via --with-wheel=DIR, or check that the path you provided is
-correct if you're already doing this.
--------------------------------------------------------------------
-])
-    else
-      with_bundled_wheel=no
-    fi
-  else
-    with_bundled_wheel=yes
-  fi
-
-  has_python=yes
-fi
-
-AM_CONDITIONAL([HAS_PYTHON], [test "x$has_python" = "xyes"])
-
-AM_CONDITIONAL([WITH_BUNDLED_SETUPTOOLS],
-    [test "x$with_bundled_setuptools" = "xyes"])
-AM_CONDITIONAL([WITH_BUNDLED_PIP],
-    [test "x$with_bundled_pip" = "xyes"])
-AM_CONDITIONAL([WITH_BUNDLED_WHEEL],
-    [test "x$with_bundled_wheel" = "xyes"])
-
-AM_CONDITIONAL([WITHOUT_PYTHON_DEPS],
-    [test "x$without_python_deps" = "xyes"])
-
 
 if test -n "`echo $with_picojson`"; then
   CPPFLAGS="$CPPFLAGS -I${with_picojson}/include"
@@ -2122,7 +1847,7 @@ fi
 if test -n "`echo $with_zookeeper`"; then
   CPPFLAGS="$CPPFLAGS -I${with_zookeeper}/include/zookeeper"
   LDFLAGS="$LDFLAGS -L${with_zookeeper}/lib"
-elif test "x$enable_bundled" = "xno"; then
+elif test "x$enable_bundled" != "xyes"; then
   CPPFLAGS="$CPPFLAGS -I/usr/include/zookeeper"
 fi
 
@@ -2160,6 +1885,326 @@ fi
 AM_CONDITIONAL([WITH_BUNDLED_ZOOKEEPER],
                [test "x$with_bundled_zookeeper" = "xyes"])
 
+# NOTE: Do not update any compiler or linker settings (e.g. CXXFLAGS,
+# LDFLAGS, ...) beyond this line.
+
+# Perform necessary configuration for building with Python.
+if test "x$enable_python" = "xyes"; then
+  # If the user specified PYTHON_VERSION then assume that is the
+  # Python that they want and construct PYTHON using the canonical
+  # name (failing if PYTHON is also set since we can't easily check
+  # that PYTHON and PYTHON_VERSION are compatible). This bit of
+  # tomfoolery is mostly to match the semantics of AC_PYTHON_DEVEL
+  # (used below). If we don't do this then it's possible that a user
+  # will specify PYTHON_VERSION which will get ignored (and likely
+  # replaced) via AM_PATH_PYTHON.
+  # TODO(benh): Consolidate AM_PATH_PYTHON and AC_PYTHON_DEVEL into a
+  # single macro that both iterates through potential 'python' options
+  # looking for an acceptable version (i.e., AM_PATH_PYTHON) and
+  # checks for Python.h (i.e., AC_PYTHON_DEVEL).
+  if test -n "$PYTHON_VERSION"; then
+    if test -n "$PYTHON"; then
+      AC_MSG_ERROR([only specify one of PYTHON or PYTHON_VERSION])
+    fi
+    PYTHON=python$PYTHON_VERSION
+  fi
+
+  # Check if PYTHON is at least 2.6 or try and find one that is if
+  # PYTHON is not set (necessary to run our examples).
+  AM_PATH_PYTHON([2.6],,
+                 [AC_MSG_ERROR([mesos requires Python >= 2.6
+-------------------------------------------------------------------
+If you already have Python 2.6 installed (and it's on the path),
+you might want to check if you have the PYTHON environment variable
+set to an older version of Python.
+-------------------------------------------------------------------
+  ])])
+
+  # Next we ensure we have the Python development libraries.
+  AX_PYTHON_DEVEL([>= '2.6'])
+
+  # Ensure that we can build a native Python egg linking against a
+  # static library that imports from the standard C++ library.
+  # This was added due to MESOS-799.
+  AC_MSG_CHECKING([whether we can build usable Python eggs])
+
+  # Render code that imports from the standard C++ library.
+  cat <<__EOF__ >testlib.cpp [
+#include <string>
+std::string test()
+{
+  return std::string("42");
+}]
+__EOF__
+
+  # Build a static library from the above code.
+  $CXX -x c++ -fPIC -c testlib.cpp $CPPFLAGS $CFLAGS $CXXFLAGS \
+    $LDFLAGS -o testlib.o
+  ar rcs libtest.a testlib.o
+
+  # Render a native Python module that imports from that library.
+  cat <<__EOF__ >testpyegg.cpp [
+#include <Python.h>
+#include <string>
+
+std::string test();
+PyMODINIT_FUNC initminimal();
+
+static PyObject *minimal_test(PyObject *self, PyObject* args)
+{
+  return PyString_FromString(test().c_str());
+}
+
+static PyMethodDef minimal_methods[] = {
+  { "test", minimal_test, METH_NOARGS, "Test." },
+  { NULL, NULL }
+};
+
+PyMODINIT_FUNC initminimal()
+{
+  PyImport_AddModule("minimal");
+  Py_InitModule("minimal", minimal_methods);
+}]
+__EOF__
+
+  # Render a distutils setup for building the Python egg.
+  cat <<__EOF__ >setup.py [
+from distutils.core import setup, Extension;
+setup(name = 'MinimalTest',
+      version = '1.0',
+      description = 'foo',
+      ext_modules = [ Extension('minimal',
+                                 extra_objects = ['libtest.a'],
+                                 sources = ['testpyegg.cpp'] ) ] )
+]
+__EOF__
+
+  # Build that Python egg that links against that library. The build
+  # settings are propagated to distutils.
+  # NOTE: We need to embed our CXXFLAGS in CFLAGS because distutils
+  # doesn't pull out CXXFLAGS automagically.
+  CXX="$CXX" CC="$CC" CFLAGS="$CFLAGS $CXXFLAGS" \
+    LDFLAGS="$LDFLAGS" $PYTHON setup.py build_ext --inplace \
+    --build-temp ./ 2>&1 >/dev/null
+
+  # Run a test-script that makes use of the Python egg.
+  pyeggtest=`$PYTHON -c "import minimal; print(minimal.test())" 2>&1`
+
+  # Validate the test-script output.
+  AS_IF([test "x$pyeggtest" = "x42"], [pyeggbuild=yes])
+
+  # Clean up all leftovers from this test.
+  rm -f testlib.cpp testlib.o libtest.a
+  rm -f testpyegg.cpp testpyegg.o setup.py minimal.so
+
+  AS_IF([test "x$pyeggbuild" = "xyes"],
+        [AC_MSG_RESULT([yes])],
+        [AS_IF([test "x$OS_NAME" = "xdarwin"],
+               [AC_MSG_ERROR([no
+-------------------------------------------------------------------
+It appears we were unable to build a usable native Python egg. You
+might be using the default Mac OS X Python distribution which is
+incompatible for building native eggs using this compiler setup.
+For more details, see:
+    https://issues.apache.org/jira/browse/MESOS-799
+
+There are two possible workarounds for this issue:
+    1. Disable python bindings by configuring with --disable-python.
+    2. Use an alternative Python installation that was built using
+       the same build setup as Mesos.
+-------------------------------------------------------------------])],
+               [AC_MSG_ERROR([no
+-------------------------------------------------------------------
+It appears we were unable to build a usable native Python egg.
+
+There are two possible workarounds for this issue:
+    1. Disable python bindings by configuring with --disable-python.
+    2. Use an alternative Python installation that was built using
+       the same build setup as Mesos.
+-------------------------------------------------------------------])])
+        ])
+
+  AC_MSG_CHECKING([for an old installation of the Mesos egg (before 0.20.0)])
+
+  $PYTHON -c "import mesos; mesos._mesos" &> /dev/null
+
+  if test $? = 0; then
+    pymodulelocation=`python -c \
+      "import mesos; import os; print os.path.dirname(mesos.__path__[[0]])" \
+      2> /dev/null`
+  fi
+
+  AS_IF([test -z "$pymodulelocation"],
+        [AC_MSG_RESULT([no])],
+        [AC_MSG_ERROR([yes
+-------------------------------------------------------------------
+It appears that you currently have a native Python egg installed
+from a version before 0.20.0. This conflicts with the egg in this
+version.
+
+There are two possible workarounds for this issue:
+    1. Disable Python bindings by configuring with --disable-python.
+    2. Uninstall the legacy egg from your Python installation. This
+       might require you doing:
+         rm -rf $pymodulelocation
+-------------------------------------------------------------------])])
+
+  # Determine how the generated Python egg's will get named, used in
+  # the Makefile to keep the targets from being rerun.
+  PYTHON_EGG_POSTFIX=`$PYTHON -c \
+    'import sys; \
+     from distutils.util import get_platform; \
+     print "-py" + sys.version[[0:3]] + "-" + get_platform()'`
+
+  PYTHON_EGG_PUREPY_POSTFIX=`$PYTHON -c \
+    'import sys; \
+     from distutils.util import get_platform; \
+     print "-py" + sys.version[[0:3]]'`
+
+  PYTHON_WHL_POSTFIX=`$PYTHON -c \
+    'import sys; \
+     from distutils.util import get_platform; \
+     print "-cp" + sys.version[[0:3]].replace(".", "") + "-none-" \
+       + get_platform().replace(".", "_").replace("-", "_")'`
+
+  PYTHON_WHL_PUREPY_POSTFIX=`$PYTHON -c \
+    'import sys; \
+     print "-py" + sys.version[[0]] + "-none-any"'`
+
+  AC_CONFIG_FILES([src/examples/python/test-executor],
+                  [chmod +x src/examples/python/test-executor])
+  AC_CONFIG_FILES([src/examples/python/test-framework],
+                  [chmod +x src/examples/python/test-framework])
+  AC_CONFIG_FILES([src/python/setup.py])
+  AC_CONFIG_FILES([src/python/cli/setup.py])
+  AC_CONFIG_FILES([src/python/interface/setup.py])
+  AC_CONFIG_FILES([src/python/native_common/ext_modules.py])
+  AC_CONFIG_FILES([src/python/executor/setup.py])
+  AC_CONFIG_FILES([src/python/native/setup.py])
+  AC_CONFIG_FILES([src/python/scheduler/setup.py])
+
+  AC_CONFIG_LINKS([src/python/executor/ext_modules.py:src/python/native_common/ext_modules.py])
+  AC_CONFIG_LINKS([src/python/scheduler/ext_modules.py:src/python/native_common/ext_modules.py])
+
+  # When clang is being used, make sure that the distutils python-
+  # config cflags extraction does not cause build errors (MESOS-1079).
+  # TODO(tillt): Remove this once Apple distributed an updated Python.
+  PYTHON_CPPFLAGS="$CPPFLAGS"
+  PYTHON_CFLAGS="$CFLAGS $CXXFLAGS" # distutils requires we embed CXXFLAGS.
+  PYTHON_LDFLAGS="$LDFLAGS $GFLAGS_LIBS"
+
+  AS_IF([test "x$ax_cv_cxx_compiler_vendor" = "xclang"],
+	[PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -Qunused-arguments"
+         PYTHON_CFLAGS="$PYTHON_CFLAGS -Qunused-arguments"])
+
+  AC_SUBST([PYTHON_CPPFLAGS])
+  AC_SUBST([PYTHON_CFLAGS])
+  AC_SUBST([PYTHON_EGG_POSTFIX])
+  AC_SUBST([PYTHON_EGG_PUREPY_POSTFIX])
+  AC_SUBST([PYTHON_WHL_POSTFIX])
+  AC_SUBST([PYTHON_WHL_PUREPY_POSTFIX])
+  AC_SUBST([PYTHON]) # Used by the example shell scripts and src/Makefile.am.
+
+  AC_DEFINE([MESOS_HAS_PYTHON])
+
+  # Check if user has asked us to use a preinstalled setuptools, or if
+  # they asked us to ignore all bundled libraries while compiling and linking.
+  if test "x$enable_bundled_setuptools" != "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+
+    AC_PYTHON_MODULE([distutils], [no])
+    if test "x$HAVE_PYMOD_distutils" = "xno"; then
+      AC_PYTHON_MODULE([setuptools], [no])
+
+      if test "x$HAVE_PYMOD_setuptools" = "xyes"; then
+        found_setuptools=yes
+      fi
+
+    else
+      found_setuptools=yes
+    fi
+
+    if test "x$found_setuptools" = "xyes"; then
+      with_bundled_setuptools=no
+    else
+      AC_MSG_ERROR([cannot find setuptools
+-------------------------------------------------------------------
+You have requested the use of a non-bundled setuptools but no suitable
+setuptools could be found.
+
+You may want specify the location of setuptools by providing a prefix
+path via --with-setuptools=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+    fi
+  else
+    with_bundled_setuptools=yes
+  fi
+
+  # Check if user has asked us to use a preinstalled pip, or if
+  # they asked us to ignore all bundled libraries while compiling and linking.
+  if test "x$enable_bundled_pip" != "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+
+    AC_PYTHON_MODULE([pip], [no])
+    if test "x$HAVE_PYMOD_pip" = "xno"; then
+      AC_MSG_ERROR([cannot find pip
+-------------------------------------------------------------------
+You have requested the use of a non-bundled pip but no suitable
+pip could be found.
+
+You may want specify the location of pip by providing a prefix
+path via --with-pip=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+    else
+      with_bundled_pip=no
+    fi
+  else
+    with_bundled_pip=yes
+  fi
+
+  # Check if user has asked us to use a preinstalled wheel, or if
+  # they asked us to ignore all bundled libraries while compiling and linking.
+  if test "x$enable_bundled_wheel" != "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+
+    AC_PYTHON_MODULE([wheel], [no])
+    if test "x$HAVE_PYMOD_wheel" = "xno"; then
+      AC_MSG_ERROR([cannot find wheel
+-------------------------------------------------------------------
+You have requested the use of a non-bundled wheel but no suitable
+wheel could be found.
+
+You may want specify the location of wheel by providing a prefix
+path via --with-wheel=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+    else
+      with_bundled_wheel=no
+    fi
+  else
+    with_bundled_wheel=yes
+  fi
+
+  has_python=yes
+fi
+
+AM_CONDITIONAL([HAS_PYTHON], [test "x$has_python" = "xyes"])
+
+AM_CONDITIONAL([WITH_BUNDLED_SETUPTOOLS],
+    [test "x$with_bundled_setuptools" = "xyes"])
+AM_CONDITIONAL([WITH_BUNDLED_PIP],
+    [test "x$with_bundled_pip" = "xyes"])
+AM_CONDITIONAL([WITH_BUNDLED_WHEEL],
+    [test "x$with_bundled_wheel" = "xyes"])
+
+AM_CONDITIONAL([ENABLE_PYTHON_DEPENDENCY_INSTALL],
+    [test "x$enable_python_dependency_install" = "xyes"])
+
 
 ###############################################################################
 # Configure args to be passed to 3rdparty libraries.
@@ -2187,3 +2232,11 @@ AC_SUBST(MESOS_PATCH_VERSION, m4_car(m4_shift2(major_minor_patch)))
 
 
 AC_OUTPUT
+
+AC_MSG_NOTICE([Build option summary:
+    CXX:        $CXX
+    CXXFLAGS:   $CXXFLAGS
+    CPPFLAGS:   $CPPFLAGS
+    LDFLAGS:    $LDFLAGS
+    LIBS:       $LIBS
+])

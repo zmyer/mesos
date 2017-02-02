@@ -42,6 +42,7 @@
 #include "slave/paths.hpp"
 
 #include "slave/containerizer/mesos/mount.hpp"
+#include "slave/containerizer/mesos/paths.hpp"
 
 #include "slave/containerizer/mesos/isolators/filesystem/linux.hpp"
 
@@ -52,6 +53,7 @@ using std::ostringstream;
 using std::string;
 using std::vector;
 
+using mesos::slave::ContainerClass;
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerState;
 using mesos::slave::ContainerLaunchInfo;
@@ -64,13 +66,7 @@ namespace slave {
 
 Try<Isolator*> LinuxFilesystemIsolatorProcess::create(const Flags& flags)
 {
-  Result<string> user = os::user();
-  if (!user.isSome()) {
-    return Error("Failed to determine user: " +
-                 (user.isError() ? user.error() : "username not found"));
-  }
-
-  if (user.get() != "root") {
+  if (geteuid() != 0) {
     return Error("LinuxFilesystemIsolator requires root privileges");
   }
 
@@ -209,14 +205,25 @@ LinuxFilesystemIsolatorProcess::LinuxFilesystemIsolatorProcess(
 LinuxFilesystemIsolatorProcess::~LinuxFilesystemIsolatorProcess() {}
 
 
+bool LinuxFilesystemIsolatorProcess::supportsNesting()
+{
+    return true;
+}
+
+
 Future<Nothing> LinuxFilesystemIsolatorProcess::recover(
     const list<ContainerState>& states,
     const hashset<ContainerID>& orphans)
 {
   foreach (const ContainerState& state, states) {
+    Option<ExecutorInfo> executorInfo;
+    if (state.has_executor_info()) {
+      executorInfo = state.executor_info();
+    }
+
     Owned<Info> info(new Info(
         state.directory(),
-        state.executor_info()));
+        executorInfo));
 
     infos.put(state.container_id(), info);
   }
@@ -227,37 +234,67 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::recover(
     return Failure("Failed to get mount table: " + table.error());
   }
 
+  list<Future<Nothing>> cleanups;
+
   foreach (const fs::MountInfoTable::Entry& entry, table->entries) {
     // Check for mounts inside an executor's run path. These are
     // persistent volumes mounts.
     Try<paths::ExecutorRunPath> runPath =
-      paths::parseExecutorRunPath(flags.work_dir, entry.target);
+      slave::paths::parseExecutorRunPath(flags.work_dir, entry.target);
 
     if (runPath.isError()) {
       continue;
     }
 
-    if (infos.contains(runPath->containerId)) {
+    const string rootSandboxPath = paths::getExecutorRunPath(
+        flags.work_dir,
+        runPath->slaveId,
+        runPath->frameworkId,
+        runPath->executorId,
+        runPath->containerId);
+
+    Try<ContainerID> containerId =
+      containerizer::paths::parseSandboxPath(
+          runPath->containerId,
+          rootSandboxPath,
+          entry.target);
+
+    // Since we pass the same 'entry.target' to 'parseSandboxPath' and
+    // 'parseSandboxPath', we should not see an error here.
+    if (containerId.isError()) {
+      return Failure("Parsing sandbox path failed: " + containerId.error());
+    }
+
+    if (infos.contains(containerId.get())) {
       continue;
     }
 
-    // TODO(josephw): We only track persistent volumes for known
-    // orphans as these orphans were presumably created by an earlier
-    // `MesosContainerizer`. Other persistent volumes may have been
-    // created by other actors, such as the `DockerContainerizer`.
-    if (orphans.contains(runPath->containerId)) {
-      Owned<Info> info(new Info(paths::getExecutorRunPath(
-          flags.work_dir,
-          runPath->slaveId,
-          runPath->frameworkId,
-          runPath->executorId,
-          runPath->containerId)));
+    // TODO(josephw): We only track persistent volumes for containers
+    // launched by MesosContainerizer. Nested containers or containers
+    // that are listed in 'orphans' were presumably created by an
+    // earlier `MesosContainerizer`. Other persistent volumes may have
+    // been created by other actors, such as the
+    // `DockerContainerizer`.
+    if (orphans.contains(containerId.get())) {
+      infos.put(containerId.get(), Owned<Info>(new Info(
+          containerizer::paths::getSandboxPath(
+              rootSandboxPath,
+              containerId.get()))));
+    } else if (containerId->has_parent()) {
+      infos.put(containerId.get(), Owned<Info>(new Info(
+          containerizer::paths::getSandboxPath(
+              rootSandboxPath,
+              containerId.get()))));
 
-      infos.put(runPath->containerId, info);
+      LOG(INFO) << "Cleaning up unknown orphaned nested container "
+                << containerId.get();
+
+      cleanups.push_back(cleanup(containerId.get()));
     }
   }
 
-  return Nothing();
+  return collect(cleanups)
+    .then([]() { return Nothing(); });
 }
 
 
@@ -265,20 +302,46 @@ Future<Option<ContainerLaunchInfo>> LinuxFilesystemIsolatorProcess::prepare(
     const ContainerID& containerId,
     const ContainerConfig& containerConfig)
 {
-  const string& directory = containerConfig.directory();
+  // If we are a nested container in the `DEBUG` class, then we only
+  // use this isolator to indicate that we should enter our parent's
+  // MOUNT namespace. We don't want to clone a new MOUNT namespace or
+  // run any new pre-exec commands in it. For now, we also don't
+  // support provisioning a new filesystem or setting a `rootfs` for
+  // the container. We also don't support mounting any volumes.
+  if (containerId.has_parent() &&
+      containerConfig.has_container_class() &&
+      containerConfig.container_class() == ContainerClass::DEBUG) {
+    if (containerConfig.has_rootfs()) {
+      return Failure("A 'rootfs' cannot be set for DEBUG containers");
+    }
+
+    if (containerConfig.has_container_info() &&
+        containerConfig.container_info().volumes().size() > 0) {
+      return Failure("Volumes not supported for DEBUG containers");
+    }
+
+    ContainerLaunchInfo launchInfo;
+    launchInfo.add_enter_namespaces(CLONE_NEWNS);
+    return launchInfo;
+  }
 
   if (infos.contains(containerId)) {
     return Failure("Container has already been prepared");
   }
 
-  Owned<Info> info(new Info(
-      directory,
-      containerConfig.executor_info()));
+  const string& directory = containerConfig.directory();
 
-  infos.put(containerId, info);
+  Option<ExecutorInfo> executorInfo;
+  if (containerConfig.has_executor_info()) {
+    executorInfo = containerConfig.executor_info();
+  }
+
+  infos.put(containerId, Owned<Info>(new Info(
+      directory,
+      executorInfo)));
 
   ContainerLaunchInfo launchInfo;
-  launchInfo.set_namespaces(CLONE_NEWNS);
+  launchInfo.add_clone_namespaces(CLONE_NEWNS);
 
   // Prepare the commands that will be run in the container's mount
   // namespace right after forking the executor process. We use these
@@ -293,6 +356,11 @@ Future<Option<ContainerLaunchInfo>> LinuxFilesystemIsolatorProcess::prepare(
 
   foreach (const CommandInfo& command, commands.get()) {
     launchInfo.add_pre_exec_commands()->CopyFrom(command);
+  }
+
+  // Currently, we only need to update resources for top level containers.
+  if (containerId.has_parent()) {
+    return launchInfo;
   }
 
   return update(containerId, containerConfig.executor_info().resources())
@@ -323,7 +391,7 @@ Try<vector<CommandInfo>> LinuxFilesystemIsolatorProcess::getPreExecCommands(
   mountFlags.path = "/";
 
   foreachvalue (const flags::Flag& flag, mountFlags) {
-    const Option<string> value = flag.stringify(flags);
+    const Option<string> value = flag.stringify(mountFlags);
     if (value.isSome()) {
       command.add_arguments(
           "--" + flag.effective_name().value + "=" + value.get());
@@ -332,7 +400,7 @@ Try<vector<CommandInfo>> LinuxFilesystemIsolatorProcess::getPreExecCommands(
 
   commands.push_back(command);
 
-  if (!containerConfig.executor_info().has_container()) {
+  if (!containerConfig.has_container_info()) {
     return commands;
   }
 
@@ -364,8 +432,7 @@ Try<vector<CommandInfo>> LinuxFilesystemIsolatorProcess::getPreExecCommands(
     commands.push_back(command);
   }
 
-  foreach (const Volume& volume,
-           containerConfig.executor_info().container().volumes()) {
+  foreach (const Volume& volume, containerConfig.container_info().volumes()) {
     // NOTE: Volumes with source will be handled by the corresponding
     // isolators (e.g., docker/volume).
     if (volume.has_source()) {
@@ -538,6 +605,10 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::update(
     const ContainerID& containerId,
     const Resources& resources)
 {
+  if (containerId.has_parent()) {
+    return Failure("Not supported for nested containers");
+  }
+
   // Mount persistent volumes. We do this in the host namespace and
   // rely on mount propagation for them to be visible inside the
   // container.
@@ -592,6 +663,16 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::update(
     }
   }
 
+  // Get user and group info for this task based on the task's sandbox.
+  struct stat s;
+  if (::stat(info->directory.c_str(), &s) < 0) {
+    return Failure("Failed to get ownership for '" + info->directory +
+                   "': " + os::strerror(errno));
+  }
+
+  const uid_t uid = s.st_uid;
+  const gid_t gid = s.st_gid;
+
   // We then mount new persistent volumes.
   foreach (const Resource& resource, resources.persistentVolumes()) {
     // This is enforced by the master.
@@ -614,34 +695,32 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::update(
     // Determine the source of the mount.
     string source = paths::getPersistentVolumePath(flags.work_dir, resource);
 
-    // Set the ownership of the persistent volume to match that of the
-    // sandbox directory.
-    //
-    // NOTE: Currently, persistent volumes in Mesos are exclusive,
-    // meaning that if a persistent volume is used by one task or
-    // executor, it cannot be concurrently used by other task or
-    // executor. But if we allow multiple executors to use same
-    // persistent volume at the same time in the future, the ownership
-    // of the persistent volume may conflict here.
-    //
-    // TODO(haosdent): Consider letting the frameworks specify the
-    // user/group of the persistent volumes.
-    struct stat s;
-    if (::stat(info->directory.c_str(), &s) < 0) {
-      return Failure("Failed to get ownership for '" + info->directory + "': " +
-                     os::strerror(errno));
+    bool isVolumeInUse = false;
+
+    foreachvalue (const Owned<Info>& info, infos) {
+      if (info->resources.contains(resource)) {
+        isVolumeInUse = true;
+        break;
+      }
     }
 
-    LOG(INFO) << "Changing the ownership of the persistent volume at '"
-              << source << "' with uid " << s.st_uid
-              << " and gid " << s.st_gid;
+    // Set the ownership of the persistent volume to match that of the sandbox
+    // directory if the volume is not already in use. If the volume is
+    // currently in use by other containers, tasks in this container may fail
+    // to read from or write to the persistent volume due to incompatible
+    // ownership and file system permissions.
+    if (!isVolumeInUse) {
+      LOG(INFO) << "Changing the ownership of the persistent volume at '"
+                << source << "' with uid " << uid << " and gid " << gid;
 
-    Try<Nothing> chown = os::chown(s.st_uid, s.st_gid, source, false);
-    if (chown.isError()) {
-      return Failure(
-          "Failed to change the ownership of the persistent volume at '" +
-          source + "' with uid " + stringify(s.st_uid) +
-          " and gid " + stringify(s.st_gid) + ": " + chown.error());
+      Try<Nothing> chown = os::chown(uid, gid, source, false);
+
+      if (chown.isError()) {
+        return Failure(
+            "Failed to change the ownership of the persistent volume at '" +
+            source + "' with uid " + stringify(uid) +
+            " and gid " + stringify(gid) + ": " + chown.error());
+      }
     }
 
     // Determine the target of the mount.
@@ -676,6 +755,18 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::update(
             "Failed to mount persistent volume from '" +
             source + "' to '" + target + "': " + mount.error());
       }
+
+      // If the mount needs to be read-only, do a remount.
+      if (resource.disk().volume().mode() == Volume::RO) {
+        mount = fs::mount(
+            None(), target, None(), MS_BIND | MS_RDONLY | MS_REMOUNT, nullptr);
+
+        if (mount.isError()) {
+          return Failure(
+              "Failed to remount persistent volume as read-only from '" +
+              source + "' to '" + target + "': " + mount.error());
+        }
+      }
     }
   }
 
@@ -694,6 +785,17 @@ Future<Nothing> LinuxFilesystemIsolatorProcess::cleanup(
             << containerId;
 
     return Nothing();
+  }
+
+  // Make sure the container we are cleaning up doesn't have any
+  // children (they should have already been cleaned up by a previous
+  // call if it had any).
+  foreachkey (const ContainerID& _containerId, infos) {
+    if (_containerId.has_parent() && _containerId.parent() == containerId) {
+      return Failure(
+          "Container " + stringify(containerId) + " has non terminated "
+          "child container " + stringify(_containerId));
+    }
   }
 
   const Owned<Info>& info = infos[containerId];
@@ -755,6 +857,9 @@ LinuxFilesystemIsolatorProcess::Metrics::~Metrics()
 }
 
 
+// TODO(gilbert): Currently, this only supports counting rootfses for
+// top level containers. We should figure out another way to collect
+// this information if necessary.
 double LinuxFilesystemIsolatorProcess::_containers_new_rootfs()
 {
   double count = 0.0;

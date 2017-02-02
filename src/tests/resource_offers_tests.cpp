@@ -58,7 +58,9 @@ namespace tests {
 class ResourceOffersTest : public MesosTest {};
 
 
-TEST_F(ResourceOffersTest, ResourceOfferWithMultipleSlaves)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    ResourceOffersTest,
+    ResourceOfferWithMultipleSlaves)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -69,6 +71,7 @@ TEST_F(ResourceOffersTest, ResourceOfferWithMultipleSlaves)
   // Start 10 slaves.
   for (int i = 0; i < 10; i++) {
     slave::Flags flags = CreateSlaveFlags();
+    flags.launcher = "posix";
 
     flags.resources = Option<std::string>("cpus:2;mem:1024");
 
@@ -298,7 +301,7 @@ TEST_F(ResourceOffersTest, Request)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(allocator, addFramework(_, _, _))
+  EXPECT_CALL(allocator, addFramework(_, _, _, _))
     .Times(1);
 
   Future<Nothing> registered;

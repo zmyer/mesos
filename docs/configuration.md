@@ -474,7 +474,7 @@ Example:
     --slave_ping_timeout=VALUE
   </td>
   <td>
-The timeout within which each agent is expected to respond to a
+The timeout within which an agent is expected to respond to a
 ping from the master. Agents that do not respond within
 max_agent_ping_timeouts ping retries will be asked to shutdown.
 <b>NOTE</b>: The total ping timeout (<code>agent_ping_timeout</code> multiplied by
@@ -503,10 +503,12 @@ checks. The value is of the form <code>(Number of agents)/(Duration)</code>.
     --slave_reregister_timeout=VALUE
   </td>
   <td>
-The timeout within which all agents are expected to re-register
-when a new master is elected as the leader. Agents that do not
-re-register within the timeout will be removed from the registry
-and will be shutdown if they attempt to communicate with master.
+The timeout within which an agent is expected to re-register.
+Agents re-register when they become disconnected from the master
+or when a new master is elected as the leader. Agents that do not
+re-register within the timeout will be marked unreachable in the
+registry; if/when the agent re-registers with the master, any
+non-partition-aware tasks running on the agent will be terminated.
 <b>NOTE</b>: This value has to be at least 10mins. (default: 10mins)
   </td>
 </tr>
@@ -706,11 +708,18 @@ Maximum number of completed frameworks to store in memory. (default: 50)
 </tr>
 <tr>
   <td>
-    --max_completed_tasks_per_framework
-=VALUE
+    --max_completed_tasks_per_framework=VALUE
   </td>
   <td>
 Maximum number of completed tasks per framework to store in memory. (default: 1000)
+  </td>
+</tr>
+<tr>
+  <td>
+    --max_unreachable_tasks_per_framework=VALUE
+  </td>
+  <td>
+Maximum number of unreachable tasks per framework to store in memory. (default: 1000)
   </td>
 </tr>
 <tr>
@@ -992,6 +1001,22 @@ in, e.g., <code>memory,cpuacct</code>. The default is none.
 Present functionality is intended for resource monitoring and
 no cgroup limits are set, they are inherited from the root mesos
 cgroup.
+  </td>
+</tr>
+<tr>
+  <td>
+    --allowed_capabilities=VALUE
+  </td>
+  <td>
+The value needs to be a JSON-formatted string of Linux capabilities
+that the agent should allow. Note that if no Linux capabilities
+isolation is enabled (<code>linux/capabilities</code> is not present
+in the arguments to <code>--isolation</code>), this flags is ignored.
+<p/>
+Example:
+<pre><code>{
+"capabilities": [NET_RAW, MKNOD]
+}</code></pre>
   </td>
 </tr>
 <tr>
@@ -1371,6 +1396,15 @@ shutting it down (e.g., 60secs, 3mins, etc) (default: 1mins)
 </tr>
 <tr>
   <td>
+    --max_completed_executors_per_framework
+  </td>
+  <td>
+Maximum number of completed executors per framework to store
+in memory. (default: 150)
+  </td>
+</tr>
+<tr>
+  <td>
     --executor_shutdown_grace_period=VALUE
   </td>
   <td>
@@ -1492,7 +1526,7 @@ e.g., <code>APPC,DOCKER</code>.
   </td>
   <td>
 Strategy for provisioning container rootfs from images, e.g., <code>aufs</code>,
-<code>bind</code>, <code>copy</code>, <code>overlay</code>. (default: copy)
+<code>bind</code>, <code>copy</code>, <code>overlay</code>.
   </td>
 </tr>
 <tr>

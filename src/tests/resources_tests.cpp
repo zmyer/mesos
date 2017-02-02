@@ -27,9 +27,16 @@
 #include <stout/json.hpp>
 #include <stout/protobuf.hpp>
 
+#include <mesos/resources.hpp>
+
+#include <mesos/v1/resources.hpp>
+
+#include "internal/evolve.hpp"
+
 #include "master/master.hpp"
 
 #include "tests/mesos.hpp"
+#include "tests/resources_utils.hpp"
 
 using namespace mesos::internal::master;
 
@@ -43,6 +50,8 @@ using std::string;
 using std::vector;
 
 using google::protobuf::RepeatedPtrField;
+
+using mesos::internal::evolve;
 
 using mesos::internal::protobuf::createLabel;
 
@@ -627,14 +636,14 @@ TEST(ResourcesTest, ParsingFromJSONError)
 
   EXPECT_ERROR(Resources::parse(jsonString));
 
-  // Empty Resources.
+  // Negative Resources.
   jsonString =
     "["
     "  {"
     "    \"name\": \"panda_power\","
     "    \"type\": \"SCALAR\","
     "    \"scalar\": {"
-    "      \"value\": 0"
+    "      \"value\": -1"
     "    }"
     "  },"
     "  {"
@@ -804,6 +813,13 @@ TEST(ResourcesTest, PrintingExtendedAttributes)
   disk.set_role("alice");
   stream << disk;
   EXPECT_EQ("disk(alice):1", stream.str());
+
+  // Allocated resource.
+  stream.str("");
+  disk.mutable_allocation_info()->set_role("role");
+  stream << disk;
+  EXPECT_EQ("disk(alice)(allocated: role):1", stream.str());
+  disk.clear_allocation_info();
 
   // Standard revocable resource.
   stream.str("");
@@ -2268,6 +2284,21 @@ TEST(ResourcesOperationTest, StrippedResourcesVolume)
 }
 
 
+TEST(ResourcesOperationTest, StrippedResourcesAllocated)
+{
+  Resources allocated = Resources::parse("cpus:1;mem:512").get();
+  allocated.allocate("role");
+
+  Resources stripped = allocated.createStrippedScalarQuantity();
+
+  // Allocation info should be stripped when
+  // converting to a quantity.
+  foreach (const Resource& resource, stripped) {
+    EXPECT_FALSE(resource.has_allocation_info());
+  }
+}
+
+
 TEST(ResourcesOperationTest, StrippedResourcesReserved)
 {
   Resources unreserved = Resources::parse("cpus:1;mem:512").get();
@@ -2517,6 +2548,17 @@ TEST(ResourcesTest, Count)
 }
 
 
+TEST(ResourcesTest, Evolve)
+{
+  string resourcesString = "cpus(role1):2;mem(role1):10;cpus:4;mem:20";
+  Resources resources = Resources::parse(resourcesString).get();
+
+  v1::Resources evolved = evolve(resources);
+
+  EXPECT_EQ(v1::Resources::parse(resourcesString).get(), evolved);
+}
+
+
 TEST(SharedResourcesTest, Printing)
 {
   Resources volume = createPersistentVolume(
@@ -2733,25 +2775,119 @@ TEST(SharedResourcesTest, Filter)
 }
 
 
-struct Parameter
+TEST(AllocatedResourcesTest, Equality)
+{
+  Resources cpus1 = Resources::parse("cpus", "1", "*").get();
+  Resources cpus2 = Resources::parse("cpus", "1", "*").get();
+
+  cpus1.allocate("role1");
+  cpus2.allocate("role2");
+
+  EXPECT_EQ(cpus1, cpus1);
+  EXPECT_NE(cpus1, cpus2);
+}
+
+
+TEST(AllocatedResourcesTest, Contains)
+{
+  Resources cpus1 = Resources::parse("cpus", "1", "*").get();
+  Resources cpus2 = Resources::parse("cpus", "1", "*").get();
+
+  cpus1.allocate("role1");
+  cpus2.allocate("role2");
+
+  EXPECT_TRUE((cpus1 + cpus2).contains(cpus1));
+  EXPECT_TRUE((cpus1 + cpus2).contains(cpus2));
+}
+
+
+TEST(AllocatedResourcesTest, Addition)
+{
+  Resources cpus1 = Resources::parse("cpus", "1", "*").get();
+  Resources cpus2 = Resources::parse("cpus", "1", "*").get();
+
+  cpus1.allocate("role1");
+  cpus2.allocate("role2");
+
+  EXPECT_EQ(2u, (cpus1 + cpus2).size());
+  EXPECT_SOME_EQ(2.0, (cpus1 + cpus2).cpus());
+}
+
+
+TEST(AllocatedResourcesTest, Subtraction)
+{
+  Resources cpus1 = Resources::parse("cpus", "1", "*").get();
+  Resources cpus2 = Resources::parse("cpus", "1", "*").get();
+
+  cpus1.allocate("role1");
+  cpus2.allocate("role2");
+
+  EXPECT_TRUE((cpus1 - cpus1).empty());
+  EXPECT_TRUE((cpus2 - cpus2).empty());
+
+  EXPECT_EQ(cpus1, cpus1 - cpus2);
+  EXPECT_EQ(cpus2, cpus2 - cpus1);
+}
+
+
+TEST(AllocatedResourcesTest, Allocations)
+{
+  // Unreserved resources can be allocated to any role (including *).
+  Resources cpus1 = Resources::parse("cpus", "1", "*").get();
+  Resources mem1 = Resources::parse("mem", "1024", "*").get();
+
+  cpus1.allocate("*");
+  mem1.allocate("*");
+
+  Resources cpus2 = Resources::parse("cpus", "2", "*").get();
+  Resources mem2 = Resources::parse("mem", "2048", "*").get();
+
+  cpus2.allocate("role1");
+  mem2.allocate("role1");
+
+  // Reserved resources are allocated to the reserved role.
+  Resources cpus3 = Resources::parse("cpus", "3", "role2").get();
+  Resources mem3 = Resources::parse("mem", "3096", "role2").get();
+
+  cpus3.allocate("role2");
+  mem3.allocate("role2");
+
+  Resources resources = cpus1 + cpus2 + cpus3 + mem1 + mem2 + mem3;
+
+  hashmap<string, Resources> allocations = resources.allocations();
+
+  EXPECT_EQ(3u, allocations.size());
+  EXPECT_EQ(cpus1 + mem1, allocations["*"]);
+  EXPECT_EQ(cpus2 + mem2, allocations["role1"]);
+  EXPECT_EQ(cpus3 + mem3, allocations["role2"]);
+
+  // Test unallocation.
+  cpus1.unallocate();
+
+  Resource r = *cpus1.begin();
+  EXPECT_FALSE(r.has_allocation_info());
+}
+
+
+struct ScalarArithmeticParameter
 {
   Resources resources;
   size_t totalOperations;
 };
 
 
-class Resources_BENCHMARK_Test
+class Resources_Scalar_Arithmetic_BENCHMARK_Test
   : public ::testing::Test,
-    public ::testing::WithParamInterface<Parameter>
+    public ::testing::WithParamInterface<ScalarArithmeticParameter>
 {
 public:
   // Returns the 'Resources' parameters to run the benchmarks against.
-  static vector<Parameter> parameters()
+  static vector<ScalarArithmeticParameter> parameters()
   {
-    vector<Parameter> parameters_;
+    vector<ScalarArithmeticParameter> parameters_;
 
     // Test a typical vector of scalars.
-    Parameter scalars;
+    ScalarArithmeticParameter scalars;
     scalars.resources =
       Resources::parse("cpus:1;gpus:1;mem:128;disk:256").get();
     scalars.totalOperations = 50000;
@@ -2769,7 +2905,7 @@ public:
 
     // Test a large amount of unique reservations. This can
     // occur when aggregating across agents in a cluster.
-    Parameter reservations;
+    ScalarArithmeticParameter reservations;
     for (int i = 0; i < 1000; ++i) {
       Label label;
       label.set_key("key_" + stringify(i));
@@ -2785,7 +2921,7 @@ public:
     reservations.totalOperations = 10;
 
     // Test the performance of ranges using a fragmented range of
-    // ports: [1-2,4-5,7-9,...,1000]. Note that the benchmark will
+    // ports: [1-2,4-5,7-8,...,1000]. Note that the benchmark will
     // continuously sum together the same port range, which does
     // not preserve arithmetic invariants (a+a-a != a).
     string ports;
@@ -2796,7 +2932,9 @@ public:
       ports += stringify(portBegin) + "-" + stringify(portBegin+1);
     }
 
-    Parameter ranges;
+    // TODO(gyliu513): Move the ports resources benchmark test
+    // to a separate test class.
+    ScalarArithmeticParameter ranges;
     ranges.resources = Resources::parse("ports:[" + ports + "]").get();
     ranges.totalOperations = 1000;
 
@@ -2805,7 +2943,7 @@ public:
     Resource disk = createDiskResource(
         "256", "test", "persistentId", "/volume", None(), true);
 
-    Parameter shared;
+    ScalarArithmeticParameter shared;
     shared.resources = Resources::parse("cpus:1;mem:128").get() + disk;
     shared.totalOperations = 50000;
 
@@ -2823,9 +2961,10 @@ public:
 // 'Resources' object to apply operations to, and the number
 // of times to run the operation.
 INSTANTIATE_TEST_CASE_P(
-    ResourcesOperators,
-    Resources_BENCHMARK_Test,
-    ::testing::ValuesIn(Resources_BENCHMARK_Test::parameters()));
+    ResourcesScalarArithmeticOperators,
+    Resources_Scalar_Arithmetic_BENCHMARK_Test,
+    ::testing::ValuesIn(
+        Resources_Scalar_Arithmetic_BENCHMARK_Test::parameters()));
 
 
 static string abbreviate(string s, size_t max)
@@ -2840,7 +2979,7 @@ static string abbreviate(string s, size_t max)
 }
 
 
-TEST_P(Resources_BENCHMARK_Test, Arithmetic)
+TEST_P(Resources_Scalar_Arithmetic_BENCHMARK_Test, Arithmetic)
 {
   const Resources& resources = GetParam().resources;
   size_t totalOperations = GetParam().totalOperations;
@@ -2891,6 +3030,207 @@ TEST_P(Resources_BENCHMARK_Test, Arithmetic)
        << " on " << abbreviate(stringify(resources), 50) << endl;
 
   ASSERT_TRUE(total.empty()) << total;
+}
+
+
+class Resources_Filter_BENCHMARK_Test : public ::testing::Test {};
+
+
+TEST_F(Resources_Filter_BENCHMARK_Test, Filters)
+{
+  size_t totalOperations = 50000u;
+
+  Resources nonRevocable =
+    Resources::parse("cpus:1;gpus:1;mem:128;disk:256").get();
+
+  Stopwatch watch;
+
+  watch.start();
+  for (size_t i = 0; i < totalOperations; i++) {
+    nonRevocable.nonRevocable();
+  }
+  watch.stop();
+
+  cout << "Took " << watch.elapsed()
+       << " to perform " << totalOperations << " 'r.nonRevocable()' operations"
+       << " on " << stringify(nonRevocable) << endl;
+
+  Resources revocable = createRevocableResource("cpus", "1", "*", true);
+
+  watch.start();
+  for (size_t i = 0; i < totalOperations; i++) {
+    revocable.revocable();
+  }
+  watch.stop();
+
+  cout << "Took " << watch.elapsed()
+       << " to perform " << totalOperations << " 'r.revocable()' operations"
+       << " on " << stringify(revocable) << endl;
+
+  Resources unReserved = nonRevocable;
+
+  watch.start();
+  for (size_t i = 0; i < totalOperations; i++) {
+    unReserved.unreserved();
+  }
+  watch.stop();
+
+  cout << "Took " << watch.elapsed()
+       << " to perform " << totalOperations << " 'r.unreserved()' operations"
+       << " on " << stringify(unReserved) << endl;
+
+  Resources reserved = Resources::parse(
+    "cpus(role):1;gpus(role):1;mem(role):128;disk(role):256").get();
+
+  watch.start();
+  for (size_t i = 0; i < totalOperations; i++) {
+    reserved.reserved("role");
+  }
+  watch.stop();
+
+  cout << "Took " << watch.elapsed()
+       << " to perform " << totalOperations << " 'r.reserved(role)' operations"
+       << " on " << stringify(reserved) << endl;
+}
+
+
+struct ContainsParameter
+{
+  Resources subset;
+  Resources superset;
+  size_t totalOperations;
+};
+
+
+class Resources_Contains_BENCHMARK_Test
+  : public ::testing::Test,
+    public ::testing::WithParamInterface<ContainsParameter>
+{
+public:
+  // Returns the 'Resources' parameters to run the `contains`
+  // benchmarks against. This test will include three kind of
+  // 'Resources' parameters: scalar, ranges and mixed
+  // (scalar and ranges).
+  static vector<ContainsParameter> parameters()
+  {
+    vector<ContainsParameter> parameters_;
+
+    // Test a typical vector of scalars, the superset contains
+    // the subset for this case.
+    ContainsParameter scalars1;
+    scalars1.subset = Resources::parse("cpus:1;mem:128").get();
+    scalars1.superset =
+      Resources::parse("cpus:1;gpus:1;mem:128;disk:256").get();
+
+    scalars1.totalOperations = 5000;
+
+    // Test a typical vector of scalars, the superset does not
+    // contains the subset for this case.
+    ContainsParameter scalars2;
+    scalars2.subset = scalars1.superset;
+    scalars2.superset = scalars1.subset;
+    scalars2.totalOperations = 5000;
+
+    // Test a typical vector of scalars, the superset is same
+    // as the subset for this case.
+    ContainsParameter scalars3;
+    scalars3.subset = scalars1.subset;
+    scalars3.superset = scalars1.subset;
+    scalars3.totalOperations = 5000;
+
+    // TODO(bmahler): Increase the port rangae to [1-64,000] once
+    // performance is improved such that this doesn't take a
+    // long time to run.
+
+    // Create a fragmented range for ports resources.
+    Try<::mesos::Value::Ranges> range_ =
+      fragment(createRange(1, 16000), 16000/2);
+
+    // Test a typical vector of a fragment range of ports, the superset
+    // contains the subset for this case.
+    ContainsParameter range1;
+    range1.subset = createPorts(range_.get());
+    range1.superset = Resources::parse("ports", "[1-16000]", "*").get();
+    range1.totalOperations = 100;
+
+    // Test a typical vector of a fragment range of ports, the superset
+    // does not contain the subset for this case.
+    ContainsParameter range2;
+    range2.subset = range1.superset;
+    range2.superset = range1.subset;
+    range2.totalOperations = 50;
+
+    // Test a typical vector of a fragment range of ports, the superset
+    // is same as the subset for this case.
+    ContainsParameter range3;
+    range3.subset = range1.subset;
+    range3.superset = range1.subset;
+    range3.totalOperations = 1;
+
+    // Test mixed resources including both scalar and ports resources,
+    // the superset contains the subset for this case.
+    ContainsParameter mixed1;
+    mixed1.subset = scalars1.subset + range1.subset;
+    mixed1.superset = scalars1.superset + range1.superset;
+    mixed1.totalOperations = 100;
+
+    // Test mixed resources including both scalar and ports resources,
+    // the superset contains the subset for this case.
+    ContainsParameter mixed2;
+    mixed2.subset = mixed1.superset;
+    mixed2.superset = mixed1.subset;
+    mixed2.totalOperations = 50;
+
+    // Test mixed resources including both scalar and ports resources,
+    // the superset is same as the subset for this case.
+    ContainsParameter mixed3;
+    mixed3.subset = mixed1.subset;
+    mixed3.superset = mixed1.subset;
+    mixed3.totalOperations = 1;
+
+    parameters_.push_back(std::move(scalars1));
+    parameters_.push_back(std::move(scalars2));
+    parameters_.push_back(std::move(scalars3));
+    parameters_.push_back(std::move(range1));
+    parameters_.push_back(std::move(range2));
+    parameters_.push_back(std::move(range3));
+    parameters_.push_back(std::move(mixed1));
+    parameters_.push_back(std::move(mixed2));
+    parameters_.push_back(std::move(mixed3));
+
+    return parameters_;
+  }
+};
+
+
+// The Resources `contains` benchmark tests are parameterized by
+// the 'Resources' object to apply operations to.
+INSTANTIATE_TEST_CASE_P(
+    ResourcesContains,
+    Resources_Contains_BENCHMARK_Test,
+    ::testing::ValuesIn(Resources_Contains_BENCHMARK_Test::parameters()));
+
+
+TEST_P(Resources_Contains_BENCHMARK_Test, Contains)
+{
+  const Resources& subset = GetParam().subset;
+  const Resources& superset = GetParam().superset;
+  size_t totalOperations = GetParam().totalOperations;
+
+  Stopwatch watch;
+
+  watch.start();
+  for (size_t i = 0; i < totalOperations; i++) {
+    superset.contains(subset);
+  }
+  watch.stop();
+
+  cout << "Took " << watch.elapsed()
+       << " to perform " << totalOperations
+       << " 'superset.contains(subset)' operations on superset resources "
+       << abbreviate(stringify(superset), 50)
+       << " contains subset resources " << abbreviate(stringify(subset), 50)
+       << endl;
 }
 
 } // namespace tests {

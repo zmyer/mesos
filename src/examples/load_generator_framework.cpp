@@ -224,12 +224,12 @@ private:
 };
 
 
-class Flags : public mesos::internal::logging::Flags
+class Flags : public virtual mesos::internal::logging::Flags
 {
 public:
   Flags()
   {
-    add(&master,
+    add(&Flags::master,
         "master",
         "Required. The master to connect to. May be one of:\n"
         "  master@addr:port (The PID of the master)\n"
@@ -297,7 +297,7 @@ int main(int argc, char** argv)
   }
 
   if (flags.master.isNone()) {
-    cerr << flags.usage( "Missing required option --master") << endl;
+    cerr << flags.usage("Missing required option --master") << endl;
     return EXIT_FAILURE;
   }
 

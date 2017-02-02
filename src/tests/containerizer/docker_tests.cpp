@@ -14,6 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <list>
+#include <string>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 #include <process/future.hpp>
@@ -37,6 +41,7 @@ using namespace process;
 
 using std::list;
 using std::string;
+using std::vector;
 
 namespace mesos {
 namespace internal {
@@ -156,10 +161,7 @@ TEST_F(DockerTest, ROOT_DOCKER_interface)
   Future<Nothing> stop = docker->stop(containerName);
   AWAIT_READY(stop);
 
-  AWAIT_READY(status);
-  ASSERT_SOME(status.get());
-  EXPECT_TRUE(WIFEXITED(status->get())) << status->get();
-  EXPECT_EQ(128 + SIGKILL, WEXITSTATUS(status->get())) << status->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(128 + SIGKILL, status);
 
   // Now, the container should not appear in the result of ps().
   // But it should appear in the result of ps(true).
@@ -235,10 +237,7 @@ TEST_F(DockerTest, ROOT_DOCKER_interface)
   rm = docker->rm(containerName, true);
   AWAIT_READY(rm);
 
-  AWAIT_READY(status);
-  ASSERT_SOME(status.get());
-  EXPECT_TRUE(WIFEXITED(status->get())) << status->get();
-  EXPECT_EQ(128 + SIGKILL, WEXITSTATUS(status->get())) << status->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(128 + SIGKILL, status);
 
   // Verify that the container is totally removed, that is we can't
   // find it by ps() or ps(true).
@@ -302,10 +301,7 @@ TEST_F(DockerTest, ROOT_DOCKER_kill)
 
   AWAIT_READY(kill);
 
-  AWAIT_READY(run);
-  ASSERT_SOME(run.get());
-  EXPECT_TRUE(WIFEXITED(run->get())) << run->get();
-  EXPECT_EQ(128 + SIGKILL, WEXITSTATUS(run->get())) << run->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(128 + SIGKILL, run);
 }
 
 
@@ -425,10 +421,7 @@ TEST_F(DockerTest, ROOT_DOCKER_CheckPortResource)
       "/mnt/mesos/sandbox",
       resources);
 
-  AWAIT_READY(run);
-  ASSERT_SOME(run.get());
-  EXPECT_TRUE(WIFEXITED(run->get())) << run->get();
-  EXPECT_EQ(0, WEXITSTATUS(run->get())) << run->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, run);
 }
 
 
@@ -505,10 +498,7 @@ TEST_F(DockerTest, ROOT_DOCKER_MountRelativeHostPath)
       directory.get(),
       "/mnt/mesos/sandbox");
 
-  AWAIT_READY(run);
-  ASSERT_SOME(run.get());
-  EXPECT_TRUE(WIFEXITED(run->get())) << run->get();
-  EXPECT_EQ(0, WEXITSTATUS(run->get())) << run->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, run);
 }
 
 
@@ -551,10 +541,7 @@ TEST_F(DockerTest, ROOT_DOCKER_MountAbsoluteHostPath)
       directory.get(),
       "/mnt/mesos/sandbox");
 
-  AWAIT_READY(run);
-  ASSERT_SOME(run.get());
-  EXPECT_TRUE(WIFEXITED(run->get())) << run->get();
-  EXPECT_EQ(0, WEXITSTATUS(run->get())) << run->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, run);
 }
 
 
@@ -598,10 +585,7 @@ TEST_F(DockerTest, ROOT_DOCKER_MountRelativeContainerPath)
       directory.get(),
       "/mnt/mesos/sandbox");
 
-  AWAIT_READY(run);
-  ASSERT_SOME(run.get());
-  EXPECT_TRUE(WIFEXITED(run->get())) << run->get();
-  EXPECT_EQ(0, WEXITSTATUS(run->get())) << run->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, run);
 }
 
 
@@ -816,10 +800,7 @@ TEST_F(DockerTest, ROOT_DOCKER_NVIDIA_GPU_DeviceAllow)
       None(),
       devices);
 
-  AWAIT_READY(status);
-  ASSERT_SOME(status.get());
-  EXPECT_TRUE(WIFEXITED(status->get())) << status->get();
-  EXPECT_EQ(0, WEXITSTATUS(status->get())) << status->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(0, status);
 }
 
 
@@ -887,10 +868,7 @@ TEST_F(DockerTest, ROOT_DOCKER_NVIDIA_GPU_InspectDevices)
 
   AWAIT_READY(docker->kill(containerName, SIGKILL));
 
-  AWAIT_READY(status);
-  ASSERT_SOME(status.get());
-  EXPECT_TRUE(WIFEXITED(status->get())) << status->get();
-  EXPECT_EQ(128 + SIGKILL, WEXITSTATUS(status->get())) << status->get();
+  AWAIT_EXPECT_WEXITSTATUS_EQ(128 + SIGKILL, status);
 }
 
 

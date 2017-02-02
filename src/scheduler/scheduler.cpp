@@ -14,14 +14,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __WINDOWS__
 #include <dlfcn.h>
+#endif // __WINDOWS__
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef __WINDOWS__
 #include <unistd.h>
+#endif // __WINDOWS__
 
+#ifndef __WINDOWS__
 #include <arpa/inet.h>
+#endif // __WINDOWS__
 
 #include <iostream>
 #include <memory>
@@ -50,6 +56,8 @@
 
 #include <process/metrics/gauge.hpp>
 #include <process/metrics/metrics.hpp>
+
+#include <process/ssl/flags.hpp>
 
 #include <stout/check.hpp>
 #include <stout/duration.hpp>
@@ -447,13 +455,10 @@ protected:
       string scheme = "http";
 
 #ifdef USE_SSL_SOCKET
-      Option<string> value;
-
-      value = os::getenv("SSL_ENABLED");
-      if (value.isSome() && (value.get() == "1" || value.get() == "true")) {
+      if (process::network::openssl::flags().enabled) {
         scheme = "https";
       }
-#endif
+#endif // USE_SSL_SOCKET
 
       master = ::URL(
         scheme,
@@ -638,7 +643,7 @@ protected:
     }
 
     // This could happen if the master failed over after sending an event.
-    if (!event->isSome()) {
+    if (event->isNone()) {
       const string error = "End-Of-File received from master. The master "
                            "closed the event stream";
       LOG(ERROR) << error;

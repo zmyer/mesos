@@ -23,27 +23,29 @@ set(PROCESS_TESTS_SRC
   decoder_tests.cpp
   encoder_tests.cpp
   future_tests.cpp
+  http_tests.cpp
   limiter_tests.cpp
+  loop_tests.cpp
+  metrics_tests.cpp
   mutex_tests.cpp
   owned_tests.cpp
+  process_tests.cpp
   queue_tests.cpp
+  sequence_tests.cpp
   shared_tests.cpp
+  socket_tests.cpp
   statistics_tests.cpp
   subprocess_tests.cpp
   system_tests.cpp
-  timeseries_tests.cpp
   time_tests.cpp
+  timeseries_tests.cpp
   )
 
 if (NOT WIN32)
   set(PROCESS_TESTS_SRC
     ${PROCESS_TESTS_SRC}
-    http_tests.cpp
     io_tests.cpp
-    metrics_tests.cpp
-    process_tests.cpp
     reap_tests.cpp
-    sequence_tests.cpp
     )
 endif (NOT WIN32)
 
@@ -62,9 +64,18 @@ include_directories(${PROCESS_TEST_INCLUDE_DIRS})
 ###########################################################################
 link_directories(${PROCESS_TEST_LIB_DIRS})
 
-# THE PROCESS TEST EXECUTABLE (generates, e.g., process_tests, etc., on Linux).
+# THE PROCESS TEST EXECUTABLE (generates, e.g., libprocess-tests, etc., on Linux).
 ###############################################################################
 add_executable(${PROCESS_TESTS_TARGET} ${PROCESS_TESTS_SRC})
+
+GROUP_STOUT_HEADERS()
+GROUP_PROCESS_HEADERS()
+
+GROUP_SOURCE(
+  "tests"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "*.[ch]*")
 
 # ADD LINKER FLAGS (generates, e.g., -lglog on Linux).
 ######################################################
@@ -82,4 +93,4 @@ add_dependencies(${PROCESS_TESTS_TARGET} test-linkee)
 
 # ADD TEST TARGET (runs when you do, e.g., `make check`).
 #########################################################
-add_test(NAME ProcessTests COMMAND ./${PROCESS_TESTS_TARGET})
+add_test(NAME ProcessTests COMMAND ${PROCESS_TESTS_TARGET})

@@ -32,6 +32,8 @@
 #include <stout/lambda.hpp>
 #include <stout/option.hpp>
 
+#include "common/protobuf_utils.hpp"
+
 #include "master/allocator/mesos/allocator.hpp"
 #include "master/allocator/mesos/metrics.hpp"
 
@@ -109,7 +111,8 @@ public:
   void addFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
-      const hashmap<SlaveID, Resources>& used);
+      const hashmap<SlaveID, Resources>& used,
+      bool active);
 
   void removeFramework(
       const FrameworkID& frameworkId);
@@ -211,20 +214,32 @@ protected:
   // Callback for doing batch allocations.
   void batch();
 
-  // Allocate any allocatable resources.
-  void allocate();
+  // Allocate any allocatable resources from all known agents.
+  process::Future<Nothing> allocate();
 
-  // Allocate resources just from the specified slave.
-  void allocate(const SlaveID& slaveId);
+  // Allocate resources from the specified agent.
+  process::Future<Nothing> allocate(const SlaveID& slaveId);
 
-  // Allocate resources from the specified slaves.
-  void allocate(const hashset<SlaveID>& slaveIds);
+  // Allocate resources from the specified agents. The allocation
+  // is deferred and batched with other allocation requests.
+  process::Future<Nothing> allocate(const hashset<SlaveID>& slaveIds);
 
-  // Send inverse offers from the specified slaves.
-  void deallocate(const hashset<SlaveID>& slaveIds);
+  // Method that performs allocation work.
+  Nothing _allocate();
+
+  // Helper for `_allocate()` that allocates resources for offers.
+  void __allocate();
+
+  // Helper for `_allocate()` that deallocates resources for inverse offers.
+  void deallocate();
 
   // Remove an offer filter for the specified framework.
   void expire(
+      const FrameworkID& frameworkId,
+      const SlaveID& slaveId,
+      OfferFilter* offerFilter);
+
+  void _expire(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       OfferFilter* offerFilter);
@@ -254,7 +269,7 @@ protected:
       const FrameworkID& frameworkID,
       const SlaveID& slaveID);
 
-  bool allocatable(const Resources& resources);
+  static bool allocatable(const Resources& resources);
 
   bool initialized;
   bool paused;
@@ -282,15 +297,7 @@ protected:
     // Whether the framework suppresses offers.
     bool suppressed;
 
-    // Whether the framework desires revocable resources.
-    bool revocable;
-
-    // Whether the framework is aware of GPU resources. See
-    // the documentation for the GPU_RESOURCES Capability.
-    bool gpuAware;
-
-    // Whether the framework desires shared resources.
-    bool shared;
+    protobuf::framework::Capabilities capabilities;
 
     // Active offer and inverse offer filters for the framework.
     hashmap<SlaveID, hashset<OfferFilter*>> offerFilters;
@@ -342,6 +349,10 @@ protected:
     //
     // Note that it's possible for the slave to be over-allocated!
     // In this case, allocated > total.
+    Resources available() const
+    {
+      return total - allocated;
+    }
 
     bool activated;  // Whether to offer resources.
 
@@ -385,6 +396,15 @@ protected:
   };
 
   hashmap<SlaveID, Slave> slaves;
+
+  // A set of agents that are kept as allocation candidates. Events
+  // may add or remove candidates to the set. When an allocation is
+  // processed, the set of candidates is cleared.
+  hashset<SlaveID> allocationCandidates;
+
+  // Future for the dispatched allocation that becomes
+  // ready after the allocation run is complete.
+  Option<process::Future<Nothing>> allocation;
 
   // Number of registered frameworks for each role. When a role's active
   // count drops to zero, it is removed from this map; the role is also

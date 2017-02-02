@@ -243,6 +243,27 @@ We'd like to thank the following committers to the Apache Mesos project who have
       <td></td>
       <td>matei@apache.org</td>
     </tr>
+    <tr>
+      <td>+8</td>
+      <td>Qian Zhang</td>
+      <td>IBM</td>
+      <td></td>
+      <td>qianzhang@apache.org</td>
+    </tr>
+    <tr>
+      <td>+8</td>
+      <td>Haosdent Huang</td>
+      <td>Shopee</td>
+      <td>haosdent</td>
+      <td>haosdent@apache.org</td>
+    </tr>
+    <tr>
+      <td>+8</td>
+      <td>Guangya Liu</td>
+      <td>IBM</td>
+      <td>gyliu513</td>
+      <td>gyliu@apache.org</td>
+    </tr>
   </tbody>
 </table>
 
@@ -344,7 +365,7 @@ committers to learn about areas of the code that they are unfamiliar with.
     </tr>
     <tr>
       <td>WebUI</td>
-      <td><i>maintainers needed</i></td>
+      <td>Haosdent Huang</td>
     </tr>
     <tr>
       <td>Project Website</td>

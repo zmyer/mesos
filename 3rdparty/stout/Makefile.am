@@ -12,6 +12,22 @@
 
 # Makefile for stout.
 
+# Enable common (and some language specific) warnings.
+AM_CXXFLAGS = -Wall
+# Warn when a comparison is made between signed and unsigned values.
+AM_CXXFLAGS += -Wsign-compare
+# Warn about use of format functions that can produce security issues.
+AM_CXXFLAGS += -Wformat-security
+
+# We will also have much more hardened/secured binaries and libraries.
+if ENABLE_HARDENING
+# Protect many of the functions with stack guards
+# (either -fstack-protector-strong or -fstack-protector depending on compiler support).
+AM_CXXFLAGS += @STACK_PROTECTOR@
+# Produce position independent code when appropriate.
+AM_CXXFLAGS += -fPIC -fPIE
+endif
+
 AUTOMAKE_OPTIONS = foreign
 
 if STANDALONE_STOUT
@@ -26,6 +42,8 @@ endif
 # subdirectory to make it easy to preserve the directory structure of
 # the header files during installation.
 SUBDIRS = $(MAYBE_3RDPARTY) . include
+
+PHONY_TARGETS =
 
 include ../versions.am
 
@@ -102,6 +120,7 @@ stout_tests_SOURCES =			\
   tests/adaptor_tests.cpp		\
   tests/base64_tests.cpp		\
   tests/bits_tests.cpp			\
+  tests/boundedhashmap_tests.cpp	\
   tests/bytes_tests.cpp			\
   tests/cache_tests.cpp			\
   tests/duration_tests.cpp		\
@@ -188,10 +207,12 @@ BUILT_SOURCES = $(BUNDLED_DEPS)
 # See the following discussion for the workaround:
 # http://lists.gnu.org/archive/html/automake/2013-01/msg00051.html
 check-local: tests
-	./stout-tests
+	$(TEST_DRIVER) ./stout-tests
 
 tests: $(BUNDLED_DEPS)
 	$(MAKE) $(AM_MAKEFLAGS) stout-tests
+
+PHONY_TARGETS += tests
 
 all-local: Makefile
 
@@ -213,3 +234,5 @@ dist-hook:
 if !STANDALONE_STOUT
 	cp -r $(srcdir)/3rdparty $(distdir)/
 endif
+
+.PHONY: $(PHONY_TARGETS)

@@ -21,6 +21,14 @@
 #include <stout/result.hpp>
 #include <stout/try.hpp>
 
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/wait.h>
+#endif
+
+#ifdef __WINDOWS__
+#include <stout/windows.hpp>
+#endif
 
 template <typename T>
 ::testing::AssertionResult AssertSome(
@@ -171,5 +179,247 @@ template <typename T1, typename T2>
 
 #define EXPECT_NONE(actual)                     \
   EXPECT_TRUE(actual.isNone())
+
+
+// Creates a gtest `TEST` that is disabled on Windows.
+// TODO(hausdorff): Remove after temporarily-disabled tests are fixed on
+// Windows. See MESOS-6392.
+#ifndef __WINDOWS__
+#define TEST_TEMP_DISABLED_ON_WINDOWS(test_case_name, test_name) \
+  TEST(test_case_name, test_name)
+#else
+#define TEST_TEMP_DISABLED_ON_WINDOWS(test_case_name, test_name) \
+  TEST(test_case_name, DISABLED_##test_name)
+#endif // __WINDOWS__
+
+
+// Creates a gtest `TEST_F` that is disabled on Windows.
+// TODO(hausdorff): Remove after temporarily-disabled tests are fixed on
+// Windows. See MESOS-6392.
+#ifndef __WINDOWS__
+#define TEST_F_TEMP_DISABLED_ON_WINDOWS(test_case_name, test_name) \
+  TEST_F(test_case_name, test_name)
+#else
+#define TEST_F_TEMP_DISABLED_ON_WINDOWS(test_case_name, test_name) \
+  TEST_F(test_case_name, DISABLED_##test_name)
+#endif // __WINDOWS__
+
+
+// Creates a gtest `TEST_P` that is disabled on Windows.
+// TODO(greggomann): Remove after temporarily-disabled tests are fixed on
+// Windows. See MESOS-6392.
+#ifndef __WINDOWS__
+#define TEST_P_TEMP_DISABLED_ON_WINDOWS(test_case_name, test_name) \
+  TEST_P(test_case_name, test_name)
+#else
+#define TEST_P_TEMP_DISABLED_ON_WINDOWS(test_case_name, test_name) \
+  TEST_P(test_case_name, DISABLED_##test_name)
+#endif // __WINDOWS__
+
+
+// NOTE: On Windows, the closest equivalent to `sleep` is `timeout`.
+// Unfortunately, `timeout` requires an interactive terminal, otherwise
+// it errors out immediately. Instead, we use `ping` against localhost
+// with a count.  On Windows, `ping` waits one second between pings.
+// Additionally, because `ping` requires a count greater than 0,
+// we simply `exit 0` if the sleep is too short.
+#ifndef __WINDOWS__
+#define SLEEP_COMMAND(x) "sleep " #x
+#else
+#define SLEEP_COMMAND(x) (x > 0 ? "ping 127.0.0.1 -n " #x : "cmd /C exit 0")
+#endif // __WINDOWS__
+
+
+inline ::testing::AssertionResult AssertExited(
+    const char* actualExpr,
+    const int actual)
+{
+  if (WIFEXITED(actual)) {
+    return ::testing::AssertionSuccess();
+  } else if (WIFSIGNALED(actual)) {
+    return ::testing::AssertionFailure()
+      << "Expecting WIFEXITED(" << actualExpr << ") but "
+      << " WIFSIGNALED(" << actualExpr << ") is true and "
+      << "WTERMSIG(" << actualExpr << ") is " << strsignal(WTERMSIG(actual));
+  } else if (WIFSTOPPED(actual)) {
+    return ::testing::AssertionFailure()
+      << "Expecting WIFEXITED(" << actualExpr << ") but"
+      << " WIFSTOPPED(" << actualExpr << ") is true and "
+      << "WSTOPSIG(" << actualExpr << ") is " << strsignal(WSTOPSIG(actual));
+  }
+
+  return ::testing::AssertionFailure()
+    << "Expecting WIFEXITED(" << actualExpr << ") but got"
+    << " unknown value: " << ::testing::PrintToString(actual);
+}
+
+
+#define ASSERT_EXITED(expected, actual)                 \
+  ASSERT_PRED_FORMAT2(AssertExited, expected, actual)
+
+
+#define EXPECT_EXITED(expected, actual)                 \
+  EXPECT_PRED_FORMAT2(AssertExited, expected, actual)
+
+
+inline ::testing::AssertionResult AssertExitStatusEq(
+    const char* expectedExpr,
+    const char* actualExpr,
+    const int expected,
+    const int actual)
+{
+  const ::testing::AssertionResult result = AssertExited(actualExpr, actual);
+
+  if (result) {
+    if (WEXITSTATUS(actual) == expected) {
+      return ::testing::AssertionSuccess();
+    } else {
+      return ::testing::AssertionFailure()
+        << "Value of: WEXITSTATUS(" << actualExpr << ")\n"
+        << "  Actual: " << ::testing::PrintToString(WEXITSTATUS(actual)) << "\n"
+        << "Expected: " << expectedExpr << "\n"
+        << "Which is: " << ::testing::PrintToString(expected);
+    }
+  }
+
+  return result;
+}
+
+
+#define ASSERT_WEXITSTATUS_EQ(expected, actual)                 \
+  ASSERT_PRED_FORMAT2(AssertExitStatusEq, expected, actual)
+
+
+#define EXPECT_WEXITSTATUS_EQ(expected, actual)                 \
+  EXPECT_PRED_FORMAT2(AssertExitStatusEq, expected, actual)
+
+
+
+inline ::testing::AssertionResult AssertExitStatusNe(
+    const char* expectedExpr,
+    const char* actualExpr,
+    const int expected,
+    const int actual)
+{
+  const ::testing::AssertionResult result = AssertExited(actualExpr, actual);
+
+  if (result) {
+    if (WEXITSTATUS(actual) != expected) {
+      return ::testing::AssertionSuccess();
+    } else {
+      return ::testing::AssertionFailure()
+        << "Value of: WEXITSTATUS(" << actualExpr << ")\n"
+        << "  Actual: " << ::testing::PrintToString(WEXITSTATUS(actual)) << "\n"
+        << "Expected: " << expectedExpr << "\n"
+        << "Which is: " << ::testing::PrintToString(expected);
+    }
+  }
+
+  return result;
+}
+
+
+#define ASSERT_WEXITSTATUS_NE(expected, actual)                 \
+  ASSERT_PRED_FORMAT2(AssertExitStatusNe, expected, actual)
+
+
+#define EXPECT_WEXITSTATUS_NE(expected, actual)                 \
+  EXPECT_PRED_FORMAT2(AssertExitStatusNe, expected, actual)
+
+
+inline ::testing::AssertionResult AssertSignaled(
+    const char* actualExpr,
+    const int actual)
+{
+  if (WIFEXITED(actual)) {
+    return ::testing::AssertionFailure()
+      << "Expecting WIFSIGNALED(" << actualExpr << ") but "
+      << " WIFEXITED(" << actualExpr << ") is true and "
+      << "WEXITSTATUS(" << actualExpr << ") is " << WEXITSTATUS(actual);
+  } else if (WIFSIGNALED(actual)) {
+    return ::testing::AssertionSuccess();
+  } else if (WIFSTOPPED(actual)) {
+    return ::testing::AssertionFailure()
+      << "Expecting WIFSIGNALED(" << actualExpr << ") but"
+      << " WIFSTOPPED(" << actualExpr << ") is true and "
+      << "WSTOPSIG(" << actualExpr << ") is " << strsignal(WSTOPSIG(actual));
+  }
+
+  return ::testing::AssertionFailure()
+    << "Expecting WIFSIGNALED(" << actualExpr << ") but got"
+    << " unknown value: " << ::testing::PrintToString(actual);
+}
+
+
+#define ASSERT_SIGNALED(expected, actual)               \
+  ASSERT_PRED_FORMAT2(AssertSignaled, expected, actual)
+
+
+#define EXPECT_SIGNALED(expected, actual)               \
+  EXPECT_PRED_FORMAT2(AssertSignaled, expected, actual)
+
+
+inline ::testing::AssertionResult AssertTermSigEq(
+    const char* expectedExpr,
+    const char* actualExpr,
+    const int expected,
+    const int actual)
+{
+  const ::testing::AssertionResult result = AssertSignaled(actualExpr, actual);
+
+  if (result) {
+    if (WTERMSIG(actual) == expected) {
+      return ::testing::AssertionSuccess();
+    } else {
+      return ::testing::AssertionFailure()
+        << "Value of: WTERMSIG(" << actualExpr << ")\n"
+        << "  Actual: " << strsignal(WTERMSIG(actual)) << "\n"
+        << "Expected: " << expectedExpr << "\n"
+        << "Which is: " << strsignal(expected);
+    }
+  }
+
+  return result;
+}
+
+
+#define ASSERT_WTERMSIG_EQ(expected, actual)                    \
+  ASSERT_PRED_FORMAT2(AssertTermSigEq, expected, actual)
+
+
+#define EXPECT_WTERMSIG_EQ(expected, actual)                    \
+  EXPECT_PRED_FORMAT2(AssertTermSigEq, expected, actual)
+
+
+inline ::testing::AssertionResult AssertTermSigNe(
+    const char* expectedExpr,
+    const char* actualExpr,
+    const int expected,
+    const int actual)
+{
+  const ::testing::AssertionResult result = AssertSignaled(actualExpr, actual);
+
+  if (result) {
+    if (WTERMSIG(actual) != expected) {
+      return ::testing::AssertionSuccess();
+    } else {
+      return ::testing::AssertionFailure()
+        << "Value of: WTERMSIG(" << actualExpr << ")\n"
+        << "  Actual: " << strsignal(WTERMSIG(actual)) << "\n"
+        << "Expected: " << expectedExpr << "\n"
+        << "Which is: " << strsignal(expected);
+    }
+  }
+
+  return result;
+}
+
+
+#define ASSERT_WTERMSIG_NE(expected, actual)                    \
+  ASSERT_PRED_FORMAT2(AssertTermSigNe, expected, actual)
+
+
+#define EXPECT_WTERMSIG_NE(expected, actual)                    \
+  EXPECT_PRED_FORMAT2(AssertTermSigNe, expected, actual)
 
 #endif // __STOUT_GTEST_HPP__

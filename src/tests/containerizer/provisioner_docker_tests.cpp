@@ -28,6 +28,12 @@
 
 #include <mesos/docker/spec.hpp>
 
+#ifdef __linux__
+#include "linux/fs.hpp"
+#endif
+
+#include "slave/containerizer/mesos/provisioner/constants.hpp"
+
 #include "slave/containerizer/mesos/provisioner/docker/metadata_manager.hpp"
 #include "slave/containerizer/mesos/provisioner/docker/paths.hpp"
 #include "slave/containerizer/mesos/provisioner/docker/puller.hpp"
@@ -55,6 +61,10 @@ using process::Promise;
 
 using master::Master;
 
+using mesos::internal::slave::AUFS_BACKEND;
+using mesos::internal::slave::COPY_BACKEND;
+using mesos::internal::slave::OVERLAY_BACKEND;
+
 using mesos::master::detector::MasterDetector;
 
 using slave::ImageInfo;
@@ -63,6 +73,8 @@ using slave::Slave;
 using slave::docker::Puller;
 using slave::docker::RegistryPuller;
 using slave::docker::Store;
+
+using testing::WithParamInterface;
 
 namespace mesos {
 namespace internal {
@@ -78,11 +90,13 @@ public:
     // Verify contents of the image in store directory.
     const string layerPath1 = paths::getImageLayerRootfsPath(
         flags.docker_store_dir,
-        "123");
+        "123",
+        COPY_BACKEND);
 
     const string layerPath2 = paths::getImageLayerRootfsPath(
         flags.docker_store_dir,
-        "456");
+        "456",
+        COPY_BACKEND);
 
     EXPECT_TRUE(os::exists(layerPath1));
     EXPECT_TRUE(os::exists(layerPath2));
@@ -176,6 +190,7 @@ TEST_F(ProvisionerDockerLocalStoreTest, LocalStoreTestWithTar)
   slave::Flags flags;
   flags.docker_registry = archivesDir;
   flags.docker_store_dir = path::join(os::getcwd(), "store");
+  flags.image_provisioner_backend = COPY_BACKEND;
 
   Try<Owned<slave::Store>> store = slave::docker::Store::create(flags);
   ASSERT_SOME(store);
@@ -184,7 +199,9 @@ TEST_F(ProvisionerDockerLocalStoreTest, LocalStoreTestWithTar)
   mesosImage.set_type(Image::DOCKER);
   mesosImage.mutable_docker()->set_name("abc");
 
-  Future<slave::ImageInfo> imageInfo = store.get()->get(mesosImage);
+  Future<slave::ImageInfo> imageInfo =
+    store.get()->get(mesosImage, COPY_BACKEND);
+
   AWAIT_READY(imageInfo);
 
   verifyLocalDockerImage(flags, imageInfo.get().layers);
@@ -198,6 +215,7 @@ TEST_F(ProvisionerDockerLocalStoreTest, MetadataManagerInitialization)
   slave::Flags flags;
   flags.docker_registry = path::join(os::getcwd(), "images");
   flags.docker_store_dir = path::join(os::getcwd(), "store");
+  flags.image_provisioner_backend = COPY_BACKEND;
 
   Try<Owned<slave::Store>> store = slave::docker::Store::create(flags);
   ASSERT_SOME(store);
@@ -206,7 +224,7 @@ TEST_F(ProvisionerDockerLocalStoreTest, MetadataManagerInitialization)
   image.set_type(Image::DOCKER);
   image.mutable_docker()->set_name("abc");
 
-  Future<slave::ImageInfo> imageInfo = store.get()->get(image);
+  Future<slave::ImageInfo> imageInfo = store.get()->get(image, COPY_BACKEND);
   AWAIT_READY(imageInfo);
 
   // Store is deleted and recreated. Metadata Manager is initialized upon
@@ -217,7 +235,7 @@ TEST_F(ProvisionerDockerLocalStoreTest, MetadataManagerInitialization)
   Future<Nothing> recover = store.get()->recover();
   AWAIT_READY(recover);
 
-  imageInfo = store.get()->get(image);
+  imageInfo = store.get()->get(image, COPY_BACKEND);
   AWAIT_READY(imageInfo);
   verifyLocalDockerImage(flags, imageInfo.get().layers);
 }
@@ -228,21 +246,23 @@ class MockPuller : public Puller
 public:
   MockPuller()
   {
-    EXPECT_CALL(*this, pull(_, _))
+    EXPECT_CALL(*this, pull(_, _, _))
       .WillRepeatedly(Invoke(this, &MockPuller::unmocked_pull));
   }
 
   virtual ~MockPuller() {}
 
-  MOCK_METHOD2(
+  MOCK_METHOD3(
       pull,
       Future<vector<string>>(
           const spec::ImageReference&,
+          const string&,
           const string&));
 
   Future<vector<string>> unmocked_pull(
       const spec::ImageReference& reference,
-      const string& directory)
+      const string& directory,
+      const string& backend)
   {
     // TODO(gilbert): Allow return list to be overridden.
     return vector<string>();
@@ -269,7 +289,7 @@ TEST_F(ProvisionerDockerLocalStoreTest, PullingSameImageSimutanuously)
   Future<string> directory;
   Promise<vector<string>> promise;
 
-  EXPECT_CALL(*puller, pull(_, _))
+  EXPECT_CALL(*puller, pull(_, _, _))
     .WillOnce(testing::DoAll(FutureSatisfy(&pull),
                              FutureArg<1>(&directory),
                              Return(promise.future())));
@@ -282,7 +302,9 @@ TEST_F(ProvisionerDockerLocalStoreTest, PullingSameImageSimutanuously)
   mesosImage.set_type(Image::DOCKER);
   mesosImage.mutable_docker()->set_name("abc");
 
-  Future<slave::ImageInfo> imageInfo1 = store.get()->get(mesosImage);
+  Future<slave::ImageInfo> imageInfo1 =
+    store.get()->get(mesosImage, COPY_BACKEND);
+
   AWAIT_READY(pull);
   AWAIT_READY(directory);
 
@@ -303,7 +325,8 @@ TEST_F(ProvisionerDockerLocalStoreTest, PullingSameImageSimutanuously)
       os::write(path::join(layerPath, "json"), stringify(manifest)));
 
   ASSERT_TRUE(imageInfo1.isPending());
-  Future<slave::ImageInfo> imageInfo2 = store.get()->get(mesosImage);
+  Future<slave::ImageInfo> imageInfo2 =
+    store.get()->get(mesosImage, COPY_BACKEND);
 
   const vector<string> result = {"456"};
 
@@ -550,85 +573,6 @@ TEST_F(ProvisionerDockerPullerTest, ROOT_INTERNET_CURL_Normalize)
 }
 
 
-// This test verifies that any docker image containing whiteout files
-// will be processed correctly.
-TEST_F(ProvisionerDockerPullerTest, ROOT_INTERNET_CURL_Whiteout)
-{
-  Try<Owned<cluster::Master>> master = StartMaster();
-  ASSERT_SOME(master);
-
-  slave::Flags flags = CreateSlaveFlags();
-  flags.isolation = "docker/runtime,filesystem/linux";
-  flags.image_providers = "docker";
-
-  Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
-  ASSERT_SOME(slave);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  EXPECT_CALL(sched, registered(&driver, _, _));
-
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
-
-  driver.start();
-
-  AWAIT_READY(offers);
-  ASSERT_EQ(1u, offers->size());
-
-  const Offer& offer = offers.get()[0];
-
-  // We are using the docker image 'cirros' to verify that
-  // the symlink /etc/rc3.d/S40-network does not exist in
-  // container's rootfs because it is labeled by a '.wh.'
-  // whiteout file, and both should be removed.
-  CommandInfo command;
-  command.set_shell(false);
-  command.set_value("/usr/bin/test");
-  command.add_arguments("test");
-  command.add_arguments("!");
-  command.add_arguments("-f");
-  command.add_arguments("/etc/rc3.d/S40-network");
-
-  TaskInfo task = createTask(
-      offer.slave_id(),
-      Resources::parse("cpus:1;mem:128").get(),
-      command);
-
-  Image image;
-  image.set_type(Image::DOCKER);
-  image.mutable_docker()->set_name("cirros");
-
-  ContainerInfo* container = task.mutable_container();
-  container->set_type(ContainerInfo::MESOS);
-  container->mutable_mesos()->mutable_image()->CopyFrom(image);
-
-  Future<TaskStatus> statusRunning;
-  Future<TaskStatus> statusFinished;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&statusRunning))
-    .WillOnce(FutureArg<1>(&statusFinished));
-
-  driver.launchTasks(offer.id(), {task});
-
-  AWAIT_READY_FOR(statusRunning, Seconds(60));
-  EXPECT_EQ(task.task_id(), statusRunning->task_id());
-  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
-
-  AWAIT_READY(statusFinished);
-  EXPECT_EQ(task.task_id(), statusFinished->task_id());
-  EXPECT_EQ(TASK_FINISHED, statusFinished->state());
-
-  driver.stop();
-  driver.join();
-}
-
-
 // This test verifies that the scratch based docker image (that
 // only contain a single binary and its dependencies) can be
 // launched correctly.
@@ -677,6 +621,200 @@ TEST_F(ProvisionerDockerPullerTest, ROOT_INTERNET_CURL_ScratchImage)
   // 'hello-world' is a scratch image. It contains only one
   // binary 'hello' in its rootfs.
   image.mutable_docker()->set_name("hello-world");
+
+  ContainerInfo* container = task.mutable_container();
+  container->set_type(ContainerInfo::MESOS);
+  container->mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(task.task_id(), statusRunning->task_id());
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  AWAIT_READY(statusFinished);
+  EXPECT_EQ(task.task_id(), statusFinished->task_id());
+  EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  driver.stop();
+  driver.join();
+}
+
+
+class ProvisionerDockerWhiteoutTest
+  : public MesosTest,
+    public WithParamInterface<string>
+{
+public:
+  // Returns the supported backends.
+  static vector<string> parameters()
+  {
+    vector<string> backends = {COPY_BACKEND};
+
+    Try<bool> aufsSupported = fs::supported("aufs");
+    if (aufsSupported.isSome() && aufsSupported.get()) {
+      backends.push_back(AUFS_BACKEND);
+    }
+
+    Try<bool> overlayfsSupported = fs::supported("overlayfs");
+    if (overlayfsSupported.isSome() && overlayfsSupported.get()) {
+      backends.push_back(OVERLAY_BACKEND);
+    }
+
+    return backends;
+  }
+};
+
+
+INSTANTIATE_TEST_CASE_P(
+    BackendFlag,
+    ProvisionerDockerWhiteoutTest,
+    ::testing::ValuesIn(ProvisionerDockerWhiteoutTest::parameters()));
+
+
+// This test verifies that a docker image containing whiteout files
+// will be processed correctly by copy, aufs and overlay backends.
+TEST_P(ProvisionerDockerWhiteoutTest, ROOT_INTERNET_CURL_Whiteout)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+  flags.image_provisioner_backend = GetParam();
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_EQ(1u, offers->size());
+
+  const Offer& offer = offers.get()[0];
+
+  // We are using the docker image 'zhq527725/whiteout' to verify that the
+  // files '/dir1/file1' and '/dir1/dir2/file2' do not exist in container's
+  // rootfs because of the following two whiteout files in the image:
+  //   '/dir1/.wh.file1'
+  //   '/dir1/dir2/.wh..wh..opq'
+  // And we also verify that the file '/dir1/dir2/file3' exists in container's
+  // rootfs which will NOT be applied by '/dir1/dir2/.wh..wh..opq' since they
+  // are in the same layer.
+  // See more details about this docker image in the link below:
+  //   https://hub.docker.com/r/zhq527725/whiteout/
+  CommandInfo command = createCommandInfo(
+      "test ! -f /dir1/file1 && "
+      "test ! -f /dir1/dir2/file2 && "
+      "test -f /dir1/dir2/file3");
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      Resources::parse("cpus:1;mem:128").get(),
+      command);
+
+  Image image = createDockerImage("zhq527725/whiteout");
+
+  ContainerInfo* container = task.mutable_container();
+  container->set_type(ContainerInfo::MESOS);
+  container->mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(task.task_id(), statusRunning->task_id());
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  AWAIT_READY(statusFinished);
+  EXPECT_EQ(task.task_id(), statusFinished->task_id());
+  EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that Docker image can be pulled from the
+// repository by digest.
+TEST_F(ProvisionerDockerPullerTest, ROOT_INTERNET_CURL_ImageDigest)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_EQ(1u, offers->size());
+
+  const Offer& offer = offers.get()[0];
+
+  // NOTE: We use a non-shell command here because 'sh' might not be
+  // in the PATH. 'alpine' does not specify env PATH in the image. On
+  // some linux distribution, '/bin' is not in the PATH by default.
+  CommandInfo command;
+  command.set_shell(false);
+  command.set_value("/bin/ls");
+  command.add_arguments("ls");
+  command.add_arguments("-al");
+  command.add_arguments("/");
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      Resources::parse("cpus:1;mem:128").get(),
+      command);
+
+  // NOTE: We use the digest of the 'alpine:2.7' image because it has a
+  // Schema 1 manifest (the only manifest schema that we currently support).
+  const string digest =
+    "sha256:9f08005dff552038f0ad2f46b8e65ff3d25641747d3912e3ea8da6785046561a";
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("library/alpine@" + digest);
 
   ContainerInfo* container = task.mutable_container();
   container->set_type(ContainerInfo::MESOS);
