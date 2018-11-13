@@ -47,14 +47,14 @@ TEST_F(ProtobufIOTest, Basic)
 {
   const string file = ".protobuf_io_test_basic";
 
-  Try<int> result = os::open(
+  Try<int_fd> result = os::open(
       file,
       O_CREAT | O_WRONLY | O_SYNC | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
   ASSERT_SOME(result);
 
-  int fdw = result.get();
+  int_fd fdw = result.get();
 
   result = os::open(
       file,
@@ -63,7 +63,7 @@ TEST_F(ProtobufIOTest, Basic)
 
   ASSERT_SOME(result);
 
-  int fdr = result.get();
+  int_fd fdr = result.get();
 
   const size_t writes = 10;
   for (size_t i = 0; i < writes; i++) {
@@ -81,12 +81,12 @@ TEST_F(ProtobufIOTest, Basic)
       break;
     }
 
-    EXPECT_EQ(read.get().value(), stringify(reads++));
+    EXPECT_EQ(read->value(), stringify(reads++));
   }
 
   // Ensure we've hit the end of the file without reading a partial
   // protobuf.
-  ASSERT_TRUE(read.isNone());
+  ASSERT_NONE(read);
   ASSERT_EQ(writes, reads);
 
   os::close(fdw);
@@ -107,7 +107,7 @@ TEST_F(ProtobufIOTest, Append)
     ASSERT_SOME(result);
   }
 
-  Try<int> fd = os::open(
+  Try<int_fd> fd = os::open(
       file,
       O_CREAT | O_RDONLY | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -122,16 +122,17 @@ TEST_F(ProtobufIOTest, Append)
       break;
     }
 
-    EXPECT_EQ(read.get().value(), stringify(reads++));
+    EXPECT_EQ(read->value(), stringify(reads++));
   }
 
   // Ensure we've hit the end of the file without reading a partial
   // protobuf.
-  ASSERT_TRUE(read.isNone());
+  ASSERT_NONE(read);
   ASSERT_EQ(writes, reads);
 
   os::close(fd.get());
 }
+
 
 TEST_F(ProtobufIOTest, RepeatedPtrField)
 {
@@ -139,8 +140,10 @@ TEST_F(ProtobufIOTest, RepeatedPtrField)
 
   RepeatedPtrField<FrameworkID> expected;
 
-  const size_t size = 10;
-  for (size_t i = 0; i < size; i++) {
+  // NOTE: This uses `int` instead of `size_t` because eventually the iterator
+  // is used in `Get(int)`, and converting from `size_t` generates a warning.
+  const int size = 10;
+  for (int i = 0; i < size; i++) {
     FrameworkID frameworkId;
     frameworkId.set_value(stringify(i));
     expected.Add()->CopyFrom(frameworkId);
@@ -149,15 +152,14 @@ TEST_F(ProtobufIOTest, RepeatedPtrField)
   Try<Nothing> write = ::protobuf::write(file, expected);
   ASSERT_SOME(write);
 
-  Result<RepeatedPtrField<FrameworkID>> read =
+  Result<RepeatedPtrField<FrameworkID>> actual =
     ::protobuf::read<RepeatedPtrField<FrameworkID>>(file);
-  ASSERT_SOME(read);
 
-  RepeatedPtrField<FrameworkID> actual = read.get();
+  ASSERT_SOME(actual);
 
-  ASSERT_EQ(expected.size(), actual.size());
-  for (size_t i = 0; i < size; i++) {
-    EXPECT_EQ(expected.Get(i), actual.Get(i));
+  ASSERT_EQ(expected.size(), actual->size());
+  for (int i = 0; i < size; i++) {
+    EXPECT_EQ(expected.Get(i), actual->Get(i));
   }
 }
 

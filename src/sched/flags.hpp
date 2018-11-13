@@ -36,15 +36,6 @@ class Flags : public virtual logging::Flags
 public:
   Flags()
   {
-    add(&Flags::authentication_backoff_factor,
-        "authentication_backoff_factor",
-        "Scheduler driver authentication retries are exponentially backed\n"
-        "off based on 'b', the authentication backoff factor (e.g., 1st retry\n"
-        "uses a random value between `[0, b * 2^1]`, 2nd retry between\n"
-        "`[0, b * 2^2]`, 3rd retry between `[0, b * 2^3]`, etc up to a\n"
-        "maximum of " + stringify(AUTHENTICATION_RETRY_INTERVAL_MAX),
-        DEFAULT_AUTHENTICATION_BACKOFF_FACTOR);
-
     add(&Flags::registration_backoff_factor,
         "registration_backoff_factor",
         "Scheduler driver (re-)registration retries are exponentially backed\n"
@@ -109,7 +100,7 @@ public:
         "modules_dir",
         "Directory path of the module manifest files.\n"
         "The manifest files are processed in alphabetical order.\n"
-        "(See --modules for more information on module manifest files)\n"
+        "(See --modules for more information on module manifest files).\n"
         "Cannot be used in conjunction with --modules.\n");
 
     add(&Flags::authenticatee,
@@ -119,10 +110,32 @@ public:
         "or load an alternate authenticatee module using MESOS_MODULES.",
         DEFAULT_AUTHENTICATEE);
 
-    add(&Flags::authentication_timeout,
-        "authentication_timeout",
-        "Timeout after which authentication will be retried.",
-        DEFAULT_AUTHENTICATION_TIMEOUT);
+    add(&Flags::authentication_backoff_factor,
+        "authentication_backoff_factor",
+        "The scheduler will time out its authentication with the master based\n"
+        "on exponential backoff. The timeout will be randomly chosen within\n"
+        "the range `[min, min + factor*2^n]` where `n` is the number of\n"
+        "failed attempts. To tune these parameters, set the\n"
+        "`--authentication_timeout_[min|max|factor]` flags.\n",
+        DEFAULT_AUTHENTICATION_BACKOFF_FACTOR);
+
+    add(&Flags::authentication_timeout_min,
+        "authentication_timeout_min",
+        flags::DeprecatedName("authentication_timeout"),
+        "The minimum amount of time the scheduler waits before retrying\n"
+        "authenticating with the master. See `authentication_backoff_factor`\n"
+        "for more details. NOTE: since authentication retry cancels the\n"
+        "previous authentication request, one should consider what is the\n"
+        "normal authentication delay when setting this flag to prevent\n"
+        "premature retry",
+        DEFAULT_AUTHENTICATION_TIMEOUT_MIN);
+
+    add(&Flags::authentication_timeout_max,
+      "authentication_timeout_max",
+      "The maximum amount of time the scheduler waits before retrying\n"
+      "authenticating with the master. See `authentication_backoff_factor`\n"
+      "for more details",
+      DEFAULT_AUTHENTICATION_TIMEOUT_MAX);
   }
 
   Duration authentication_backoff_factor;
@@ -130,7 +143,8 @@ public:
   Option<Modules> modules;
   Option<std::string> modulesDir;
   std::string authenticatee;
-  Duration authentication_timeout;
+  Duration authentication_timeout_min;
+  Duration authentication_timeout_max;
 };
 
 } // namespace scheduler {

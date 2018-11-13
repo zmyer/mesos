@@ -37,7 +37,7 @@
 #ifndef __WINDOWS__
 #include <mesos/state/log.hpp>
 #endif // __WINDOWS__
-#include <mesos/state/protobuf.hpp>
+#include <mesos/state/state.hpp>
 #include <mesos/state/storage.hpp>
 
 #include <mesos/zookeeper/detector.hpp>
@@ -57,6 +57,7 @@
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
+#include <stout/version.hpp>
 
 #include "common/build.hpp"
 #include "common/http.hpp"
@@ -128,70 +129,13 @@ using std::string;
 using std::vector;
 
 
-class Flags : public virtual master::Flags
-{
-public:
-  Flags()
-  {
-    add(&Flags::ip,
-        "ip",
-        "IP address to listen on. This cannot be used in conjunction\n"
-        "with `--ip_discovery_command`.");
-
-    add(&Flags::port, "port", "Port to listen on.", MasterInfo().port());
-
-    add(&Flags::advertise_ip,
-        "advertise_ip",
-        "IP address advertised to reach this Mesos master.\n"
-        "The master does not bind using this IP address.\n"
-        "However, this IP address may be used to access this master.");
-
-    add(&Flags::advertise_port,
-        "advertise_port",
-        "Port advertised to reach Mesos master (along with\n"
-        "`advertise_ip`). The master does not bind to this port.\n"
-        "However, this port (along with `advertise_ip`) may be used to\n"
-        "access this master.");
-
-    add(&Flags::zk,
-        "zk",
-        "ZooKeeper URL (used for leader election amongst masters)\n"
-        "May be one of:\n"
-        "  `zk://host1:port1,host2:port2,.../path`\n"
-        "  `zk://username:password@host1:port1,host2:port2,.../path`\n"
-        "  `file:///path/to/file` (where file contains one of the above)\n"
-        "NOTE: Not required if master is run in standalone mode (non-HA).");
-
-    add(&Flags::ip_discovery_command,
-        "ip_discovery_command",
-        "Optional IP discovery binary: if set, it is expected to emit\n"
-        "the IP address which the master will try to bind to.\n"
-        "Cannot be used in conjunction with `--ip`.");
-    }
-
-    // The following flags are executable specific (e.g., since we only
-    // have one instance of libprocess per execution, we only want to
-    // advertise the IP and port option once, here).
-
-    Option<string> ip;
-    uint16_t port;
-    Option<string> advertise_ip;
-    Option<string> advertise_port;
-    Option<string> zk;
-
-    // Optional IP discover script that will set the Master IP.
-    // If set, its output is expected to be a valid parseable IP string.
-    Option<string> ip_discovery_command;
-};
-
-
 int main(int argc, char** argv)
 {
   // The order of initialization of various master components is as follows:
   // * Validate flags.
+  // * Logging.
   // * Log build information.
   // * Libprocess.
-  // * Logging.
   // * Version process.
   // * Firewall rules: should be initialized before initializing HTTP endpoints.
   // * Modules: Load module libraries and manifests before they
@@ -202,7 +146,7 @@ int main(int argc, char** argv)
   // * Allocator.
   // * Registry storage.
   // * State.
-  // * Master contendor.
+  // * Master contender.
   // * Master detector.
   // * Authorizer.
   // * Slave removal rate limiter.
@@ -213,7 +157,7 @@ int main(int argc, char** argv)
 
   GOOGLE_PROTOBUF_VERIFY_VERSION;
 
-  ::Flags flags;
+  master::Flags flags;
 
   Try<flags::Warnings> load = flags.load("MESOS_", argc, argv);
 
@@ -228,13 +172,31 @@ int main(int argc, char** argv)
   }
 
   if (load.isError()) {
-    cerr << flags.usage(load.error()) << endl;
+    cerr << load.error() << "\n\n"
+         << "See `mesos-master --help` for a list of supported flags." << endl;
     return EXIT_FAILURE;
   }
 
+  logging::initialize(argv[0], true, flags); // Catch signals.
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
+
+  // Check that master's version has the expected format (SemVer).
+  {
+    Try<Version> version = Version::parse(MESOS_VERSION);
+    if (version.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to parse Mesos version '" << MESOS_VERSION << "': "
+        << version.error();
+    }
+  }
+
   if (flags.ip_discovery_command.isSome() && flags.ip.isSome()) {
-    EXIT(EXIT_FAILURE) << flags.usage(
-        "Only one of `--ip` or `--ip_discovery_command` should be specified");
+    EXIT(EXIT_FAILURE)
+      << "Only one of `--ip` or `--ip_discovery_command` should be specified";
   }
 
   if (flags.ip_discovery_command.isSome()) {
@@ -262,17 +224,19 @@ int main(int argc, char** argv)
   if (flags.zk.isNone()) {
     if (flags.master_contender.isSome() ^ flags.master_detector.isSome()) {
       EXIT(EXIT_FAILURE)
-        << flags.usage("Both --master_contender and --master_detector should "
-                       "be specified or omitted.");
+        << "Both --master_contender and --master_detector should "
+           "be specified or omitted.";
     }
   } else {
     if (flags.master_contender.isSome() || flags.master_detector.isSome()) {
       EXIT(EXIT_FAILURE)
-        << flags.usage("Only one of --zk or the "
-                       "--master_contender/--master_detector "
-                       "pair should be specified.");
+        << "Only one of --zk or the "
+           "--master_contender/--master_detector "
+           "pair should be specified.";
     }
   }
+
+  os::setenv("LIBPROCESS_MEMORY_PROFILING", stringify(flags.memory_profiling));
 
   // Log build information.
   LOG(INFO) << "Build: " << build::DATE << " by " << build::USER;
@@ -296,13 +260,6 @@ int main(int argc, char** argv)
           READONLY_HTTP_AUTHENTICATION_REALM)) {
     EXIT(EXIT_FAILURE) << "The call to `process::initialize()` in the master's "
                        << "`main()` was not the function's first invocation";
-  }
-
-  logging::initialize(argv[0], flags, true); // Catch signals.
-
-  // Log any flag warnings (after logging is initialized).
-  foreach (const flags::Warning& warning, load->warnings) {
-    LOG(WARNING) << warning.message;
   }
 
   spawn(new VersionProcess(), true);
@@ -329,7 +286,7 @@ int main(int argc, char** argv)
   // Initialize modules.
   if (flags.modules.isSome() && flags.modulesDir.isSome()) {
     EXIT(EXIT_FAILURE) <<
-      flags.usage("Only one of --modules or --modules_dir should be specified");
+      "Only one of --modules or --modules_dir should be specified";
   }
 
   if (flags.modulesDir.isSome()) {
@@ -372,17 +329,19 @@ int main(int argc, char** argv)
   }
 
   // Create an instance of allocator.
-  const string allocatorName = flags.allocator;
-  Try<Allocator*> allocator = Allocator::create(allocatorName);
+  Try<Allocator*> allocator = Allocator::create(
+      flags.allocator,
+      flags.role_sorter,
+      flags.framework_sorter);
 
   if (allocator.isError()) {
     EXIT(EXIT_FAILURE)
-      << "Failed to create '" << allocatorName
-      << "' allocator: " << allocator.error();
+      << "Failed to create allocator '" << flags.allocator << "'"
+      << ": " << allocator.error();
   }
 
   CHECK_NOTNULL(allocator.get());
-  LOG(INFO) << "Using '" << allocatorName << "' allocator";
+  LOG(INFO) << "Using '" << flags.allocator << "' allocator";
 
   Storage* storage = nullptr;
 #ifndef __WINDOWS__
@@ -416,7 +375,7 @@ int main(int argc, char** argv)
           << " registry when using ZooKeeper";
       }
 
-      Try<zookeeper::URL> url = zookeeper::URL::parse(flags.zk.get());
+      Try<zookeeper::URL> url = zookeeper::URL::parse(flags.zk->value);
       if (url.isError()) {
         EXIT(EXIT_FAILURE) << "Error parsing ZooKeeper URL: " << url.error();
       }
@@ -424,10 +383,10 @@ int main(int argc, char** argv)
       log = new Log(
           flags.quorum.get(),
           path::join(flags.work_dir.get(), "replicated_log"),
-          url.get().servers,
+          url->servers,
           flags.zk_session_timeout,
-          path::join(url.get().path, "log_replicas"),
-          url.get().authentication,
+          path::join(url->path, "log_replicas"),
+          url->authentication,
           flags.log_auto_initialize,
           "registrar/");
     } else {
@@ -449,8 +408,7 @@ int main(int argc, char** argv)
 
   CHECK_NOTNULL(storage);
 
-  mesos::state::protobuf::State* state =
-    new mesos::state::protobuf::State(storage);
+  mesos::state::State* state = new mesos::state::State(storage);
   Registrar* registrar =
     new Registrar(flags, state, READONLY_HTTP_AUTHENTICATION_REALM);
 
@@ -458,7 +416,9 @@ int main(int argc, char** argv)
   MasterDetector* detector;
 
   Try<MasterContender*> contender_ = MasterContender::create(
-      flags.zk, flags.master_contender);
+      flags.zk.isSome() ? flags.zk->value : Option<string>::none(),
+      flags.master_contender,
+      flags.zk_session_timeout);
 
   if (contender_.isError()) {
     EXIT(EXIT_FAILURE)
@@ -468,7 +428,9 @@ int main(int argc, char** argv)
   contender = contender_.get();
 
   Try<MasterDetector*> detector_ = MasterDetector::create(
-      flags.zk, flags.master_detector);
+      flags.zk.isSome() ? flags.zk->value : Option<string>::none(),
+      flags.master_detector,
+      flags.zk_session_timeout);
 
   if (detector_.isError()) {
     EXIT(EXIT_FAILURE)

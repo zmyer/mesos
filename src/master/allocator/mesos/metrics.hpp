@@ -20,8 +20,11 @@
 #include <string>
 #include <vector>
 
+#include <mesos/quota/quota.hpp>
+
 #include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/pull_gauge.hpp>
+#include <process/metrics/push_gauge.hpp>
 #include <process/metrics/timer.hpp>
 
 #include <process/pid.hpp>
@@ -54,35 +57,67 @@ struct Metrics
   const process::PID<HierarchicalAllocatorProcess> allocator;
 
   // Number of dispatch events currently waiting in the allocator process.
-  process::metrics::Gauge event_queue_dispatches;
+  process::metrics::PullGauge event_queue_dispatches;
 
   // TODO(bbannier) This metric is identical to `event_queue_dispatches`, but
   // uses a name deprecated in 1.0. This metric should be removed after the
   // deprecation cycle.
-  process::metrics::Gauge event_queue_dispatches_;
+  process::metrics::PullGauge event_queue_dispatches_;
 
   // Number of times the allocation algorithm has run.
   process::metrics::Counter allocation_runs;
 
-  // Latency of the allocation algorithm.
+  // Time spent in the allocation algorithm.
   process::metrics::Timer<Milliseconds> allocation_run;
 
-  // Gauges for the total amount of each resource in the cluster.
-  std::vector<process::metrics::Gauge> resources_total;
+  // The latency of allocation runs due to the batching of allocation requests.
+  process::metrics::Timer<Milliseconds> allocation_run_latency;
 
-  // Gauges for the allocated amount of each resource in the cluster.
-  std::vector<process::metrics::Gauge> resources_offered_or_allocated;
+  // PullGauges for the total amount of each resource in the cluster.
+  std::vector<process::metrics::PullGauge> resources_total;
 
-  // Gauges for the per-role quota allocation for each resource.
-  hashmap<std::string, hashmap<std::string, process::metrics::Gauge>>
+  // PullGauges for the allocated amount of each resource in the cluster.
+  std::vector<process::metrics::PullGauge> resources_offered_or_allocated;
+
+  // PullGauges for the per-role quota allocation for each resource.
+  hashmap<std::string, hashmap<std::string, process::metrics::PullGauge>>
     quota_allocated;
 
-  // Gauges for the per-role quota guarantee for each resource.
-  hashmap<std::string, hashmap<std::string, process::metrics::Gauge>>
+  // PullGauges for the per-role quota guarantee for each resource.
+  hashmap<std::string, hashmap<std::string, process::metrics::PullGauge>>
     quota_guarantee;
 
-  // Gauges for the per-role count of active offer filters.
-  hashmap<std::string, process::metrics::Gauge> offer_filters_active;
+  // PullGauges for the per-role count of active offer filters.
+  hashmap<std::string, process::metrics::PullGauge> offer_filters_active;
+};
+
+
+struct FrameworkMetrics
+{
+  FrameworkMetrics(
+      const FrameworkInfo& _frameworkInfo,
+      const bool _publishPerFrameworkMetrics);
+
+  ~FrameworkMetrics();
+
+  void reviveRole(const std::string& role);
+  void suppressRole(const std::string& role);
+
+  // Since frameworks can update their list of roles,
+  // these methods add/remove per-role metrics.
+  void addSubscribedRole(const std::string& role);
+  void removeSubscribedRole(const std::string& role);
+
+  // Add or remove per-framework metrics.
+  template <typename T> void addMetric(const T& metric);
+  template <typename T> void removeMetric(const T& metric);
+
+  const FrameworkInfo frameworkInfo;
+
+  const bool publishPerFrameworkMetrics;
+
+  // Suppresion state metric (boolean 0 or 1) for each role.
+  hashmap<std::string, process::metrics::PushGauge> suppressed;
 };
 
 } // namespace internal {

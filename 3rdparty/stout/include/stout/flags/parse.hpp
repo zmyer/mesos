@@ -25,6 +25,8 @@
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 
+#include <stout/flags/flag.hpp>
+
 #include <stout/os/read.hpp>
 
 namespace flags {
@@ -80,19 +82,36 @@ inline Try<Bytes> parse(const std::string& value)
 template <>
 inline Try<net::IP> parse(const std::string& value)
 {
-  return net::IP::parse(value, AF_INET);
+  return net::IP::parse(value);
+}
+
+
+template <>
+inline Try<net::IPv4> parse(const std::string& value)
+{
+  return net::IPv4::parse(value);
+}
+
+
+template <>
+inline Try<net::IPv6> parse(const std::string& value)
+{
+  return net::IPv6::parse(value);
 }
 
 
 template <>
 inline Try<JSON::Object> parse(const std::string& value)
 {
+#ifndef __WINDOWS__
   // A value that already starts with 'file://' will properly be
   // loaded from the file and put into 'value' but if it starts with
   // '/' we need to explicitly handle it for backwards compatibility
   // reasons (because we used to handle it before we introduced the
   // 'fetch' mechanism for flags that first fetches the data from URIs
   // such as 'file://').
+  //
+  // NOTE: Because this code is deprecated, it is not supported on Windows.
   if (strings::startsWith(value, "/")) {
     LOG(WARNING) << "Specifying an absolute filename to read a command line "
                     "option out of without using 'file:// is deprecated and "
@@ -106,6 +125,7 @@ inline Try<JSON::Object> parse(const std::string& value)
     }
     return JSON::parse<JSON::Object>(read.get());
   }
+#endif // __WINDOWS__
   return JSON::parse<JSON::Object>(value);
 }
 
@@ -113,12 +133,15 @@ inline Try<JSON::Object> parse(const std::string& value)
 template <>
 inline Try<JSON::Array> parse(const std::string& value)
 {
+#ifndef __WINDOWS__
   // A value that already starts with 'file://' will properly be
   // loaded from the file and put into 'value' but if it starts with
   // '/' we need to explicitly handle it for backwards compatibility
   // reasons (because we used to handle it before we introduced the
   // 'fetch' mechanism for flags that first fetches the data from URIs
   // such as 'file://').
+  //
+  // NOTE: Because this code is deprecated, it is not supported on Windows.
   if (strings::startsWith(value, "/")) {
     LOG(WARNING) << "Specifying an absolute filename to read a command line "
                     "option out of without using 'file:// is deprecated and "
@@ -132,6 +155,7 @@ inline Try<JSON::Array> parse(const std::string& value)
     }
     return JSON::parse<JSON::Array>(read.get());
   }
+#endif // __WINDOWS__
   return JSON::parse<JSON::Array>(value);
 }
 
@@ -140,6 +164,105 @@ template <>
 inline Try<Path> parse(const std::string& value)
 {
   return Path(value);
+}
+
+
+template <>
+inline Try<SecurePathOrValue> parse(const std::string& value)
+{
+  SecurePathOrValue result;
+  result.value = value;
+
+  if (strings::startsWith(value, "file://")) {
+    const std::string path = value.substr(7);
+
+    Try<std::string> read = os::read(path);
+
+    if (read.isError()) {
+      return Error("Error reading file '" + path + "': " + read.error());
+    }
+
+    result.value = read.get();
+    result.path = Path(path);
+  }
+
+  return result;
+}
+
+
+#ifdef __WINDOWS__
+template <>
+inline Try<int_fd> parse(const std::string& value)
+{
+  // Looks like "WindowsFD::Type::HANDLE=0000000000000000".
+  std::vector<std::string> fd = strings::split(value, "=");
+  if (fd.size() != 2) {
+    return Error("Expected to split string into exactly two parts.");
+  }
+
+  if (strings::endsWith(fd[0], "HANDLE")) {
+    Try<HANDLE> t = parse<HANDLE>(fd[1]);
+    if (t.isError()) {
+      return Error(t.error());
+    }
+    return int_fd(t.get());
+  } else if (strings::endsWith(fd[0], "SOCKET")) {
+    Try<SOCKET> t = parse<SOCKET>(fd[1]);
+    if (t.isError()) {
+      return Error(t.error());
+    }
+    return int_fd(t.get());
+  }
+
+  return Error("`int_fd` was neither a `HANDLE` nor a `SOCKET`");
+}
+#endif // __WINDOWS__
+
+
+// TODO(klueska): Generalize this parser to take any comma separated
+// list and convert it to its appropriate type (i.e., not just for
+// unsigned ints). Issues could arise when the generic type is a
+// string that contains commas though, so generalizing this is not as
+// straightforward as it looks at first glance.
+template <>
+inline Try<std::vector<unsigned int>> parse(const std::string& value)
+{
+  std::vector<unsigned int> result;
+
+  foreach (const std::string& token, strings::tokenize(value, ",")) {
+    Try<unsigned int> number = numify<unsigned int>(token);
+
+    if (number.isError()) {
+      return Error("Failed to numify '" + token + "': " + number.error());
+    }
+
+    result.push_back(number.get());
+  }
+
+  return result;
+}
+
+
+// NOTE: Strings in the set cannot contain commas, since that
+// is the delimiter and we provide no way to escape it.
+//
+// TODO(klueska): Generalize this parser to take any comma separated
+// list and convert it to its appropriate type (i.e., not just for
+// strings).
+template <>
+inline Try<std::set<std::string>> parse(const std::string& value)
+{
+  std::set<std::string> result;
+
+  foreach (const std::string& token, strings::tokenize(value, ",")) {
+    if (result.count(token) > 0) {
+      return Error("Duplicate token '" + token + "'");
+    }
+
+    result.insert(token);
+  }
+
+  return result;
 }
 
 } // namespace flags {

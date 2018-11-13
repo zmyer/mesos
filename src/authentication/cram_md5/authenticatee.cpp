@@ -72,10 +72,10 @@ public:
     CHECK(secret != nullptr) << "Failed to allocate memory for secret";
 
     memcpy(secret->data, data, length);
-    secret->len = length;
+    secret->len = static_cast<unsigned long>(length);
   }
 
-  virtual ~CRAMMD5AuthenticateeProcess()
+  ~CRAMMD5AuthenticateeProcess() override
   {
     if (connection != nullptr) {
       sasl_dispose(&connection);
@@ -83,7 +83,7 @@ public:
     free(secret);
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     discarded(); // Fail the promise.
   }
@@ -130,7 +130,7 @@ public:
 
     // NOTE: Some SASL mechanisms do not allow/enable "proxying",
     // i.e., authorization. Therefore, some mechanisms send _only_ the
-    // authoriation name rather than both the user (authentication
+    // authorization name rather than both the user (authentication
     // name) and authorization name. Thus, for now, we assume
     // authorization is handled out of band. Consider the
     // SASL_NEED_PROXY flag if we want to reconsider this in the
@@ -177,7 +177,7 @@ public:
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Anticipate mechanisms and steps from the server.
     install<AuthenticationMechanismsMessage>(
@@ -265,7 +265,7 @@ protected:
     int result = sasl_client_step(
         connection,
         data.length() == 0 ? nullptr : data.data(),
-        data.length(),
+        static_cast<unsigned>(data.length()),
         &interact,
         &output,
         &length);
@@ -330,7 +330,7 @@ private:
     CHECK(SASL_CB_USER == id || SASL_CB_AUTHNAME == id);
     *result = static_cast<const char*>(context);
     if (length != nullptr) {
-      *length = strlen(*result);
+      *length = static_cast<unsigned>(strlen(*result));
     }
     return SASL_OK;
   }

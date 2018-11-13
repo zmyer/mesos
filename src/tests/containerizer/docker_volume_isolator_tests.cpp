@@ -78,7 +78,7 @@ class MockDockerVolumeDriverClient : public DriverClient
 public:
   MockDockerVolumeDriverClient() {}
 
-  virtual ~MockDockerVolumeDriverClient() {}
+  ~MockDockerVolumeDriverClient() override {}
 
   MOCK_METHOD3(
       mount,
@@ -98,13 +98,13 @@ public:
 class DockerVolumeIsolatorTest : public MesosTest
 {
 protected:
-  virtual void TearDown()
+  void TearDown() override
   {
     // Try to remove any mounts under sandbox.
     if (::geteuid() == 0) {
-      Try<Nothing> unmountAll = fs::unmountAll(sandbox->c_str(), MNT_DETACH);
+      Try<Nothing> unmountAll = fs::unmountAll(sandbox.get(), MNT_DETACH);
       if (unmountAll.isError()) {
-        LOG(ERROR) << "Failed to unmount '" << sandbox->c_str()
+        LOG(ERROR) << "Failed to unmount '" << sandbox.get()
                    << "': " << unmountAll.error();
         return;
       }
@@ -151,6 +151,8 @@ protected:
       const slave::Flags& flags,
       const Owned<DriverClient>& mockClient)
   {
+    fetcher.reset(new Fetcher(flags));
+
     Try<Isolator*> linuxIsolator_ =
       LinuxFilesystemIsolatorProcess::create(flags);
 
@@ -199,7 +201,8 @@ protected:
     Try<MesosContainerizer*> containerizer = MesosContainerizer::create(
         flags,
         true,
-        &fetcher,
+        fetcher.get(),
+        nullptr,
         std::move(launcher),
         provisioner->share(),
         {std::move(linuxIsolator),
@@ -214,7 +217,7 @@ protected:
   }
 
 private:
-  Fetcher fetcher;
+  Owned<Fetcher> fetcher;
 };
 
 
@@ -240,7 +243,7 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsWithVolumes)
 
   Try<Owned<cluster::Slave>> slave = StartSlave(
       detector.get(),
-      containerizer.get().get(),
+      containerizer->get(),
       flags);
 
   ASSERT_SOME(slave);
@@ -267,7 +270,7 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsWithVolumes)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -340,14 +343,19 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsWithVolumes)
     .WillOnce(DoAll(FutureArg<1>(&unmount2Name),
                     Return(Nothing())));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFinished));
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -394,7 +402,7 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsFailedWithSameVolumes)
 
   Try<Owned<cluster::Slave>> slave = StartSlave(
       detector.get(),
-      containerizer.get().get(),
+      containerizer->get(),
       flags);
 
   ASSERT_SOME(slave);
@@ -421,7 +429,7 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsFailedWithSameVolumes)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -494,7 +502,7 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsSlaveRecovery)
 
   Try<Owned<cluster::Slave>> slave = StartSlave(
       detector.get(),
-      containerizer.get().get(),
+      containerizer->get(),
       flags);
 
   ASSERT_SOME(slave);
@@ -525,7 +533,7 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsSlaveRecovery)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -587,27 +595,38 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsSlaveRecovery)
     .WillOnce(DoAll(FutureArg<1>(&mount2Name),
                     Return(mountPoint2)));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
-  Future<Nothing> ack =
+  Future<Nothing> ack1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> ack2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  // Wait for the ACK to be checkpointed.
+  AWAIT_READY(ack1);
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(ack);
+  AWAIT_READY(ack2);
 
   // Stop the slave after TASK_RUNNING is received.
   slave.get()->terminate();
 
   // Set up so we can wait until the new slave updates the container's
-  // resources (this occurs after the executor has re-registered).
+  // resources (this occurs after the executor has reregistered).
   Future<Nothing> update =
     FUTURE_DISPATCH(_, &MesosContainerizerProcess::update);
 
@@ -633,7 +652,7 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsSlaveRecovery)
                     Return(Nothing())));
 
   // Use the same flags.
-  slave = StartSlave(detector.get(), containerizer.get().get(), flags);
+  slave = StartSlave(detector.get(), containerizer->get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(reregistered);
@@ -643,9 +662,9 @@ TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsSlaveRecovery)
 
   Future<hashset<ContainerID>> containers = containerizer.get()->containers();
   AWAIT_READY(containers);
-  ASSERT_EQ(1u, containers.get().size());
+  ASSERT_EQ(1u, containers->size());
 
-  ContainerID containerId = *(containers.get().begin());
+  ContainerID containerId = *(containers->begin());
 
   Future<TaskStatus> statusKilled;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -691,7 +710,7 @@ TEST_F(DockerVolumeIsolatorTest,
 
   Try<Owned<cluster::Slave>> slave = StartSlave(
       detector.get(),
-      containerizer.get().get(),
+      containerizer->get(),
       flags);
 
   ASSERT_SOME(slave);
@@ -718,7 +737,7 @@ TEST_F(DockerVolumeIsolatorTest,
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -767,12 +786,16 @@ TEST_F(DockerVolumeIsolatorTest,
   EXPECT_CALL(*mockClient, unmount(driver1, _))
     .WillOnce(Return(Nothing()));
 
+  Future<TaskStatus> statusStarting1;
   Future<TaskStatus> statusRunning1;
   Future<TaskStatus> statusKilled1;
+  Future<TaskStatus> statusStarting2;
   Future<TaskStatus> statusRunning2;
   Future<TaskStatus> statusKilled2;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting1))
+    .WillOnce(FutureArg<1>(&statusStarting2))
     .WillOnce(FutureArg<1>(&statusRunning1))
     .WillOnce(FutureArg<1>(&statusRunning2))
     .WillOnce(FutureArg<1>(&statusKilled1))
@@ -780,8 +803,10 @@ TEST_F(DockerVolumeIsolatorTest,
 
   driver.launchTasks(offer.id(), {task1, task2});
 
-  AWAIT_READY(statusRunning1);
-  EXPECT_EQ(TASK_RUNNING, statusRunning1->state());
+  // TASK_STARTING and TASK_RUNNING updates might arrive interleaved,
+  // so we only check the first and the last where the values are known.
+  AWAIT_READY(statusStarting1);
+  EXPECT_EQ(TASK_STARTING, statusStarting1->state());
 
   AWAIT_READY(statusRunning2);
   EXPECT_EQ(TASK_RUNNING, statusRunning2->state());
@@ -825,7 +850,7 @@ TEST_F(DockerVolumeIsolatorTest,
 
   Try<Owned<cluster::Slave>> slave = StartSlave(
       detector.get(),
-      containerizer.get().get(),
+      containerizer->get(),
       flags);
 
   ASSERT_SOME(slave);
@@ -852,7 +877,7 @@ TEST_F(DockerVolumeIsolatorTest,
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -908,14 +933,19 @@ TEST_F(DockerVolumeIsolatorTest,
     .WillOnce(DoAll(FutureArg<1>(&unmountName),
                     Return(Nothing())));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFinished));
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -960,7 +990,7 @@ TEST_F(DockerVolumeIsolatorTest,
 
   Try<Owned<cluster::Slave>> slave = StartSlave(
       detector.get(),
-      containerizer.get().get(),
+      containerizer->get(),
       flags);
 
   ASSERT_SOME(slave);
@@ -987,7 +1017,7 @@ TEST_F(DockerVolumeIsolatorTest,
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -1050,14 +1080,19 @@ TEST_F(DockerVolumeIsolatorTest,
     .WillOnce(DoAll(FutureArg<1>(&unmountName),
                     Return(Nothing())));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFinished));
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1071,6 +1106,273 @@ TEST_F(DockerVolumeIsolatorTest,
 
   AWAIT_READY(statusFinished);
   EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  // Make sure the docker volume unmount parameters are same with
+  // the parameters in `containerInfo`.
+  AWAIT_EXPECT_EQ(name, unmountName);
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a container launched without
+// a rootfs cannot write to a read-only docker volume.
+TEST_F(DockerVolumeIsolatorTest, ROOT_CommandTaskNoRootfsWithReadOnlyVolume)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  MockDockerVolumeDriverClient* mockClient = new MockDockerVolumeDriverClient;
+
+  Try<Owned<MesosContainerizer>> containerizer =
+    createContainerizer(flags, Owned<DriverClient>(mockClient));
+
+  ASSERT_SOME(containerizer);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer->get(),
+      flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  const string key = "iops";
+  const string value = "150";
+
+  hashmap<string, string> options = {{key, value}};
+
+  // Create a volume with relative path.
+  const string _driver = "driver";
+  const string name = "name";
+  const string containerPath = "tmp/foo";
+
+  Volume volume = createDockerVolume(_driver, name, containerPath, options);
+  volume.set_mode(Volume::RO);
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      offer.resources(),
+      "echo 'hello' > " + containerPath + "/file");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.add_volumes()->CopyFrom(volume);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  // Create mount point for volume.
+  const string mountPoint = path::join(os::getcwd(), "volume");
+  ASSERT_SOME(os::mkdir(mountPoint));
+
+  Future<string> mountName;
+  Future<hashmap<string, string>> mountOptions;
+
+  EXPECT_CALL(*mockClient, mount(_driver, _, _))
+    .WillOnce(DoAll(FutureArg<1>(&mountName),
+                    FutureArg<2>(&mountOptions),
+                    Return(mountPoint)));
+
+  Future<string> unmountName;
+
+  EXPECT_CALL(*mockClient, unmount(_driver, _))
+    .WillOnce(DoAll(FutureArg<1>(&unmountName),
+                    Return(Nothing())));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFailed;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFailed));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  // Make sure the docker volume mount parameters are same with the
+  // parameters in `containerInfo`.
+  AWAIT_EXPECT_EQ(name, mountName);
+
+  AWAIT_READY(mountOptions);
+  EXPECT_SOME_EQ(value, mountOptions->get(key));
+
+  AWAIT_READY(statusFailed);
+  EXPECT_EQ(TASK_FAILED, statusFailed->state());
+
+  // Make sure the docker volume unmount parameters are same with
+  // the parameters in `containerInfo`.
+  AWAIT_EXPECT_EQ(name, unmountName);
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a container launched with
+// a rootfs cannot write to a read-only docker volume.
+TEST_F(DockerVolumeIsolatorTest,
+       ROOT_INTERNET_CURL_CommandTaskRootfsWithReadOnlyVolume)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/volume,docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+
+  MockDockerVolumeDriverClient* mockClient = new MockDockerVolumeDriverClient;
+
+  Try<Owned<MesosContainerizer>> containerizer =
+    createContainerizer(flags, Owned<DriverClient>(mockClient));
+
+  ASSERT_SOME(containerizer);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      containerizer->get(),
+      flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  const string key = "iops";
+  const string value = "150";
+
+  hashmap<string, string> options = {{key, value}};
+
+  // Create a volume with relative path.
+  const string _driver = "driver";
+  const string name = "name";
+  const string containerPath = "tmp/foo";
+
+  Volume volume = createDockerVolume(_driver, name, containerPath, options);
+  volume.set_mode(Volume::RO);
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      offer.resources(),
+      "echo 'hello' > " + containerPath + "/file");
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::MESOS);
+  containerInfo.add_volumes()->CopyFrom(volume);
+
+  containerInfo.mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  // Create mount point for volume.
+  const string mountPoint = path::join(os::getcwd(), "volume");
+  ASSERT_SOME(os::mkdir(mountPoint));
+
+  Future<string> mountName;
+  Future<hashmap<string, string>> mountOptions;
+
+  EXPECT_CALL(*mockClient, mount(_driver, _, _))
+    .WillOnce(DoAll(FutureArg<1>(&mountName),
+                    FutureArg<2>(&mountOptions),
+                    Return(mountPoint)));
+
+  Future<string> unmountName;
+
+  EXPECT_CALL(*mockClient, unmount(_driver, _))
+    .WillOnce(DoAll(FutureArg<1>(&unmountName),
+                    Return(Nothing())));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFailed;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFailed));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  // Make sure the docker volume mount parameters are same with the
+  // parameters in `containerInfo`.
+  AWAIT_EXPECT_EQ(name, mountName);
+
+  AWAIT_READY(mountOptions);
+  EXPECT_SOME_EQ(value, mountOptions->get(key));
+
+  AWAIT_READY(statusFailed);
+  EXPECT_EQ(TASK_FAILED, statusFailed->state());
 
   // Make sure the docker volume unmount parameters are same with
   // the parameters in `containerInfo`.

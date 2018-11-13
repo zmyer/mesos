@@ -50,6 +50,7 @@
 #include "tests/containerizer.hpp"
 #include "tests/mesos.hpp"
 #include "tests/mock_slave.hpp"
+#include "tests/resources_utils.hpp"
 #include "tests/utils.hpp"
 
 using namespace process;
@@ -88,12 +89,12 @@ const char FIXED_RESOURCE_ESTIMATOR_NAME[] =
 class OversubscriptionTest : public MesosTest
 {
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     MesosTest::SetUp();
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     // Unload modules.
     foreach (const Modules::Library& library, modules.libraries()) {
@@ -225,7 +226,7 @@ TEST_F(OversubscriptionTest, FetchResourceUsage)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 10", DEFAULT_EXECUTOR_ID);
   task.mutable_labels()->add_labels()->CopyFrom(
@@ -246,7 +247,7 @@ TEST_F(OversubscriptionTest, FetchResourceUsage)
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_RUNNING, status->state());
 
   AWAIT_READY(usageCallback);
 
@@ -254,21 +255,21 @@ TEST_F(OversubscriptionTest, FetchResourceUsage)
   AWAIT_READY(usage);
 
   // Expecting the same statistics as these returned by mocked containerizer.
-  ASSERT_EQ(1, usage.get().executors_size());
-  EXPECT_EQ(usage.get().executors(0).executor_info().executor_id(),
+  ASSERT_EQ(1, usage->executors_size());
+  EXPECT_EQ(usage->executors(0).executor_info().executor_id(),
             DEFAULT_EXECUTOR_ID);
-  ASSERT_EQ(usage.get().executors(0).statistics(), statistics);
+  ASSERT_EQ(usage->executors(0).statistics(), statistics);
   ASSERT_EQ(task.executor().labels(),
-            usage.get().executors(0).executor_info().labels());
-  ASSERT_EQ(1, usage.get().executors(0).tasks().size());
+            usage->executors(0).executor_info().labels());
+  ASSERT_EQ(1, usage->executors(0).tasks().size());
   ASSERT_EQ(task.name(),
-            usage.get().executors(0).tasks(0).name());
+            usage->executors(0).tasks(0).name());
   ASSERT_EQ(task.task_id(),
-            usage.get().executors(0).tasks(0).id());
+            usage->executors(0).tasks(0).id());
   ASSERT_EQ(task.resources(),
-            usage.get().executors(0).tasks(0).resources());
+            usage->executors(0).tasks(0).resources());
   ASSERT_EQ(task.labels(),
-            usage.get().executors(0).tasks(0).labels());
+            usage->executors(0).tasks(0).labels());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -282,11 +283,14 @@ TEST_F(OversubscriptionTest, FetchResourceUsage)
 // oversubscribed resources to the master.
 TEST_F(OversubscriptionTest, ForwardUpdateSlaveMessage)
 {
+  Clock::pause();
+
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  Future<SlaveRegisteredMessage> slaveRegistered =
-    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+  // The agent will send a single `UpdateSlaveMessage` after registration.
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
 
   MockResourceEstimator resourceEstimator;
 
@@ -304,12 +308,15 @@ TEST_F(OversubscriptionTest, ForwardUpdateSlaveMessage)
     StartSlave(detector.get(), &resourceEstimator, flags);
   ASSERT_SOME(slave);
 
-  AWAIT_READY(slaveRegistered);
+  Clock::advance(flags.registration_backoff_factor);
+  Clock::advance(flags.authentication_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(updateSlaveMessage);
 
   Future<UpdateSlaveMessage> update =
     FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
 
-  Clock::pause();
   // No update should be sent until there is an estimate.
   Clock::advance(flags.oversubscribed_resources_interval);
   Clock::settle();
@@ -322,7 +329,9 @@ TEST_F(OversubscriptionTest, ForwardUpdateSlaveMessage)
 
   AWAIT_READY(update);
 
-  EXPECT_EQ(update.get().oversubscribed_resources(), resources);
+  EXPECT_TRUE(update->has_update_oversubscribed_resources());
+  EXPECT_TRUE(update->update_oversubscribed_resources());
+  EXPECT_EQ(update->oversubscribed_resources(), resources);
 
   // Ensure the metric is updated.
   JSON::Object metrics = Metrics();
@@ -330,7 +339,7 @@ TEST_F(OversubscriptionTest, ForwardUpdateSlaveMessage)
       1u,
       metrics.values.count("master/messages_update_slave"));
   ASSERT_EQ(
-      1u,
+      2u,
       metrics.values["master/messages_update_slave"]);
 
   ASSERT_EQ(
@@ -389,7 +398,7 @@ TEST_F(OversubscriptionTest, RevocableOffer)
 
   // Initially the framework will get all regular resources.
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
   EXPECT_TRUE(Resources(offers1.get()[0].resources()).revocable().empty());
 
   Future<vector<Offer>> offers2;
@@ -398,13 +407,17 @@ TEST_F(OversubscriptionTest, RevocableOffer)
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Inject an estimation of oversubscribable cpu resources.
+  estimations.put(createRevocableResources("cpus", "2"));
+
   Resources taskResources = createRevocableResources("cpus", "1");
+  taskResources.allocate(framework.roles(0));
+
   Resources executorResources = createRevocableResources("cpus", "1");
-  estimations.put(taskResources + executorResources);
+  executorResources.allocate(framework.roles(0));
 
   // Now the framework will get revocable resources.
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2.get().size());
+  ASSERT_FALSE(offers2->empty());
   EXPECT_EQ(
       taskResources + executorResources,
       Resources(offers2.get()[0].resources()));
@@ -428,7 +441,7 @@ TEST_F(OversubscriptionTest, RevocableOffer)
   driver.launchTasks({offers1.get()[0].id(), offers2.get()[0].id()}, {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_RUNNING, status->state());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -493,7 +506,7 @@ TEST_F(OversubscriptionTest, RescindRevocableOfferWithIncreasedRevocable)
   Clock::advance(masterFlags.allocation_interval);
   Clock::settle();
 
-  EXPECT_EQ(1u, offers.size());
+  ASSERT_EQ(1u, offers.size());
   EXPECT_TRUE(Resources(offers.get()->resources()).revocable().empty());
 
   // Inject an estimation of oversubscribable resources.
@@ -506,7 +519,8 @@ TEST_F(OversubscriptionTest, RescindRevocableOfferWithIncreasedRevocable)
   EXPECT_EQ(1u, offers.size());
   Future<Offer> offer = offers.get();
   AWAIT_READY(offer);
-  EXPECT_EQ(resources1, Resources(offer->resources()));
+  EXPECT_EQ(allocatedResources(resources1, framework.roles(0)),
+            Resources(offer->resources()));
 
   Future<OfferID> offerId;
   EXPECT_CALL(sched, offerRescinded(&driver, _))
@@ -534,16 +548,16 @@ TEST_F(OversubscriptionTest, RescindRevocableOfferWithIncreasedRevocable)
   Clock::advance(masterFlags.allocation_interval);
   Clock::settle();
 
-  ASSERT_GT(offers.size(), 0);
+  ASSERT_GT(offers.size(), 0u);
 
   // The total offered resources after the latest estimate.
   Resources resources3;
-  for (size_t i = 0; i < offers.size(); i++) {
+  while (offers.size() != 0) {
     resources3 += offers.get()->resources();
   }
 
   // The offered resources should match the resource estimate.
-  EXPECT_EQ(resources2, resources3);
+  EXPECT_EQ(allocatedResources(resources2, framework.roles(0)), resources3);
 
   driver.stop();
   driver.join();
@@ -605,7 +619,7 @@ TEST_F(OversubscriptionTest, RescindRevocableOfferWithDecreasedRevocable)
   Clock::advance(agentFlags.registration_backoff_factor);
   Clock::advance(masterFlags.allocation_interval);
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1->size());
+  ASSERT_FALSE(offers1->empty());
   EXPECT_TRUE(Resources(offers1.get()[0].resources()).revocable().empty());
 
   Future<vector<Offer>> offers2;
@@ -618,8 +632,9 @@ TEST_F(OversubscriptionTest, RescindRevocableOfferWithDecreasedRevocable)
 
   // Now the framework will get revocable resources.
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2->size());
-  EXPECT_EQ(resources1, Resources(offers2.get()[0].resources()));
+  ASSERT_FALSE(offers2->empty());
+  EXPECT_EQ(allocatedResources(resources1, framework.roles(0)),
+            Resources(offers2.get()[0].resources()));
 
   Future<OfferID> offerId;
   EXPECT_CALL(sched, offerRescinded(&driver, _))
@@ -648,8 +663,9 @@ TEST_F(OversubscriptionTest, RescindRevocableOfferWithDecreasedRevocable)
 
   // The new offer should include the latest oversubscribed resources.
   AWAIT_READY(offers3);
-  EXPECT_NE(0u, offers3->size());
-  EXPECT_EQ(resources2, Resources(offers3.get()[0].resources()));
+  ASSERT_FALSE(offers3->empty());
+  EXPECT_EQ(allocatedResources(resources2, framework.roles(0)),
+            Resources(offers3.get()[0].resources()));
 
   driver.stop();
   driver.join();
@@ -687,8 +703,10 @@ TEST_F(OversubscriptionTest, FixedResourceEstimator)
   Clock::settle();
 
   AWAIT_READY(update);
+  ASSERT_TRUE(update->has_update_oversubscribed_resources());
+  ASSERT_TRUE(update->update_oversubscribed_resources());
 
-  Resources resources = update.get().oversubscribed_resources();
+  Resources resources = update->oversubscribed_resources();
   EXPECT_SOME_EQ(2.0, resources.cpus());
 
   Clock::resume();
@@ -719,7 +737,7 @@ TEST_F(OversubscriptionTest, FixedResourceEstimator)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
   const Offer offer = offers.get()[0];
 
   // The offer should contain revocable resources.
@@ -742,8 +760,8 @@ TEST_F(OversubscriptionTest, FixedResourceEstimator)
   driver.launchTasks(offer.id(), {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(task.task_id(), status.get().task_id());
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(task.task_id(), status->task_id());
+  EXPECT_EQ(TASK_STARTING, status->state());
 
   // Advance the clock for the slave to trigger the calculation of the
   // total oversubscribed resources. As we described above, we don't
@@ -805,7 +823,7 @@ TEST_F(OversubscriptionTest, QoSFetchResourceUsage)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 10", DEFAULT_EXECUTOR_ID);
   task.mutable_executor()->mutable_labels()->add_labels()->CopyFrom(
@@ -824,7 +842,7 @@ TEST_F(OversubscriptionTest, QoSFetchResourceUsage)
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_RUNNING, status->state());
 
   AWAIT_READY(usageCallback);
 
@@ -832,12 +850,12 @@ TEST_F(OversubscriptionTest, QoSFetchResourceUsage)
   AWAIT_READY(usage);
 
   // Expecting the same statistics as these returned by mocked containerizer.
-  ASSERT_EQ(1, usage.get().executors_size());
-  EXPECT_EQ(usage.get().executors(0).executor_info().executor_id(),
+  ASSERT_EQ(1, usage->executors_size());
+  EXPECT_EQ(usage->executors(0).executor_info().executor_id(),
             DEFAULT_EXECUTOR_ID);
-  ASSERT_EQ(usage.get().executors(0).statistics(), statistics);
+  ASSERT_EQ(usage->executors(0).statistics(), statistics);
   ASSERT_EQ(task.executor().labels(),
-            usage.get().executors(0).executor_info().labels());
+            usage->executors(0).executor_info().labels());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -848,7 +866,7 @@ TEST_F(OversubscriptionTest, QoSFetchResourceUsage)
 
 
 // Ensures the slave forwards the estimation whenever receiving
-// a registered or re-registered message from the master, even
+// a registered or reregistered message from the master, even
 // if the total oversubscribable resources does not change.
 TEST_F(OversubscriptionTest, Reregistration)
 {
@@ -888,8 +906,10 @@ TEST_F(OversubscriptionTest, Reregistration)
   Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(slaveRegistered);
   AWAIT_READY(update);
+  ASSERT_TRUE(update->has_update_oversubscribed_resources());
+  ASSERT_TRUE(update->update_oversubscribed_resources());
 
-  Resources resources = update.get().oversubscribed_resources();
+  Resources resources = update->oversubscribed_resources();
   EXPECT_SOME_EQ(2.0, resources.cpus());
 
   // Trigger a re-registration and expect another update message.
@@ -904,6 +924,8 @@ TEST_F(OversubscriptionTest, Reregistration)
   Clock::advance(agentFlags.registration_backoff_factor);
   AWAIT_READY(slaveReregistered);
   AWAIT_READY(update);
+  EXPECT_TRUE(update->has_update_oversubscribed_resources());
+  EXPECT_TRUE(update->update_oversubscribed_resources());
 }
 
 
@@ -924,25 +946,30 @@ TEST_F(OversubscriptionTest, ReceiveQoSCorrection)
         &corrections,
         &Queue<list<QoSCorrection>>::get));
 
-  MockSlave slave(CreateSlaveFlags(), &detector, &containerizer, &controller);
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      &detector,
+      &containerizer,
+      &controller,
+      None(),
+      true);
+
+  ASSERT_SOME(slave);
+  ASSERT_NE(nullptr, slave.get()->mock());
 
   Future<list<QoSCorrection>> qosCorrections;
-  EXPECT_CALL(slave, _qosCorrections(_))
+  EXPECT_CALL(*slave.get()->mock(), _qosCorrections(_))
     .WillOnce(FutureArg<0>(&qosCorrections));
 
-  spawn(slave);
+  slave.get()->start();
 
   list<QoSCorrection> expected = { QoSCorrection() };
   corrections.put(expected);
 
   AWAIT_READY(qosCorrections);
 
-  ASSERT_EQ(qosCorrections.get().size(), 1u);
+  ASSERT_EQ(qosCorrections->size(), 1u);
 
   // TODO(nnielsen): Test for equality of QoSCorrections.
-
-  terminate(slave);
-  wait(slave);
 }
 
 
@@ -999,21 +1026,26 @@ TEST_F(OversubscriptionTest, QoSCorrectionKill)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 10");
 
+  Future<TaskStatus> status0;
   Future<TaskStatus> status1;
   Future<TaskStatus> status2;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status0))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2))
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
+  AWAIT_READY(status0);
+  ASSERT_EQ(TASK_STARTING, status0->state());
+
   AWAIT_READY(status1);
-  ASSERT_EQ(TASK_RUNNING, status1.get().state());
+  ASSERT_EQ(TASK_RUNNING, status1->state());
 
   AWAIT_READY(usageCallback);
 
@@ -1021,9 +1053,9 @@ TEST_F(OversubscriptionTest, QoSCorrectionKill)
   AWAIT_READY(usage);
 
   // Expecting the same statistics as these returned by mocked containerizer.
-  ASSERT_EQ(1, usage.get().executors_size());
+  ASSERT_EQ(1, usage->executors_size());
 
-  const ResourceUsage::Executor& executor = usage.get().executors(0);
+  const ResourceUsage::Executor& executor = usage->executors(0);
   // Carry out kill correction.
   QoSCorrection killCorrection;
 
@@ -1108,21 +1140,26 @@ TEST_F(OversubscriptionTest, QoSCorrectionKillPartitionAware)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 10");
 
+  Future<TaskStatus> status0;
   Future<TaskStatus> status1;
   Future<TaskStatus> status2;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status0))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2))
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
+  AWAIT_READY(status0);
+  ASSERT_EQ(TASK_STARTING, status0->state());
+
   AWAIT_READY(status1);
-  ASSERT_EQ(TASK_RUNNING, status1.get().state());
+  ASSERT_EQ(TASK_RUNNING, status1->state());
 
   AWAIT_READY(usageCallback);
 
@@ -1130,9 +1167,9 @@ TEST_F(OversubscriptionTest, QoSCorrectionKillPartitionAware)
   AWAIT_READY(usage);
 
   // Expecting the same statistics as these returned by mocked containerizer.
-  ASSERT_EQ(1, usage.get().executors_size());
+  ASSERT_EQ(1, usage->executors_size());
 
-  const ResourceUsage::Executor& executor = usage.get().executors(0);
+  const ResourceUsage::Executor& executor = usage->executors(0);
   // Carry out kill correction.
   QoSCorrection killCorrection;
 
@@ -1160,7 +1197,7 @@ TEST_F(OversubscriptionTest, QoSCorrectionKillPartitionAware)
 }
 
 
-// This test verifies that when a framework re-registers with updated
+// This test verifies that when a framework reregisters with updated
 // FrameworkInfo, it gets updated in the allocator. The steps involved
 // are:
 //   1. Launch a master, slave and scheduler.
@@ -1218,7 +1255,7 @@ TEST_F(OversubscriptionTest, UpdateAllocatorOnSchedulerFailover)
   // it doesn't have the capability set.
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
   EXPECT_TRUE(Resources(offers1.get()[0].resources()).revocable().empty());
 
   // Now launch the second (i.e., failover) scheduler using the
@@ -1266,7 +1303,7 @@ TEST_F(OversubscriptionTest, UpdateAllocatorOnSchedulerFailover)
   Clock::resume();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
   EXPECT_TRUE(Resources(offers1.get()[0].resources()).revocable().empty());
 
   // Check if framework receives revocable offers.
@@ -1274,13 +1311,12 @@ TEST_F(OversubscriptionTest, UpdateAllocatorOnSchedulerFailover)
   EXPECT_CALL(sched2, resourceOffers(&driver2, _))
     .WillOnce(FutureArg<1>(&offers2));
 
-  Resources taskResources = createRevocableResources("cpus", "1");
-  Resources executorResources = createRevocableResources("cpus", "1");
-  estimations.put(taskResources + executorResources);
+  Resources revocable = createRevocableResources("cpus", "2");
+  estimations.put(revocable);
 
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2.get().size());
-  EXPECT_EQ(taskResources + executorResources,
+  ASSERT_FALSE(offers2->empty());
+  EXPECT_EQ(allocatedResources(revocable, framework2.roles(0)),
             Resources(offers2.get()[0].resources()));
 
   EXPECT_EQ(DRIVER_STOPPED, driver2.stop());
@@ -1289,6 +1325,7 @@ TEST_F(OversubscriptionTest, UpdateAllocatorOnSchedulerFailover)
   EXPECT_EQ(DRIVER_ABORTED, driver1.stop());
   EXPECT_EQ(DRIVER_STOPPED, driver1.join());
 }
+
 
 TEST_F(OversubscriptionTest, RemoveCapabilitiesOnSchedulerFailover)
 {
@@ -1338,7 +1375,7 @@ TEST_F(OversubscriptionTest, RemoveCapabilitiesOnSchedulerFailover)
 
   // Initially the framework will get all regular resources.
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
   EXPECT_TRUE(Resources(offers1.get()[0].resources()).revocable().empty());
 
   Future<vector<Offer>> offers2;
@@ -1347,16 +1384,14 @@ TEST_F(OversubscriptionTest, RemoveCapabilitiesOnSchedulerFailover)
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Inject an estimation of oversubscribable cpu resources.
-  Resources taskResources = createRevocableResources("cpus", "1");
-  Resources executorResources = createRevocableResources("cpus", "1");
-  estimations.put(taskResources + executorResources);
+  Resources revocable = createRevocableResources("cpus", "2");
+  estimations.put(revocable);
 
   // Now the framework will get revocable resources.
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2.get().size());
-  EXPECT_EQ(
-      taskResources + executorResources,
-      Resources(offers2.get()[0].resources()));
+  ASSERT_FALSE(offers2->empty());
+  EXPECT_EQ(allocatedResources(revocable, framework1.roles(0)),
+            Resources(offers2.get()[0].resources()));
 
   // Reregister the framework with removal of revocable resources capability.
   FrameworkInfo framework2 = DEFAULT_FRAMEWORK_INFO;
@@ -1391,7 +1426,7 @@ TEST_F(OversubscriptionTest, RemoveCapabilitiesOnSchedulerFailover)
   Clock::resume();
 
   AWAIT_READY(offers3);
-  EXPECT_NE(0u, offers3.get().size());
+  ASSERT_FALSE(offers3->empty());
   EXPECT_TRUE(Resources(offers3.get()[0].resources()).revocable().empty());
 
   driver1.stop();
@@ -1464,7 +1499,7 @@ TEST_F(OversubscriptionTest, LoadQoSController)
   AWAIT(qosCorrections);
 
   // Expect no corrections.
-  ASSERT_EQ(qosCorrections.get().size(), 0u);
+  ASSERT_EQ(qosCorrections->size(), 0u);
 
   // Second correction iteration. Make system 5 minutes load above the
   // threshold.
@@ -1474,7 +1509,7 @@ TEST_F(OversubscriptionTest, LoadQoSController)
   AWAIT(qosCorrections);
 
   // Expect two corrections, since there were two revocable executors.
-  ASSERT_EQ(qosCorrections.get().size(), 2u);
+  ASSERT_EQ(qosCorrections->size(), 2u);
 }
 
 

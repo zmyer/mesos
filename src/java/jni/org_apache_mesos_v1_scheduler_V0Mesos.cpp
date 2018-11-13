@@ -28,6 +28,7 @@
 #include <process/clock.hpp>
 #include <process/delay.hpp>
 #include <process/dispatch.hpp>
+#include <process/future.hpp>
 #include <process/id.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
@@ -79,58 +80,66 @@ public:
       const string& master,
       const Option<Credential>& credential);
 
-  virtual ~V0ToV1Adapter();
+  ~V0ToV1Adapter() override;
 
   // v0 Scheduler interface overrides.
-  virtual void registered(
+  void registered(
       SchedulerDriver* driver,
       const FrameworkID& frameworkId,
       const MasterInfo& masterInfo) override;
 
-  virtual void reregistered(
+  void reregistered(
       SchedulerDriver* driver,
       const MasterInfo& masterInfo) override;
 
-  virtual void disconnected(SchedulerDriver* driver) override;
+  void disconnected(SchedulerDriver* driver) override;
 
-  virtual void resourceOffers(
+  void resourceOffers(
       SchedulerDriver* driver,
       const vector<Offer>& offers) override;
 
-  virtual void offerRescinded(
+  void offerRescinded(
       SchedulerDriver* driver,
       const OfferID& offerId) override;
 
-  virtual void statusUpdate(
+  void statusUpdate(
       SchedulerDriver* driver,
       const TaskStatus& status) override;
 
-  virtual void frameworkMessage(
+  void frameworkMessage(
       SchedulerDriver* driver,
       const ExecutorID& executorId,
       const SlaveID& slaveId,
       const string& data) override;
 
-  virtual void slaveLost(
+  void slaveLost(
       SchedulerDriver* driver,
       const SlaveID& slaveId) override;
 
-  virtual void executorLost(
+  void executorLost(
       SchedulerDriver* driver,
       const ExecutorID& executorId,
       const SlaveID& slaveId,
       int status) override;
 
-  virtual void error(
+  void error(
       SchedulerDriver* driver,
       const string& message) override;
 
   // v1 MesosBase interface overrides.
-  virtual void send(const v1::scheduler::Call& call) override;
+  void send(const v1::scheduler::Call& call) override;
 
-  virtual void reconnect() override
+  void reconnect() override
   {
     // The driver does not support explicit reconnection with the master.
+    UNREACHABLE();
+  }
+
+  process::Future<v1::scheduler::APIResult> call(
+      const v1::scheduler::Call& callMessage) override
+  {
+    // The driver does not support sending a `v1::scheduler::Call` that returns
+    // a `v1::scheduler::Response`.
     UNREACHABLE();
   }
 
@@ -148,7 +157,7 @@ class V0ToV1AdapterProcess : public process::Process<V0ToV1AdapterProcess>
 public:
   V0ToV1AdapterProcess(JNIEnv* env, jweak jmesos);
 
-  virtual ~V0ToV1AdapterProcess() = default;
+  ~V0ToV1AdapterProcess() override = default;
 
   void registered(const FrameworkID& frameworkId, const MasterInfo& masterInfo);
 
@@ -188,6 +197,8 @@ protected:
   void _received();
 
   void __received(const Event& event);
+
+  void connect();
 
   void heartbeat();
 
@@ -355,35 +366,9 @@ void V0ToV1AdapterProcess::registered(
     const FrameworkID& _frameworkId,
     const MasterInfo& masterInfo)
 {
-  jvm->AttachCurrentThread(JNIENV_CAST(&env), NULL);
+  LOG(INFO) << "Registered with the Mesos master; invoking connected callback";
 
-  jclass clazz = env->GetObjectClass(jmesos);
-
-  jfieldID scheduler =
-    env->GetFieldID(clazz, "scheduler",
-                    "Lorg/apache/mesos/v1/scheduler/Scheduler;");
-
-  jobject jscheduler = env->GetObjectField(jmesos, scheduler);
-
-  clazz = env->GetObjectClass(jscheduler);
-
-  // scheduler.connected(mesos);
-  jmethodID connected =
-    env->GetMethodID(clazz, "connected",
-                     "(Lorg/apache/mesos/v1/scheduler/Mesos;)V");
-
-  env->ExceptionClear();
-
-  env->CallVoidMethod(jscheduler, connected, jmesos);
-
-  if (env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    jvm->DetachCurrentThread();
-    ABORT("Exception thrown during `connected` call");
-  }
-
-  jvm->DetachCurrentThread();
+  connect();
 
   // We need this copy to populate the fields in `Event::Subscribed` upon
   // receiving a `reregistered()` callback later.
@@ -422,37 +407,28 @@ void V0ToV1AdapterProcess::reregistered(const MasterInfo& masterInfo)
 
 void V0ToV1AdapterProcess::disconnected()
 {
-  disconnect();
+  // Upon noticing a disconnection with the master, we drain the pending
+  // events in the queue that were waiting to be sent to the scheduler
+  // upon receiving the subscribe call.
+  // It's fine to do so because:
+  // - Any outstanding offers are invalidated by the master upon a scheduler
+  //   (re-)registration.
+  // - Any task status updates could be reconciled by the scheduler.
+  LOG(INFO) << "Dropping " << pending.size() << " pending event(s)"
+            << " because master disconnected";
 
-  jvm->AttachCurrentThread(JNIENV_CAST(&env), NULL);
+  pending = queue<Event>();
+  subscribeCall = false;
 
-  jclass clazz = env->GetObjectClass(jmesos);
-
-  jfieldID scheduler =
-    env->GetFieldID(clazz, "scheduler",
-                    "Lorg/apache/mesos/v1/scheduler/Scheduler;");
-
-  jobject jscheduler = env->GetObjectField(jmesos, scheduler);
-
-  clazz = env->GetObjectClass(jscheduler);
-
-  // scheduler.disconnected(mesos);
-  jmethodID disconnected =
-    env->GetMethodID(clazz, "disconnected",
-                     "(Lorg/apache/mesos/v1/scheduler/Mesos;)V");
-
-  env->ExceptionClear();
-
-  env->CallVoidMethod(jmesos, disconnected);
-
-  if (env->ExceptionCheck()) {
-    env->ExceptionDescribe();
-    env->ExceptionClear();
-    jvm->DetachCurrentThread();
-    ABORT("Exception thrown during `disconnected` call");
+  if (heartbeatTimer.isSome()) {
+    Clock::cancel(heartbeatTimer.get());
+    heartbeatTimer = None();
   }
 
-  jvm->DetachCurrentThread();
+  LOG(INFO) << "Disconnected with the Mesos master;"
+            << " invoking disconnected callback";
+
+  disconnect();
 }
 
 
@@ -554,6 +530,18 @@ void V0ToV1AdapterProcess::error(const string& message)
 
   event.mutable_error()->set_message(message);
 
+  // There might be an error during the communication with the master or
+  // implicit registration happening on driver initialization. Since
+  // `Scheduler.connect` is called upon a successful registration only, the
+  // scheduler will never try to subscribe and hence will never receive the
+  // error. This workaround satisfies the invariant of the v1 interface that
+  // a scheduler can receive an event only after successfully connecting with
+  // the master.
+  if (!subscribeCall) {
+    LOG(INFO) << "Implicitly connecting the scheduler to send an error";
+    connect();
+  }
+
   received(event);
 }
 
@@ -572,24 +560,25 @@ void V0ToV1AdapterProcess::send(SchedulerDriver* driver, const Call& _call)
   }
 
   switch (call.type()) {
-    case Call::SUBSCRIBE: {
+    case scheduler::Call::SUBSCRIBE: {
       subscribeCall = true;
 
       heartbeatTimer = process::delay(interval, self(), &Self::heartbeat);
 
       // The driver subscribes implicitly with the master upon initialization.
       // For compatibility with the v1 interface, send the already enqueued
-      // subscribed event upon receiving the subscribe request.
+      // subscribed event (or subscription error) upon receiving the subscribe
+      // request.
       _received();
       break;
     }
 
-    case Call::TEARDOWN: {
+    case scheduler::Call::TEARDOWN: {
       driver->stop(false);
       break;
     }
 
-    case Call::ACCEPT: {
+    case scheduler::Call::ACCEPT: {
       vector<OfferID> offerIds;
       foreach (const OfferID& offerId, call.accept().offer_ids()) {
         offerIds.emplace_back(offerId);
@@ -609,15 +598,15 @@ void V0ToV1AdapterProcess::send(SchedulerDriver* driver, const Call& _call)
       break;
     }
 
-    case Call::ACCEPT_INVERSE_OFFERS:
-    case Call::DECLINE_INVERSE_OFFERS:
-    case Call::SHUTDOWN: {
+    case scheduler::Call::ACCEPT_INVERSE_OFFERS:
+    case scheduler::Call::DECLINE_INVERSE_OFFERS:
+    case scheduler::Call::SHUTDOWN: {
       // TODO(anand): Throw java error.
       LOG(ERROR) << "Received an unexpected " << call.type() << " call";
       break;
     }
 
-    case Call::DECLINE: {
+    case scheduler::Call::DECLINE: {
       foreach (const OfferID& offerId, call.decline().offer_ids()) {
         if (call.decline().has_filters()) {
           driver->declineOffer(offerId, call.decline().filters());
@@ -629,17 +618,17 @@ void V0ToV1AdapterProcess::send(SchedulerDriver* driver, const Call& _call)
       break;
     }
 
-    case Call::REVIVE: {
+    case scheduler::Call::REVIVE: {
       driver->reviveOffers();
       break;
     }
 
-    case Call::KILL: {
+    case scheduler::Call::KILL: {
       driver->killTask(call.kill().task_id());
       break;
     }
 
-    case Call::ACKNOWLEDGE: {
+    case scheduler::Call::ACKNOWLEDGE: {
       TaskStatus status;
       status.mutable_task_id()->CopyFrom(call.acknowledge().task_id());
       status.mutable_slave_id()->CopyFrom(call.acknowledge().slave_id());
@@ -649,7 +638,11 @@ void V0ToV1AdapterProcess::send(SchedulerDriver* driver, const Call& _call)
       break;
     }
 
-    case Call::RECONCILE: {
+    // TODO(greggomann): Implement operation status acknowledgement.
+    case scheduler::Call::ACKNOWLEDGE_OPERATION_STATUS:
+      break;
+
+    case scheduler::Call::RECONCILE: {
       vector<TaskStatus> statuses;
 
       foreach (const scheduler::Call::Reconcile::Task& task,
@@ -663,7 +656,11 @@ void V0ToV1AdapterProcess::send(SchedulerDriver* driver, const Call& _call)
       break;
     }
 
-    case Call::MESSAGE: {
+    // TODO(greggomann): Implement operation reconciliation.
+    case scheduler::Call::RECONCILE_OPERATIONS:
+      break;
+
+    case scheduler::Call::MESSAGE: {
       driver->sendFrameworkMessage(
           call.message().executor_id(),
           call.message().slave_id(),
@@ -671,7 +668,7 @@ void V0ToV1AdapterProcess::send(SchedulerDriver* driver, const Call& _call)
       break;
     }
 
-    case Call::REQUEST: {
+    case scheduler::Call::REQUEST: {
       vector<Request> requests;
 
       foreach (const Request& request, call.request().requests()) {
@@ -682,12 +679,12 @@ void V0ToV1AdapterProcess::send(SchedulerDriver* driver, const Call& _call)
       break;
     }
 
-    case Call::SUPPRESS: {
+    case scheduler::Call::SUPPRESS: {
       driver->suppressOffers();
       break;
     }
 
-    case Call::UNKNOWN: {
+    case scheduler::Call::UNKNOWN: {
       EXIT(EXIT_FAILURE) << "Received an unexpected " << call.type()
                          << " call";
       break;
@@ -699,7 +696,8 @@ void V0ToV1AdapterProcess::send(SchedulerDriver* driver, const Call& _call)
 void V0ToV1AdapterProcess::received(const Event& event)
 {
   // For compatibility with the v1 interface, we only start sending events
-  // once the scheduler has sent the subscribe call.
+  // once the scheduler has sent the subscribe call. An exception to this
+  // is an error event, which can be sent before the subscribe call.
   if (!subscribeCall) {
     pending.push(event);
     return;
@@ -759,6 +757,40 @@ void V0ToV1AdapterProcess::__received(const Event& event)
 }
 
 
+void V0ToV1AdapterProcess::connect()
+{
+  jvm->AttachCurrentThread(JNIENV_CAST(&env), NULL);
+
+  jclass clazz = env->GetObjectClass(jmesos);
+
+  jfieldID scheduler =
+    env->GetFieldID(clazz, "scheduler",
+                    "Lorg/apache/mesos/v1/scheduler/Scheduler;");
+
+  jobject jscheduler = env->GetObjectField(jmesos, scheduler);
+
+  clazz = env->GetObjectClass(jscheduler);
+
+  // scheduler.connected(mesos);
+  jmethodID connected =
+    env->GetMethodID(clazz, "connected",
+                     "(Lorg/apache/mesos/v1/scheduler/Mesos;)V");
+
+  env->ExceptionClear();
+
+  env->CallVoidMethod(jscheduler, connected, jmesos);
+
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    jvm->DetachCurrentThread();
+    ABORT("Exception thrown during `connected` call");
+  }
+
+  jvm->DetachCurrentThread();
+}
+
+
 void V0ToV1AdapterProcess::heartbeat()
 {
   // It is possible that we were unable to cancel this timer upon a
@@ -783,20 +815,35 @@ void V0ToV1AdapterProcess::heartbeat()
 
 void V0ToV1AdapterProcess::disconnect()
 {
-  // Upon noticing a disconnection with the master, we drain the pending
-  // events in the queue that were waiting to be sent to the scheduler
-  // upon receiving the subscribe call.
-  // It's fine to do so because:
-  // - Any outstanding offers are invalidated by the master upon a scheduler
-  //   (re-)registration.
-  // - Any task status updates could be reconciled by the scheduler.
-  pending = queue<Event>();
-  subscribeCall = false;
+  jvm->AttachCurrentThread(JNIENV_CAST(&env), NULL);
 
-  if (heartbeatTimer.isSome()) {
-    Clock::cancel(heartbeatTimer.get());
-    heartbeatTimer = None();
+  jclass clazz = env->GetObjectClass(jmesos);
+
+  jfieldID scheduler =
+    env->GetFieldID(clazz, "scheduler",
+                    "Lorg/apache/mesos/v1/scheduler/Scheduler;");
+
+  jobject jscheduler = env->GetObjectField(jmesos, scheduler);
+
+  clazz = env->GetObjectClass(jscheduler);
+
+  // scheduler.disconnected(mesos);
+  jmethodID disconnected =
+    env->GetMethodID(clazz, "disconnected",
+                     "(Lorg/apache/mesos/v1/scheduler/Mesos;)V");
+
+  env->ExceptionClear();
+
+  env->CallVoidMethod(jscheduler, disconnected, jmesos);
+
+  if (env->ExceptionCheck()) {
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    jvm->DetachCurrentThread();
+    ABORT("Exception thrown during `disconnected` call");
   }
+
+  jvm->DetachCurrentThread();
 }
 
 

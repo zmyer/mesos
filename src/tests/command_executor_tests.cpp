@@ -32,6 +32,8 @@
 
 #include <stout/gtest.hpp>
 
+#include <stout/os/constants.hpp>
+
 #include "master/master.hpp"
 
 #include "master/detector/standalone.hpp"
@@ -123,11 +125,16 @@ TEST_P(CommandExecutorTest, NoTaskKillingCapability)
       offers->front().resources(),
       SLEEP_COMMAND(1000));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
   driver.launchTasks(offers->front().id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -149,9 +156,6 @@ TEST_P(CommandExecutorTest, NoTaskKillingCapability)
 
 // This test ensures that the command executor sends TASK_KILLING
 // to frameworks that support the capability.
-// TODO(hausdorff): Enable test. The executor tests use the replicated log
-// by default. This is not currently supported on Windows, so they will all
-// fail until that changes.
 TEST_P(CommandExecutorTest, TaskKillingCapability)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -194,11 +198,16 @@ TEST_P(CommandExecutorTest, TaskKillingCapability)
       offers->front().resources(),
        SLEEP_COMMAND(1000));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
   driver.launchTasks(offers->front().id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -221,8 +230,83 @@ TEST_P(CommandExecutorTest, TaskKillingCapability)
 }
 
 
-// TODO(hausdorff): Kill policy helpers are not yet enabled on Windows. See
-// MESOS-6698.
+// This test ensures that the command executor will terminate a task after it
+// reaches `max_completion_time`.
+TEST_P(CommandExecutorTest, MaxCompletionTime)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.http_command_executor = GetParam();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  // Although the framework is started with the task killing capability,
+  // it should not receive a `TASK_KILLING` status update.
+  FrameworkInfo::Capability capability;
+  capability.set_type(FrameworkInfo::Capability::TASK_KILLING_STATE);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_capabilities()->CopyFrom(capability);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_EQ(1u, offers->size());
+
+  // Launch a task with the command executor.
+  TaskInfo task = createTask(
+      offers->front().slave_id(),
+      offers->front().resources(),
+       SLEEP_COMMAND(1000));
+
+  // Set a `max_completion_time` for 2 seconds. Hopefully this should not
+  // block test too long and still keep it reliable.
+  task.mutable_max_completion_time()->set_nanoseconds(Seconds(2).ns());
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFailed;
+
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFailed));
+
+  driver.launchTasks(offers->front().id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  AWAIT_READY(statusFailed);
+  EXPECT_EQ(TASK_FAILED, statusFailed->state());
+
+  EXPECT_EQ(
+      TaskStatus::REASON_MAX_COMPLETION_TIME_REACHED, statusFailed->reason());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// TODO(qianzhang): Kill policy helpers are not yet enabled on Windows. See
+// MESOS-8168.
 #ifndef __WINDOWS__
 // This test ensures that a task will transition straight from `TASK_KILLING` to
 // `TASK_KILLED`, even if the health check begins to fail during the kill policy
@@ -280,7 +364,8 @@ TEST_P(CommandExecutorTest, NoTransitionFromKillingToRunning)
 
   HealthCheck healthCheck;
   healthCheck.set_type(HealthCheck::COMMAND);
-  healthCheck.mutable_command()->set_value("ls " + tmpPath + " >/dev/null");
+  healthCheck.mutable_command()->set_value(
+      "ls " + tmpPath + " > " + os::DEV_NULL);
   healthCheck.set_delay_seconds(0);
   healthCheck.set_grace_period_seconds(0);
   healthCheck.set_interval_seconds(0);
@@ -296,12 +381,14 @@ TEST_P(CommandExecutorTest, NoTransitionFromKillingToRunning)
   vector<TaskInfo> tasks;
   tasks.push_back(task);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
   Future<TaskStatus> statusKilling;
   Future<TaskStatus> statusKilled;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillOnce(FutureArg<1>(&statusKilling))
@@ -309,26 +396,29 @@ TEST_P(CommandExecutorTest, NoTransitionFromKillingToRunning)
 
   driver.launchTasks(offers->front().id(), tasks);
 
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
   AWAIT_READY(statusRunning);
-  EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   AWAIT_READY(statusHealthy);
-  EXPECT_EQ(TASK_RUNNING, statusHealthy.get().state());
-  EXPECT_TRUE(statusHealthy.get().has_healthy());
-  EXPECT_TRUE(statusHealthy.get().healthy());
+  EXPECT_EQ(TASK_RUNNING, statusHealthy->state());
+  EXPECT_TRUE(statusHealthy->has_healthy());
+  EXPECT_TRUE(statusHealthy->healthy());
 
   driver.killTask(task.task_id());
 
   AWAIT_READY(statusKilling);
   EXPECT_EQ(TASK_KILLING, statusKilling->state());
-  EXPECT_FALSE(statusKilling.get().has_healthy());
+  EXPECT_FALSE(statusKilling->has_healthy());
 
   // Remove the temporary file, so that the health check fails.
   os::rm(tmpPath);
 
   AWAIT_READY(statusKilled);
   EXPECT_EQ(TASK_KILLED, statusKilled->state());
-  EXPECT_FALSE(statusKilled.get().has_healthy());
+  EXPECT_FALSE(statusKilled->has_healthy());
 
   driver.stop();
   driver.join();
@@ -350,7 +440,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HTTPCommandExecutorTest, TerminateWithACK)
   slave::Flags flags = CreateSlaveFlags();
   flags.http_command_executor = true;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, false, &fetcher);
@@ -360,8 +450,16 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HTTPCommandExecutorTest, TerminateWithACK)
 
   StandaloneMasterDetector detector(master.get()->pid);
 
-  MockSlave slave(flags, &detector, containerizer.get());
-  spawn(slave);
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      &detector,
+      containerizer.get(),
+      flags,
+      true);
+
+  ASSERT_SOME(slave);
+  ASSERT_NE(nullptr, slave.get()->mock());
+
+  slave.get()->start();
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -385,20 +483,26 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HTTPCommandExecutorTest, TerminateWithACK)
       offers->front().resources(),
       "sleep 1");
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
 
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFinished));
 
   Future<Future<Option<ContainerTermination>>> termination;
-  EXPECT_CALL(slave, executorTerminated(_, _, _))
+  EXPECT_CALL(*slave.get()->mock(), executorTerminated(_, _, _))
     .WillOnce(FutureArg<2>(&termination));
 
   driver.launchTasks(offers->front().id(), {task});
 
-  // Scheduler should first receive TASK_RUNNING followed by TASK_FINISHED.
+  // Scheduler should first receive TASK_STARTING, followed by TASK_RUNNING
+  // and TASK_FINISHED.
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
@@ -408,14 +512,11 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HTTPCommandExecutorTest, TerminateWithACK)
   // The executor should self terminate with 0 as exit status once
   // it gets the ACK for the terminal status update from agent.
   AWAIT_READY(termination);
-  ASSERT_TRUE(termination.get().isReady());
-  EXPECT_EQ(0, termination.get().get().get().status());
+  ASSERT_TRUE(termination->isReady());
+  EXPECT_EQ(0, termination->get()->status());
 
   driver.stop();
   driver.join();
-
-  terminate(slave);
-  wait(slave);
 }
 
 
@@ -461,23 +562,24 @@ TEST_F(HTTPCommandExecutorTest, ExplicitAcknowledgements)
       offers->front().resources(),
       SLEEP_COMMAND(1000));
 
-  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusStarting;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&statusRunning));
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   // Ensure no status update acknowledgements are sent from the driver
   // to the master until the explicit acknowledgement is sent.
   EXPECT_NO_FUTURE_CALLS(
       mesos::scheduler::Call(),
       mesos::scheduler::Call::ACKNOWLEDGE,
-      _ ,
+      _,
       master.get()->pid);
 
   driver.launchTasks(offers->front().id(), {task});
 
-  AWAIT_READY(statusRunning);
-  EXPECT_TRUE(statusRunning->has_slave_id());
-  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  AWAIT_READY(statusStarting);
+  EXPECT_TRUE(statusStarting->has_slave_id());
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   // Now send the acknowledgement.
   Future<mesos::scheduler::Call> acknowledgement = FUTURE_CALL(
@@ -486,7 +588,7 @@ TEST_F(HTTPCommandExecutorTest, ExplicitAcknowledgements)
       _,
       master.get()->pid);
 
-  driver.acknowledgeStatusUpdate(statusRunning.get());
+  driver.acknowledgeStatusUpdate(statusStarting.get());
 
   AWAIT_READY(acknowledgement);
 

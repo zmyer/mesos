@@ -14,13 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <glog/logging.h>
-
 #include <string>
 #include <vector>
 
 #include <mesos/resources.hpp>
 #include <mesos/scheduler.hpp>
+
+#include <mesos/authorizer/acls.hpp>
 
 #include <process/clock.hpp>
 #include <process/defer.hpp>
@@ -30,7 +30,7 @@
 #include <process/time.hpp>
 
 #include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/pull_gauge.hpp>
 #include <process/metrics/metrics.hpp>
 
 #include <stout/bytes.hpp>
@@ -38,8 +38,12 @@
 #include <stout/flags.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
+#include <stout/protobuf.hpp>
 #include <stout/try.hpp>
 
+#include "examples/flags.hpp"
+
+#include "logging/logging.hpp"
 
 using namespace mesos;
 
@@ -48,23 +52,25 @@ using std::string;
 using process::Clock;
 using process::defer;
 
-using process::metrics::Gauge;
+using process::metrics::PullGauge;
 using process::metrics::Counter;
-
 
 const double CPUS_PER_TASK = 0.1;
 const int MEMORY_PER_TASK = 16;
 const Bytes DISK_PER_TASK = Megabytes(5);
 
+constexpr char FRAMEWORK_METRICS_PREFIX[] = "disk_full_framework";
 
-class Flags : public virtual flags::FlagsBase
+
+class Flags : public virtual mesos::internal::examples::Flags
 {
 public:
   Flags()
   {
-    add(&Flags::master,
-        "master",
-        "Master to connect to.");
+    add(&Flags::name,
+        "name",
+        "Name to be used by the framework.",
+        "Disk Full Framework");
 
     add(&Flags::run_once,
         "run_once",
@@ -98,7 +104,7 @@ public:
         "and the task will terminated.\n");
   }
 
-  string master;
+  string name;
   bool run_once;
   Duration pre_sleep_duration;
   Duration post_sleep_duration;
@@ -111,8 +117,12 @@ class DiskFullSchedulerProcess
   : public process::Process<DiskFullSchedulerProcess>
 {
 public:
-  DiskFullSchedulerProcess (const Flags& _flags)
+  DiskFullSchedulerProcess (
+      const Flags& _flags,
+      const FrameworkInfo& _frameworkInfo)
     : flags(_flags),
+      frameworkInfo(_frameworkInfo),
+      role(_frameworkInfo.roles(0)),
       tasksLaunched(0),
       taskActive(false),
       isRegistered(false),
@@ -135,10 +145,12 @@ public:
       SchedulerDriver* driver,
       const std::vector<Offer>& offers)
   {
-    static const Resources TASK_RESOURCES = Resources::parse(
+    Resources taskResources = Resources::parse(
         "cpus:" + stringify(CPUS_PER_TASK) +
         ";mem:" + stringify(MEMORY_PER_TASK) +
-        ";disk:" + stringify(DISK_PER_TASK.megabytes())).get();
+        ";disk:" + stringify(
+            (double) DISK_PER_TASK.bytes() / Bytes::MEGABYTES)).get();
+    taskResources.allocate(role);
 
     foreach (const Offer& offer, offers) {
       LOG(INFO) << "Received offer " << offer.id() << " from agent "
@@ -149,9 +161,13 @@ public:
 
       // If we've already launched the task, or if the offer is not
       // big enough, reject the offer.
-      if (taskActive || !resources.flatten().contains(TASK_RESOURCES)) {
+      if (taskActive || !resources.toUnreserved().contains(taskResources)) {
         Filters filters;
         filters.set_refuse_seconds(600);
+
+        LOG(INFO) << "Declining offer " << offer.id() << ": "
+                  << (taskActive ? "a task is already running"
+                                 : "offer does not fit");
 
         driver->declineOffer(offer.id(), filters);
         continue;
@@ -166,14 +182,14 @@ public:
       static const string command =
           "sleep " + stringify(flags.pre_sleep_duration.secs()) +
           " && dd if=/dev/zero of=file bs=1K count=" +
-          stringify(flags.disk_use_limit.kilobytes()) +
+          stringify(flags.disk_use_limit.bytes() / Bytes::KILOBYTES) +
           " && sleep " + stringify(flags.post_sleep_duration.secs());
 
       TaskInfo task;
-      task.set_name("Disk full framework task");
+      task.set_name(flags.name + " Task");
       task.mutable_task_id()->set_value(stringify(taskId));
       task.mutable_slave_id()->MergeFrom(offer.slave_id());
-      task.mutable_resources()->CopyFrom(TASK_RESOURCES);
+      task.mutable_resources()->CopyFrom(taskResources);
       task.mutable_command()->set_shell(true);
       task.mutable_command()->set_value(command);
 
@@ -239,7 +255,11 @@ public:
       }
 
       taskActive = false;
-      ++metrics.abnormal_terminations;
+
+      if (status.reason() != TaskStatus::REASON_INVALID_OFFERS) {
+        ++metrics.abnormal_terminations;
+      }
+
       break;
     case TASK_STARTING:
     case TASK_RUNNING:
@@ -252,6 +272,9 @@ public:
 
 private:
   const Flags flags;
+  const FrameworkInfo frameworkInfo;
+  const string role;
+
   int tasksLaunched;
   bool taskActive;
 
@@ -272,14 +295,15 @@ private:
   {
     Metrics(const DiskFullSchedulerProcess& _scheduler)
       : uptime_secs(
-            "disk_full_framework/uptime_secs",
+            string(FRAMEWORK_METRICS_PREFIX) + "/uptime_secs",
             defer(_scheduler, &DiskFullSchedulerProcess::_uptime_secs)),
         registered(
-            "disk_full_framework/registered",
+            string(FRAMEWORK_METRICS_PREFIX) + "/registered",
             defer(_scheduler, &DiskFullSchedulerProcess::_registered)),
-        tasks_finished("disk_full_framework/tasks_finished"),
-        tasks_disk_full("disk_full_framework/tasks_disk_full"),
-        abnormal_terminations("disk_full_framework/abnormal_terminations")
+        tasks_finished(string(FRAMEWORK_METRICS_PREFIX) + "/tasks_finished"),
+        tasks_disk_full(string(FRAMEWORK_METRICS_PREFIX) + "/tasks_disk_full"),
+        abnormal_terminations(
+            string(FRAMEWORK_METRICS_PREFIX) + "/abnormal_terminations")
     {
       process::metrics::add(uptime_secs);
       process::metrics::add(registered);
@@ -297,8 +321,8 @@ private:
       process::metrics::remove(abnormal_terminations);
     }
 
-    process::metrics::Gauge uptime_secs;
-    process::metrics::Gauge registered;
+    process::metrics::PullGauge uptime_secs;
+    process::metrics::PullGauge registered;
 
     process::metrics::Counter tasks_finished;
     process::metrics::Counter tasks_disk_full;
@@ -313,36 +337,36 @@ private:
 class DiskFullScheduler : public Scheduler
 {
 public:
-  DiskFullScheduler(const Flags& _flags)
-    : process(_flags)
+  DiskFullScheduler(const Flags& _flags, const FrameworkInfo& _frameworkInfo)
+    : process(_flags, _frameworkInfo)
   {
     process::spawn(process);
   }
 
-  virtual ~DiskFullScheduler()
+  ~DiskFullScheduler() override
   {
     process::terminate(process);
     process::wait(process);
   }
 
-  virtual void registered(
+  void registered(
       SchedulerDriver*,
       const FrameworkID& frameworkId,
-      const MasterInfo&)
+      const MasterInfo&) override
   {
     LOG(INFO) << "Registered with framework ID: " << frameworkId;
 
     process::dispatch(&process, &DiskFullSchedulerProcess::registered);
   }
 
-  virtual void reregistered(SchedulerDriver*, const MasterInfo&)
+  void reregistered(SchedulerDriver*, const MasterInfo&) override
   {
     LOG(INFO) << "Reregistered";
 
     process::dispatch(&process, &DiskFullSchedulerProcess::registered);
   }
 
-  virtual void disconnected(SchedulerDriver*)
+  void disconnected(SchedulerDriver*) override
   {
     LOG(INFO) << "Disconnected";
 
@@ -351,9 +375,9 @@ public:
         &DiskFullSchedulerProcess::disconnected);
   }
 
-  virtual void resourceOffers(
+  void resourceOffers(
       SchedulerDriver* driver,
-      const std::vector<Offer>& offers)
+      const std::vector<Offer>& offers) override
   {
     LOG(INFO) << "Resource offers received";
 
@@ -364,12 +388,12 @@ public:
          offers);
   }
 
-  virtual void offerRescinded(SchedulerDriver*, const OfferID&)
+  void offerRescinded(SchedulerDriver*, const OfferID&) override
   {
     LOG(INFO) << "Offer rescinded";
   }
 
-  virtual void statusUpdate(SchedulerDriver* driver, const TaskStatus& status)
+  void statusUpdate(SchedulerDriver* driver, const TaskStatus& status) override
   {
     LOG(INFO) << "Task " << status.task_id() << " in state "
               << TaskState_Name(status.state())
@@ -384,30 +408,30 @@ public:
         status);
   }
 
-  virtual void frameworkMessage(
+  void frameworkMessage(
       SchedulerDriver*,
       const ExecutorID&,
       const SlaveID&,
-      const string& data)
+      const string& data) override
   {
     LOG(INFO) << "Framework message: " << data;
   }
 
-  virtual void slaveLost(SchedulerDriver*, const SlaveID& slaveId)
+  void slaveLost(SchedulerDriver*, const SlaveID& slaveId) override
   {
     LOG(INFO) << "Agent lost: " << slaveId;
   }
 
-  virtual void executorLost(
+  void executorLost(
       SchedulerDriver*,
       const ExecutorID& executorId,
       const SlaveID& slaveId,
-      int)
+      int) override
   {
     LOG(INFO) << "Executor '" << executorId << "' lost on agent: " << slaveId;
   }
 
-  virtual void error(SchedulerDriver*, const string& message)
+  void error(SchedulerDriver*, const string& message) override
   {
     LOG(INFO) << "Error message: " << message;
   }
@@ -420,52 +444,71 @@ private:
 int main(int argc, char** argv)
 {
   Flags flags;
-  Try<flags::Warnings> load = flags.load("MESOS_", argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_EXAMPLE_", argc, argv);
 
-  if (load.isError()) {
-    EXIT(EXIT_FAILURE) << flags.usage(load.error());
+  if (flags.help) {
+    std::cout << flags.usage() << std::endl;
+    return EXIT_SUCCESS;
   }
 
-  DiskFullScheduler scheduler(flags);
+  if (load.isError()) {
+    std::cerr << flags.usage(load.error()) << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  internal::logging::initialize(argv[0], false);
+
+  // Log any flag warnings.
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
 
   FrameworkInfo framework;
   framework.set_user(""); // Have Mesos fill the current user.
-  framework.set_name("Disk Full Framework (C++)");
-  framework.set_checkpoint(true);
+  framework.set_principal(flags.principal);
+  framework.set_name(flags.name);
+  framework.set_checkpoint(flags.checkpoint);
+  framework.add_roles(flags.role);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::MULTI_ROLE);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+
+  DiskFullScheduler scheduler(flags, framework);
+
+  if (flags.master == "local") {
+    // Configure master.
+    os::setenv("MESOS_ROLES", flags.role);
+    os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", stringify(flags.authenticate));
+
+    ACLs acls;
+    ACL::RegisterFramework* acl = acls.add_register_frameworks();
+    acl->mutable_principals()->set_type(ACL::Entity::ANY);
+    acl->mutable_roles()->add_values(flags.role);
+    os::setenv("MESOS_ACLS", stringify(JSON::protobuf(acls)));
+  }
 
   MesosSchedulerDriver* driver;
 
-  // TODO(hartem): Refactor these into a common set of flags.
-  Option<string> value = os::getenv("MESOS_AUTHENTICATE_FRAMEWORKS");
-  if (value.isSome()) {
+  if (flags.authenticate) {
     LOG(INFO) << "Enabling authentication for the framework";
 
-    value = os::getenv("DEFAULT_PRINCIPAL");
-    if (value.isNone()) {
-      EXIT(EXIT_FAILURE)
-        << "Expecting authentication principal in the environment";
-    }
-
     Credential credential;
-    credential.set_principal(value.get());
-
-    framework.set_principal(value.get());
-
-    value = os::getenv("DEFAULT_SECRET");
-    if (value.isNone()) {
-      EXIT(EXIT_FAILURE)
-        << "Expecting authentication secret in the environment";
+    credential.set_principal(flags.principal);
+    if (flags.secret.isSome()) {
+      credential.set_secret(flags.secret.get());
     }
 
-    credential.set_secret(value.get());
-
     driver = new MesosSchedulerDriver(
-        &scheduler, framework, flags.master, credential);
+        &scheduler,
+        framework,
+        flags.master,
+        credential);
   } else {
-    framework.set_principal("disk-full-framework-cpp");
-
     driver = new MesosSchedulerDriver(
-        &scheduler, framework, flags.master);
+        &scheduler,
+        framework,
+        flags.master);
   }
 
   int status = driver->run() == DRIVER_STOPPED ? 0 : 1;

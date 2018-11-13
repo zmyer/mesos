@@ -5,7 +5,7 @@ layout: documentation
 
 # Mesos High-Availability Mode
 
-If the Mesos master is unavailable, existing tasks can continue to execute, but new resources cannot be allocated and new tasks cannot be launched. To reduce the chance of this situation occurring, Mesos has a high-availability mode that uses multiple Mesos masters: one active master (called the _leader_ or leading master) and several _backups_ in case it fails. The masters elect the leader, with [Apache ZooKeeper](http://zookeeper.apache.org/) both coordinating the election and handling leader detection by masters, agents, and scheduler drivers. More information regarding [how leader election works](http://zookeeper.apache.org/doc/trunk/recipes.html#sc_leaderElection) is available on the Apache Zookeeper website.
+If the Mesos master is unavailable, existing tasks can continue to execute, but new resources cannot be allocated and new tasks cannot be launched. To reduce the chance of this situation occurring, Mesos has a high-availability mode that uses multiple Mesos masters: one active master (called the _leader_ or leading master) and several _backups_ in case it fails. The masters elect the leader, with [Apache ZooKeeper](http://zookeeper.apache.org/) both coordinating the election and handling leader detection by masters, agents, and scheduler drivers. More information regarding [how leader election works](https://zookeeper.apache.org/doc/current/recipes.html#sc_leaderElection) is available on the Apache Zookeeper website.
 
 This document describes how to configure Mesos to run in high-availability mode. For more information on developing highly available frameworks, see a [companion document](high-availability-framework-guide.md).
 
@@ -52,13 +52,17 @@ When a network partition disconnects an agent from the leader:
 
 * The leader marks the agent as deactivated and sends its tasks to the LOST state. The  [Framework Development Guide](app-framework-development-guide.md) describes these various task states.
 
-* Deactivated agents may not re-register with the leader and are told to shut down upon any post-deactivation communication.
+* Deactivated agents may not reregister with the leader and are told to shut down upon any post-deactivation communication.
+
+## Monitoring
+For monitoring the current number of masters in the cluster communicating with each other to form a quorum, see the monitoring guide's [Replicated Log](monitoring.md#replicated-log) on `registrar/log/ensemble_size`.
+For creating alerts covering failures in leader election, have a look at the monitoring guide's [Basic Alerts](monitoring.md#basic-alerts) on `master/elected`.
 
 ## Implementation Details
 Mesos implements two levels of ZooKeeper leader election abstractions, one in `src/zookeeper` and the other in `src/master` (look for `contender|detector.hpp|cpp`).
 
 * The lower level `LeaderContender` and `LeaderDetector` implement a generic ZooKeeper election algorithm loosely modeled after this
-[recipe](http://zookeeper.apache.org/doc/trunk/recipes.html#sc_leaderElection) (sans herd effect handling due to the master group's small size, which is often 3).
+[recipe](http://zookeeper.apache.org/doc/current/recipes.html#sc_leaderElection) (sans herd effect handling due to the master group's small size, which is often 3).
 
 * The higher level `MasterContender` and `MasterDetector` wrap around ZooKeeper's contender and detector abstractions as adapters to provide/interpret the ZooKeeper data.
 
@@ -71,4 +75,4 @@ The notion of the group of leader candidates is implemented in `Group`. This abs
 * Session Expiration
 * ZNode creation, deletion, updates
 
-We also explicitly timeout our sessions when disconnected from ZooKeeper for a specified amount of time. See `MASTER_CONTENDER_ZK_SESSION_TIMEOUT` and `MASTER_DETECTOR_ZK_SESSION_TIMEOUT`. This is because the ZooKeeper client libraries only notify of session expiration upon reconnection. These timeouts are of particular interest for network partitions.
+We also explicitly timeout our sessions when disconnected from ZooKeeper for a specified amount of time. See `--zk_session_timeout` configuration option. This is because the ZooKeeper client libraries only notify of session expiration upon reconnection. These timeouts are of particular interest for network partitions.

@@ -13,27 +13,27 @@
 #ifndef __STOUT_WINDOWS_OS_HPP__
 #define __STOUT_WINDOWS_OS_HPP__
 
-#include <direct.h>
-#include <io.h>
-#include <Psapi.h>
-#include <TlHelp32.h>
-#include <Userenv.h>
-
 #include <sys/utime.h>
 
-#include <codecvt>
+#include <algorithm>
 #include <list>
 #include <map>
+#include <memory>
+#include <numeric>
 #include <set>
 #include <string>
+#include <vector>
 
+#include <stout/bytes.hpp>
 #include <stout/duration.hpp>
 #include <stout/none.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/path.hpp>
+#include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
+#include <stout/version.hpp>
 #include <stout/windows.hpp>
 
 #include <stout/os/os.hpp>
@@ -43,93 +43,71 @@
 
 #include <stout/os/raw/environment.hpp>
 
+// NOTE: These system headers must be included after `stout/windows.hpp`
+// as they may include `Windows.h`. See comments in `stout/windows.hpp`
+// for why this ordering is important.
+#include <Psapi.h>    // For `EnumProcesses` and `GetProcessMemoryInfo`.
+#include <TlHelp32.h> // For `PROCESSENTRY32W` and `CreateToolhelp32Snapshot`.
+#include <Userenv.h>  // For `GetAllUsersProfileDirectoryW`.
+
 namespace os {
 namespace internal {
 
-inline Try<OSVERSIONINFOEX> os_version()
-{
-  OSVERSIONINFOEX os_version;
-  os_version.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
-  if (!::GetVersionEx(reinterpret_cast<LPOSVERSIONINFO>(&os_version))) {
-    return WindowsError(
-        "os::internal::os_version: Call to `GetVersionEx` failed");
-  }
-
-  return os_version;
-}
-
-
 inline Try<std::string> nodename()
 {
-  // Get DNS name of the local computer. First, find the size of the output
-  // buffer.
+  // MSDN documentation states "The names are established at system startup,
+  // when the system reads them from the registry." This is akin to the
+  // Linux `gethostname` which calls `uname`, thus avoiding a DNS lookup.
+  // The `net::getHostname` function can be used for an explicit DNS lookup.
+  //
+  // NOTE: This returns the hostname of the local computer, or the local
+  // node if this computer is part of a cluster.
+  COMPUTER_NAME_FORMAT format = ComputerNamePhysicalDnsHostname;
   DWORD size = 0;
-  if (!::GetComputerNameEx(ComputerNameDnsHostname, nullptr, &size) &&
-      ::GetLastError() != ERROR_MORE_DATA) {
-    return WindowsError(
-        "os::internal::nodename: Call to `GetComputerNameEx` failed");
+  if (::GetComputerNameExW(format, nullptr, &size) == 0) {
+    if (::GetLastError() != ERROR_MORE_DATA) {
+      return WindowsError();
+    }
   }
 
-  std::unique_ptr<char[]> name(new char[size + 1]);
+  std::vector<wchar_t> buffer;
+  buffer.reserve(size);
 
-  if (!::GetComputerNameEx(ComputerNameDnsHostname, name.get(), &size)) {
-    return WindowsError(
-        "os::internal::nodename: Call to `GetComputerNameEx` failed");
+  if (::GetComputerNameExW(format, buffer.data(), &size) == 0) {
+    return WindowsError();
   }
 
-  return std::string(name.get());
+  return stringify(std::wstring(buffer.data()));
 }
 
 
-inline std::string machine()
+// Converts a `FILETIME` from an absoute Windows time, which is the number of
+// 100-nanosecond intervals since 1601-01-01 00:00:00 +0000, to an UNIX
+// absolute time, which is number of seconds from 1970-01-01 00:00:00 +0000.
+inline double windows_to_unix_epoch(const FILETIME& filetime)
 {
-  SYSTEM_INFO system_info;
-  ::GetNativeSystemInfo(&system_info);
+  ULARGE_INTEGER time;
 
-  switch (system_info.wProcessorArchitecture) {
-    case PROCESSOR_ARCHITECTURE_AMD64:
-      return "AMD64";
-    case PROCESSOR_ARCHITECTURE_ARM:
-      return "ARM";
-    case PROCESSOR_ARCHITECTURE_IA64:
-      return "IA64";
-    case PROCESSOR_ARCHITECTURE_INTEL:
-      return "x86";
-    default:
-      return "Unknown";
-  }
-}
+  // `FILETIME` isn't 8 byte aligned so they suggest not do cast to int64*.
+  time.HighPart = filetime.dwHighDateTime;
+  time.LowPart = filetime.dwLowDateTime;
 
+  // Constant taken from here:
+  // https://msdn.microsoft.com/en-us/library/windows/desktop/ms724228(v=vs.85).aspx. // NOLINT(whitespace/line_length)
+  // It is the number of 100ns periods between the Windows and UNIX epochs.
+  constexpr uint64_t epoch_offset = 116444736000000000ULL;
 
-inline std::string sysname(OSVERSIONINFOEX os_version)
-{
-  switch (os_version.wProductType) {
-    case VER_NT_DOMAIN_CONTROLLER:
-    case VER_NT_SERVER:
-      return "Windows Server";
-    default:
-      return "Windows";
-  }
-}
+  // Now the `QuadPart` field is the 64-bit representation due to the
+  // layout of the `ULARGE_INTEGER` struct.
+  static_assert(
+      std::is_same<decltype(time.QuadPart), uint64_t>::value,
+      "Expected `ULARGE_INTEGER.QuadPart` to be of type `uint64_t`");
 
+  CHECK_GE(time.QuadPart, epoch_offset)
+    << "windows_to_unix_epoch: Given time was before UNIX epoch: "
+    << time.QuadPart;
 
-inline std::string release(OSVERSIONINFOEX os_version)
-{
-  return stringify(
-      Version(os_version.dwMajorVersion, os_version.dwMinorVersion, 0));
-}
-
-
-inline std::string version(OSVERSIONINFOEX os_version)
-{
-  std::string version = std::to_string(os_version.dwBuildNumber);
-
-  if (os_version.szCSDVersion[0] != '\0') {
-    version.append(" ");
-    version.append(os_version.szCSDVersion);
-  }
-
-  return version;
+  return static_cast<double>(time.QuadPart - epoch_offset) / 10000000;
 }
 
 } // namespace internal {
@@ -170,7 +148,16 @@ inline Try<std::set<pid_t>> pids(Option<pid_t> group, Option<pid_t> session)
     max_items *= 2;
   } while (bytes_returned >= size_in_bytes);
 
-  return std::set<pid_t>(processes.begin(), processes.end());
+  std::set<pid_t> pids_set(processes.begin(), processes.end());
+
+  // NOTE: The PID `0` will always be returned by `EnumProcesses`; however, it
+  // is the PID of Windows' System Idle Process. While the PID is valid, using
+  // it for anything is almost always invalid. For instance, `OpenProcess` will
+  // fail with an invalid parameter error if the user tries to get a handle for
+  // PID `0`. In the interest of safety, we prevent the `pids` API from ever
+  // including the PID `0`.
+  pids_set.erase(0);
+  return pids_set;
 }
 
 
@@ -189,18 +176,19 @@ inline void setenv(
 {
   // Do not set the variable if already set and `overwrite` was not specified.
   //
-  // Per MSDN[1], `GetEnvironmentVariable` returns 0 on error and sets the
+  // Per MSDN, `GetEnvironmentVariable` returns 0 on error and sets the
   // error code to `ERROR_ENVVAR_NOT_FOUND` if the variable was not found.
   //
-  // [1] https://msdn.microsoft.com/en-us/library/windows/desktop/ms683188(v=vs.85).aspx
+  // https://msdn.microsoft.com/en-us/library/windows/desktop/ms683188(v=vs.85).aspx // NOLINT(whitespace/line_length)
   if (!overwrite &&
-      ::GetEnvironmentVariable(key.c_str(), nullptr, 0) != 0 &&
+      ::GetEnvironmentVariableW(wide_stringify(key).data(), nullptr, 0) != 0 &&
       ::GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
     return;
   }
 
   // `SetEnvironmentVariable` returns an error code, but we can't act on it.
-  ::SetEnvironmentVariable(key.c_str(), value.c_str());
+  ::SetEnvironmentVariableW(
+      wide_stringify(key).data(), wide_stringify(value).data());
 }
 
 
@@ -210,7 +198,17 @@ inline void unsetenv(const std::string& key)
 {
   // Per MSDN documentation[1], passing `nullptr` as the value will cause
   // `SetEnvironmentVariable` to delete the key from the process's environment.
-  ::SetEnvironmentVariable(key.c_str(), nullptr);
+  ::SetEnvironmentVariableW(wide_stringify(key).data(), nullptr);
+}
+
+
+// NOTE: This exists for compatibility with the POSIX API. On Windows,
+// either function is suitable for clearing a secret from the
+// environment, as the pointers returned by `GetEnvironmentVariable`
+// and `GetEnvironmentStrings` are to blocks allocated on invocation.
+inline void eraseenv(const std::string& key)
+{
+  unsetenv(key);
 }
 
 
@@ -340,42 +338,7 @@ inline Result<pid_t> waitpid(long pid, int* status, int options)
 }
 
 
-inline std::string hstrerror(int err)
-{
-  char buffer[1024];
-  DWORD format_error = 0;
-
-  // NOTE: Per the Linux documentation[1], `h_errno` can have only one of the
-  // following errors.
-  switch (err) {
-    case WSAHOST_NOT_FOUND:
-    case WSANO_DATA:
-    case WSANO_RECOVERY:
-    case WSATRY_AGAIN: {
-      format_error = ::FormatMessage(
-          FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-          nullptr,
-          err,
-          MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-          buffer,
-          sizeof(buffer),
-          nullptr);
-      break;
-    }
-    default: {
-      return "Unknown resolver error";
-    }
-  }
-
-  if (format_error == 0) {
-    // If call to `FormatMessage` fails, then we choose to output the error
-    // code rather than call `FormatMessage` again.
-    return "os::hstrerror: Call to `FormatMessage` failed with error code" +
-      std::to_string(GetLastError());
-  } else {
-    return buffer;
-  }
-}
+inline std::string hstrerror(int err) = delete;
 
 
 inline Try<Nothing> chown(
@@ -400,6 +363,10 @@ inline Try<Nothing> mknod(
 // Mesos only requires millisecond resolution, so this is ok for now.
 inline Try<Nothing> sleep(const Duration& duration)
 {
+  if (duration.ms() < 0) {
+    return WindowsError(ERROR_INVALID_PARAMETER);
+  }
+
   ::Sleep(static_cast<DWORD>(duration.ms()));
 
   return Nothing();
@@ -415,9 +382,9 @@ inline Try<std::list<std::string>> glob(const std::string& pattern) = delete;
 // Returns the total number of cpus (cores).
 inline Try<long> cpus()
 {
-  SYSTEM_INFO sysInfo;
-  ::GetSystemInfo(&sysInfo);
-  return static_cast<long>(sysInfo.dwNumberOfProcessors);
+  SYSTEM_INFO sys_info;
+  ::GetSystemInfo(&sys_info);
+  return static_cast<long>(sys_info.dwNumberOfProcessors);
 }
 
 // Returns load struct with average system loads for the last
@@ -454,43 +421,11 @@ inline Try<Memory> memory()
 }
 
 
-inline Try<Version> release()
-{
-  OSVERSIONINFOEX os_version;
-  os_version.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
-  if (!::GetVersionEx(reinterpret_cast<LPOSVERSIONINFO>(&os_version))) {
-    return WindowsError("os::release: Call to `GetVersionEx` failed");
-  }
-
-  return Version(os_version.dwMajorVersion, os_version.dwMinorVersion, 0);
-}
+inline Try<Version> release() = delete;
 
 
 // Return the system information.
-inline Try<UTSInfo> uname()
-{
-  Try<OSVERSIONINFOEX> os_version = internal::os_version();
-  if (os_version.isError()) {
-    return Error(os_version.error());
-  }
-
-  // Add nodename to `UTSInfo` object.
-  Try<std::string> nodename = internal::nodename();
-  if (nodename.isError()) {
-    return Error(nodename.error());
-  }
-
-  // Populate `UTSInfo`.
-  UTSInfo info;
-
-  info.sysname = internal::sysname(os_version.get());
-  info.release = internal::release(os_version.get());
-  info.version = internal::version(os_version.get());
-  info.nodename = nodename.get();
-  info.machine = internal::machine();
-
-  return info;
-}
+inline Try<UTSInfo> uname() = delete;
 
 
 inline tm* gmtime_r(const time_t* timep, tm* result)
@@ -499,7 +434,7 @@ inline tm* gmtime_r(const time_t* timep, tm* result)
 }
 
 
-inline Result<PROCESSENTRY32> process_entry(pid_t pid)
+inline Result<PROCESSENTRY32W> process_entry(pid_t pid)
 {
   // Get a snapshot of the processes in the system. NOTE: We should not check
   // whether the handle is `nullptr`, because this API will always return
@@ -513,9 +448,9 @@ inline Result<PROCESSENTRY32> process_entry(pid_t pid)
   SharedHandle safe_snapshot_handle(snapshot_handle, ::CloseHandle);
 
   // Initialize process entry.
-  PROCESSENTRY32 process_entry;
-  ZeroMemory(&process_entry, sizeof(PROCESSENTRY32));
-  process_entry.dwSize = sizeof(PROCESSENTRY32);
+  PROCESSENTRY32W process_entry;
+  memset(&process_entry, 0, sizeof(process_entry));
+  process_entry.dwSize = sizeof(process_entry);
 
   // Get first process so that we can loop through process entries until we
   // find the one we care about.
@@ -526,7 +461,7 @@ inline Result<PROCESSENTRY32> process_entry(pid_t pid)
     // should return `None`, since we won't find the PID we're looking for, but
     // we elect to return `Error` because something terrible has probably
     // happened.
-    if (GetLastError() != ERROR_SUCCESS) {
+    if (::GetLastError() != ERROR_SUCCESS) {
       return WindowsError("os::process_entry: Call to `Process32First` failed");
     } else {
       return Error("os::process_entry: Call to `Process32First` failed");
@@ -542,7 +477,7 @@ inline Result<PROCESSENTRY32> process_entry(pid_t pid)
 
     has_next = Process32Next(safe_snapshot_handle.get(), &process_entry);
     if (has_next == FALSE) {
-      DWORD last_error = GetLastError();
+      DWORD last_error = ::GetLastError();
       if (last_error != ERROR_NO_MORE_FILES && last_error != ERROR_SUCCESS) {
         return WindowsError(
             "os::process_entry: Call to `Process32Next` failed");
@@ -559,8 +494,15 @@ inline Result<PROCESSENTRY32> process_entry(pid_t pid)
 // something went wrong.
 inline Result<Process> process(pid_t pid)
 {
+  if (pid == 0) {
+    // The 0th PID is that of the System Idle Process on Windows. However, it is
+    // invalid to attempt to get a proces handle or else perform any operation
+    // on this pseudo-process.
+    return Error("os::process: Invalid parameter: pid == 0");
+  }
+
   // Find process with pid.
-  Result<PROCESSENTRY32> entry = process_entry(pid);
+  Result<PROCESSENTRY32W> entry = process_entry(pid);
 
   if (entry.isError()) {
     return WindowsError(entry.error());
@@ -573,7 +515,8 @@ inline Result<Process> process(pid_t pid)
       false,
       pid);
 
-  if (process_handle == INVALID_HANDLE_VALUE) {
+  // ::OpenProcess returns `NULL`, not `INVALID_HANDLE_VALUE` on failure.
+  if (process_handle == nullptr) {
     return WindowsError("os::process: Call to `OpenProcess` failed");
   }
 
@@ -629,7 +572,7 @@ inline Result<Process> process(pid_t pid)
       Bytes(proc_mem_counters.WorkingSetSize),
       utime.isSome() ? utime.get() : Option<Duration>::none(),
       stime.isSome() ? stime.get() : Option<Duration>::none(),
-      entry.get().szExeFile,                   // Executable filename.
+      stringify(entry.get().szExeFile),        // Executable filename.
       false);                                  // Is not zombie process.
 }
 
@@ -637,90 +580,6 @@ inline Result<Process> process(pid_t pid)
 inline int random()
 {
   return rand();
-}
-
-
-// `create_job` function creates a job object whose name is derived
-// from the `pid` and associates the process with the job object.
-// Every process started by the `pid` process which is part of the job
-// object becomes part of the job object. The job name should match
-// the name used in `kill_job`.
-inline Try<HANDLE> create_job(pid_t pid)
-{
-  Try<std::string> alpha_pid = strings::internal::format("MESOS_JOB_%X", pid);
-  if (alpha_pid.isError()) {
-    return Error(alpha_pid.error());
-  }
-
-  HANDLE process_handle = ::OpenProcess(
-      PROCESS_SET_QUOTA | PROCESS_TERMINATE,
-      false,
-      pid);
-
-  if (process_handle == INVALID_HANDLE_VALUE) {
-    return WindowsError("os::create_job: Call to `OpenProcess` failed");
-  }
-
-  SharedHandle safe_process_handle(process_handle, ::CloseHandle);
-
-  HANDLE job_handle = ::CreateJobObject(nullptr, alpha_pid.get().c_str());
-
-  if (job_handle == nullptr) {
-    return WindowsError("os::create_job: Call to `CreateJobObject` failed");
-  }
-
-  JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { { 0 }, 0 };
-
-  jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-  // The job object will be terminated when the job handle closes. This allows
-  // the job tree to be terminated in case of errors by closing the handle.
-  ::SetInformationJobObject(
-      job_handle,
-      JobObjectExtendedLimitInformation,
-      &jeli,
-      sizeof(jeli));
-
-  if (::AssignProcessToJobObject(
-          job_handle,
-          safe_process_handle.get_handle()) == 0) {
-    return WindowsError(
-        "os::create_job: Call to `AssignProcessToJobObject` failed");
-  };
-
-  return job_handle;
-}
-
-
-// `kill_job` function assumes the process identified by `pid`
-// is associated with a job object whose name is derived from it.
-// Every process started by the `pid` process which is part of the job
-// object becomes part of the job object. Destroying the task
-// will close all such processes.
-inline Try<Nothing> kill_job(pid_t pid)
-{
-  Try<std::string> alpha_pid = strings::internal::format("MESOS_JOB_%X", pid);
-  if (alpha_pid.isError()) {
-    return Error(alpha_pid.error());
-  }
-
-  HANDLE job_handle = ::OpenJobObject(
-      JOB_OBJECT_TERMINATE,
-      FALSE,
-      alpha_pid.get().c_str());
-
-  if (job_handle == nullptr) {
-    return WindowsError("os::kill_job: Call to `OpenJobObject` failed");
-  }
-
-  SharedHandle safe_job_handle(job_handle, ::CloseHandle);
-
-  BOOL result = ::TerminateJobObject(safe_job_handle.get_handle(), 1);
-  if (result == 0) {
-    return WindowsError();
-  }
-
-  return Nothing();
 }
 
 
@@ -733,75 +592,16 @@ inline Try<std::string> var()
     // The expected behavior here is for the function to "fail"
     // and return `false`, and `size` receives necessary buffer size.
     return WindowsError(
-        "os::var: `GetAllUsersProfileDirectory` succeeded unexpectedly");
+        "os::var: `GetAllUsersProfileDirectoryW` succeeded unexpectedly");
   }
 
-  std::vector<wchar_t> var_folder(size);
-  if (!::GetAllUsersProfileDirectoryW(&var_folder[0], &size)) {
-    return WindowsError(
-        "os::var: `GetAllUsersProfileDirectory` failed");
+  std::vector<wchar_t> buffer;
+  buffer.reserve(static_cast<size_t>(size));
+  if (!::GetAllUsersProfileDirectoryW(buffer.data(), &size)) {
+    return WindowsError("os::var: `GetAllUsersProfileDirectoryW` failed");
   }
 
-  // Convert UTF-16 `wchar[]` to UTF-8 `string`.
-  std::wstring wvar_folder(&var_folder[0]);
-  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
-  return converter.to_bytes(wvar_folder);
-}
-
-
-// Create pipes for interprocess communication. Since the pipes cannot
-// be used directly by Posix `read/write' functions they are wrapped
-// in file descriptors, a process-local concept.
-inline Try<Nothing> pipe(int pipe[2])
-{
-  // Create inheritable pipe, as described in MSDN[1].
-  //
-  // [1] https://msdn.microsoft.com/en-us/library/windows/desktop/aa365782(v=vs.85).aspx
-  SECURITY_ATTRIBUTES securityAttr;
-  securityAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
-  securityAttr.bInheritHandle = TRUE;
-  securityAttr.lpSecurityDescriptor = nullptr;
-
-  HANDLE read_handle;
-  HANDLE write_handle;
-
-  const BOOL result = ::CreatePipe(
-      &read_handle,
-      &write_handle,
-      &securityAttr,
-      0);
-
-  pipe[0] = _open_osfhandle(
-      reinterpret_cast<intptr_t>(read_handle),
-      _O_RDONLY | _O_TEXT);
-
-  if (pipe[0] == -1) {
-    return ErrnoError();
-  }
-
-  pipe[1] = _open_osfhandle(reinterpret_cast<intptr_t>(write_handle), _O_TEXT);
-  if (pipe[1] == -1) {
-    return ErrnoError();
-  }
-
-  return Nothing();
-}
-
-
-// Prepare the file descriptors to be shared with a different process.
-// Under Windows we have to obtain the underlying handles to be shared
-// with a different processs.
-inline intptr_t fd_to_handle(int in)
-{
-  return ::_get_osfhandle(in);
-}
-
-
-// Convert the global file handle into a file descriptor, which on
-// Windows is only valid within the current process.
-inline int handle_to_fd(intptr_t in, int flags)
-{
-  return ::_open_osfhandle(in, flags);
+  return stringify(std::wstring(buffer.data()));
 }
 
 
@@ -811,13 +611,17 @@ inline std::string host_default_path()
 {
   // NOTE: On Windows, this code must run on the host where we are
   // expecting to `exec` the task, because the value of
-  // `%SYSTEMROOT%` is not identical on all platforms.
-  const Option<std::string> systemRootEnv = os::getenv("SYSTEMROOT");
-  const std::string systemRoot = systemRootEnv.isSome()
-    ? systemRootEnv.get()
-    : "C:\\WINDOWS";
+  // `%SystemRoot%` is not identical on all platforms.
+  const Option<std::string> system_root_env = os::getenv("SystemRoot");
+  const std::string system_root = system_root_env.isSome()
+    ? system_root_env.get()
+    : path::join("C:", "Windows");
 
-  return strings::join(";", systemRoot, path::join(systemRoot, "system32"));
+  return strings::join(";",
+      path::join(system_root, "System32"),
+      system_root,
+      path::join(system_root, "System32", "Wbem"),
+      path::join(system_root, "System32", "WindowsPowerShell", "v1.0"));
 }
 
 } // namespace os {

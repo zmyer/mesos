@@ -24,13 +24,13 @@
 #include <string>
 #include <vector>
 
-#include <boost/circular_buffer.hpp>
-
 #include <mesos/attributes.hpp>
 #include <mesos/resources.hpp>
 #include <mesos/type_utils.hpp>
 
 #include <mesos/agent/agent.hpp>
+
+#include <mesos/authentication/secret_generator.hpp>
 
 #include <mesos/executor/executor.hpp>
 
@@ -51,9 +51,11 @@
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
 #include <process/shared.hpp>
+#include <process/sequence.hpp>
 
 #include <stout/boundedhashmap.hpp>
 #include <stout/bytes.hpp>
+#include <stout/circular_buffer.hpp>
 #include <stout/linkedhashmap.hpp>
 #include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
@@ -73,10 +75,14 @@
 
 #include "messages/messages.hpp"
 
+#include "resource_provider/daemon.hpp"
+#include "resource_provider/manager.hpp"
+
 #include "slave/constants.hpp"
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
+#include "slave/http.hpp"
 #include "slave/metrics.hpp"
 #include "slave/paths.hpp"
 #include "slave/state.hpp"
@@ -85,22 +91,26 @@
 // constant in the Windows SDK.
 #ifdef __WINDOWS__
 #undef REGISTERING
+#undef REGISTERED
 #endif // __WINDOWS__
 
 namespace mesos {
 
 // Forward declarations.
 class Authorizer;
+class DiskProfileAdaptor;
 
 namespace internal {
-
 namespace slave {
 
 // Some forward declarations.
-class StatusUpdateManager;
-struct Executor;
-struct Framework;
+class TaskStatusUpdateManager;
+class Executor;
+class Framework;
+
 struct HttpConnection;
+struct ResourceProvider;
+
 
 class Slave : public ProtobufProcess<Slave>
 {
@@ -111,12 +121,13 @@ public:
         Containerizer* containerizer,
         Files* files,
         GarbageCollector* gc,
-        StatusUpdateManager* statusUpdateManager,
+        TaskStatusUpdateManager* taskStatusUpdateManager,
         mesos::slave::ResourceEstimator* resourceEstimator,
         mesos::slave::QoSController* qosController,
+        mesos::SecretGenerator* secretGenerator,
         const Option<Authorizer*>& authorizer);
 
-  virtual ~Slave();
+  ~Slave() override;
 
   void shutdown(const process::UPID& from, const std::string& message);
 
@@ -133,47 +144,103 @@ public:
 
   void doReliableRegistration(Duration maxBackoff);
 
+  // TODO(mzhu): Combine this with `runTask()' and replace all `runTask()'
+  // mock with `run()` mock.
+  void handleRunTaskMessage(
+      const process::UPID& from,
+      RunTaskMessage&& runTaskMessage);
+
   // Made 'virtual' for Slave mocking.
   virtual void runTask(
       const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
       const FrameworkID& frameworkId,
       const process::UPID& pid,
-      const TaskInfo& task);
+      const TaskInfo& task,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids,
+      const Option<bool>& launchExecutor);
 
   void run(
       const FrameworkInfo& frameworkInfo,
-      const ExecutorInfo& executorInfo,
+      ExecutorInfo executorInfo,
       Option<TaskInfo> task,
       Option<TaskGroupInfo> taskGroup,
-      const process::UPID& pid);
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids,
+      const process::UPID& pid,
+      const Option<bool>& launchExecutor);
 
   // Made 'virtual' for Slave mocking.
-  virtual void _run(
-    const process::Future<bool>& future,
-    const FrameworkInfo& frameworkInfo,
-    const ExecutorInfo& executorInfo,
-    const Option<TaskInfo>& task,
-    const Option<TaskGroupInfo>& taskGroup);
+  //
+  // This function returns a future so that we can encapsulate a task(group)
+  // launch operation (from agent receiving the run message to the completion
+  // of `_run()`) into a single future. This includes all the asynchronous
+  // steps (currently two: unschedule GC and task authorization) prior to the
+  // executor launch.
+  virtual process::Future<Nothing> _run(
+      const FrameworkInfo& frameworkInfo,
+      const ExecutorInfo& executorInfo,
+      const Option<TaskInfo>& task,
+      const Option<TaskGroupInfo>& taskGroup,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids,
+      const Option<bool>& launchExecutor);
+
+  // Made 'virtual' for Slave mocking.
+  virtual void __run(
+      const FrameworkInfo& frameworkInfo,
+      const ExecutorInfo& executorInfo,
+      const Option<TaskInfo>& task,
+      const Option<TaskGroupInfo>& taskGroup,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids,
+      const Option<bool>& launchExecutor);
+
+  // This is called when the resource limits of the container have
+  // been updated for the given tasks and task groups. If the update is
+  // successful, we flush the given tasks to the executor by sending
+  // RunTaskMessages or `LAUNCH_GROUP` events.
+  //
+  // Made 'virtual' for Slave mocking.
+  virtual void ___run(
+      const process::Future<Nothing>& future,
+      const FrameworkID& frameworkId,
+      const ExecutorID& executorId,
+      const ContainerID& containerId,
+      const std::vector<TaskInfo>& tasks,
+      const std::vector<TaskGroupInfo>& taskGroups);
+
+  // TODO(mzhu): Combine this with `runTaskGroup()' and replace all
+  // `runTaskGroup()' mock with `run()` mock.
+  void handleRunTaskGroupMessage(
+      const process::UPID& from,
+      RunTaskGroupMessage&& runTaskGroupMessage);
 
   // Made 'virtual' for Slave mocking.
   virtual void runTaskGroup(
       const process::UPID& from,
       const FrameworkInfo& frameworkInfo,
       const ExecutorInfo& executorInfo,
-      const TaskGroupInfo& taskGroupInfo);
-
-  process::Future<bool> unschedule(const std::string& path);
+      const TaskGroupInfo& taskGroupInfo,
+      const std::vector<ResourceVersionUUID>& resourceVersionUuids,
+      const Option<bool>& launchExecutor);
 
   // Made 'virtual' for Slave mocking.
   virtual void killTask(
       const process::UPID& from,
       const KillTaskMessage& killTaskMessage);
 
-  void shutdownExecutor(
+  // Made 'virtual' for Slave mocking.
+  virtual void shutdownExecutor(
       const process::UPID& from,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId);
+
+  // Shut down an executor. This is a two phase process. First, an
+  // executor receives a shut down message (shut down phase), then
+  // after a configurable timeout the slave actually forces a kill
+  // (kill phase, via the isolator) if the executor has not
+  // exited.
+  //
+  // Made 'virtual' for Slave mocking.
+  virtual void _shutdownExecutor(Framework* framework, Executor* executor);
 
   void shutdownFramework(
       const process::UPID& from,
@@ -186,23 +253,35 @@ public:
       const std::string& data);
 
   void updateFramework(
-      const FrameworkID& frameworkId,
-      const process::UPID& pid);
+      const UpdateFrameworkMessage& message);
 
-  void checkpointResources(const std::vector<Resource>& checkpointedResources);
+  void checkpointResources(
+      std::vector<Resource> checkpointedResources,
+      bool changeTotal);
+
+  void checkpointResourcesMessage(
+      const std::vector<Resource>& checkpointedResources);
+
+  void applyOperation(const ApplyOperationMessage& message);
+
+  // Reconciles pending operations with the master. This is necessary to handle
+  // cases in which operations were dropped in transit, or in which an agent's
+  // `UpdateSlaveMessage` was sent at the same time as an operation was en route
+  // from the master to the agent.
+  void reconcileOperations(const ReconcileOperationsMessage& message);
 
   void subscribe(
-    HttpConnection http,
-    const executor::Call::Subscribe& subscribe,
-    Framework* framework,
-    Executor* executor);
+      HttpConnection http,
+      const executor::Call::Subscribe& subscribe,
+      Framework* framework,
+      Executor* executor);
 
   void registerExecutor(
       const process::UPID& from,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId);
 
-  // Called when an executor re-registers with a recovering slave.
+  // Called when an executor reregisters with a recovering slave.
   // 'tasks' : Unacknowledged tasks (i.e., tasks that the executor
   //           driver never received an ACK for.)
   // 'updates' : Unacknowledged updates.
@@ -227,7 +306,7 @@ public:
 
   void ping(const process::UPID& from, bool connected);
 
-  // Handles the status update.
+  // Handles the task status update.
   // NOTE: If 'pid' is a valid UPID an ACK is sent to this pid
   // after the update is successfully handled. If pid == UPID()
   // no ACK is sent. The latter is used by the slave to send
@@ -244,7 +323,7 @@ public:
       StatusUpdate update,
       const Option<process::UPID>& pid,
       const ExecutorID& executorId,
-      const process::Future<ContainerStatus>& future);
+      const Option<process::Future<ContainerStatus>>& containerStatus);
 
   // Continue handling the status update after optionally updating the
   // container's resources.
@@ -256,7 +335,7 @@ public:
       const ContainerID& containerId,
       bool checkpoint);
 
-  // This is called when the status update manager finishes
+  // This is called when the task status update manager finishes
   // handling the update. If the handling is successful, an
   // acknowledgment is sent to the executor.
   void ___statusUpdate(
@@ -264,7 +343,7 @@ public:
       const StatusUpdate& update,
       const Option<process::UPID>& pid);
 
-  // This is called by status update manager to forward a status
+  // This is called by task status update manager to forward a status
   // update to the master. Note that the latest state of the task is
   // added to the update before forwarding.
   void forward(StatusUpdate update);
@@ -282,11 +361,15 @@ public:
       const FrameworkID& frameworkId,
       const UUID& uuid);
 
+  void operationStatusAcknowledgement(
+      const process::UPID& from,
+      const AcknowledgeOperationStatusMessage& acknowledgement);
+
   void executorLaunched(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
       const ContainerID& containerId,
-      const process::Future<bool>& future);
+      const process::Future<Containerizer::LaunchResult>& future);
 
   // Made 'virtual' for Slave mocking.
   virtual void executorTerminated(
@@ -303,6 +386,10 @@ public:
   // mock both GarbageCollector (and pass it through slave's constructor)
   // and os calls.
   void _checkDiskUsage(const process::Future<double>& usage);
+
+  // Garbage collect image layers based on the disk usage of image
+  // store.
+  void _checkImageDiskUsage(const process::Future<double>& usage);
 
   // Invoked whenever the detector detects a change in masters.
   // Made public for testing purposes.
@@ -333,47 +420,95 @@ public:
   // their address which we do in tests (for things like
   // FUTURE_DISPATCH).
 // protected:
-  virtual void initialize();
-  virtual void finalize();
-  virtual void exited(const process::UPID& pid);
+  void initialize() override;
+  void finalize() override;
+  void exited(const process::UPID& pid) override;
 
-  // This is called when the resource limits of the container have
-  // been updated for the given tasks and task groups. If the update is
-  // successful, we flush the given tasks to the executor by sending
-  // RunTaskMessages or `LAUNCH_GROUP` events.
-  void __run(
-      const process::Future<Nothing>& future,
+  process::Future<Secret> generateSecret(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId,
-      const ContainerID& containerId,
-      const std::list<TaskInfo>& tasks,
-      const std::list<TaskGroupInfo>& taskGroups);
+      const ContainerID& containerId);
+
+  // If an executor is launched for a task group, `taskInfo` would not be set.
+  void launchExecutor(
+      const Option<process::Future<Secret>>& future,
+      const FrameworkID& frameworkId,
+      const ExecutorID& executorId,
+      const Option<TaskInfo>& taskInfo);
 
   void fileAttached(const process::Future<Nothing>& result,
-                    const std::string& path);
+                    const std::string& path,
+                    const std::string& virtualPath);
 
   Nothing detachFile(const std::string& path);
+
+  // TODO(qianzhang): This is a workaround to make the default executor task's
+  // volume directory visible in MESOS UI. It handles two cases:
+  //   1. The task has disk resources specified. In this case any disk resources
+  //      specified for the task are mounted on the top level container since
+  //      currently all resources of nested containers are merged in the top
+  //      level executor container. To make sure the task can access any volumes
+  //      specified in its disk resources from its sandbox, a workaround was
+  //      introduced to the default executor in MESOS-7225, i.e., adding a
+  //      `SANDBOX_PATH` volume with type `PARENT` to the corresponding nested
+  //      container. This volume gets translated into a bind mount in the nested
+  //      container's mount namespace, which is not visible in Mesos UI because
+  //      it operates in the host namespace. See MESOS-8279 for details.
+  //   2. The executor has disk resources specified and the task's ContainerInfo
+  //      has a `SANDBOX_PATH` volume with type `PARENT` specified to share the
+  //      executor's disk volume. Similar to the first case, this `SANDBOX_PATH`
+  //      volume gets translated into a bind mount which is not visible in Mesos
+  //      UI. See MESOS-8565 for details.
+  //
+  // To make the task's volume directory visible in Mesos UI, here we attach the
+  // executor's volume directory to it so that it can be accessed via the /files
+  // endpoint. So when users browse task's volume directory in Mesos UI, what
+  // they actually browse is the executor's volume directory. Note when calling
+  // `Files::attach()`, the third argument `authorized` is not specified because
+  // it is already specified when we do the attach for the executor's sandbox
+  // and it also applies to the executor's tasks. Note that for the second case
+  // we can not do the attach when the task's ContainerInfo has a `SANDBOX_PATH`
+  // volume with type `PARENT` but the executor has NO disk resources, because
+  // in such case the attach will fail due to the executor's volume directory
+  // not existing which will actually be created by the `volume/sandbox_path`
+  // isolator when launching the nested container. But if the executor has disk
+  // resources, then we will not have this issue since the executor's volume
+  // directory will be created by the `filesystem/linux` isolator when launching
+  // the executor before we do the attach.
+  void attachTaskVolumeDirectory(
+      const ExecutorInfo& executorInfo,
+      const ContainerID& executorContainerId,
+      const Task& task);
+
+  // TODO(qianzhang): Remove the task's volume directory from the /files
+  // endpoint. This is a workaround for MESOS-8279 and MESOS-8565.
+  void detachTaskVolumeDirectories(
+      const ExecutorInfo& executorInfo,
+      const ContainerID& executorContainerId,
+      const std::vector<Task>& tasks);
 
   // Triggers a re-detection of the master when the slave does
   // not receive a ping.
   void pingTimeout(process::Future<Option<MasterInfo>> future);
 
-  void authenticate();
+  // Made virtual for testing purpose.
+  virtual void authenticate(Duration minTimeout, Duration maxTimeout);
 
   // Helper routines to lookup a framework/executor.
-  Framework* getFramework(const FrameworkID& frameworkId);
+  Framework* getFramework(const FrameworkID& frameworkId) const;
 
   Executor* getExecutor(
       const FrameworkID& frameworkId,
-      const ExecutorID& executorId);
+      const ExecutorID& executorId) const;
 
   Executor* getExecutor(const ContainerID& containerId) const;
 
-  // Returns an ExecutorInfo for a TaskInfo (possibly
-  // constructing one if the task has a CommandInfo).
+  // Returns the ExecutorInfo associated with a TaskInfo. If the task has no
+  // ExecutorInfo, then we generate an ExecutorInfo corresponding to the
+  // command executor.
   ExecutorInfo getExecutorInfo(
       const FrameworkInfo& frameworkInfo,
-      const TaskInfo& task);
+      const TaskInfo& task) const;
 
   // Shuts down the executor if it did not register yet.
   void registerExecutorTimeout(
@@ -391,7 +526,11 @@ public:
   // Checks the current disk usage and schedules for gc as necessary.
   void checkDiskUsage();
 
-  // Recovers the slave, status update manager and isolator.
+  // Checks the current container image disk usage and trigger image
+  // gc if necessary.
+  void checkImageDiskUsage();
+
+  // Recovers the slave, task status update manager and isolator.
   process::Future<Nothing> recover(const Try<state::State>& state);
 
   // This is called after 'recover()'. If 'flags.reconnect' is
@@ -410,7 +549,10 @@ public:
   virtual void __recover(const process::Future<Nothing>& future);
 
   // Helper to recover a framework from the specified state.
-  void recoverFramework(const state::FrameworkState& state);
+  void recoverFramework(
+      const state::FrameworkState& state,
+      const hashset<ExecutorID>& executorsToRecheckpoint,
+      const hashmap<ExecutorID, hashset<TaskID>>& tasksToRecheckpoint);
 
   // Removes and garbage collects the executor.
   void removeExecutor(Framework* framework, Executor* executor);
@@ -444,15 +586,16 @@ public:
       const ContainerID& containerId);
 
 private:
-  void _authenticate();
-  void authenticationTimeout(process::Future<bool> future);
+  friend class Executor;
+  friend class Framework;
+  friend class Http;
 
-  // Shut down an executor. This is a two phase process. First, an
-  // executor receives a shut down message (shut down phase), then
-  // after a configurable timeout the slave actually forces a kill
-  // (kill phase, via the isolator) if the executor has not
-  // exited.
-  void _shutdownExecutor(Framework* framework, Executor* executor);
+  friend struct Metrics;
+
+  Slave(const Slave&) = delete;
+  Slave& operator=(const Slave&) = delete;
+
+  void _authenticate(Duration currentMinTimeout, Duration currentMaxTimeout);
 
   // Process creation of persistent volumes (for CREATE) and/or deletion
   // of persistent volumes (for DESTROY) as a part of handling
@@ -461,246 +604,76 @@ private:
   Try<Nothing> syncCheckpointedResources(
       const Resources& newCheckpointedResources);
 
+  process::Future<bool> authorizeTask(
+      const TaskInfo& task,
+      const FrameworkInfo& frameworkInfo);
+
   process::Future<bool> authorizeLogAccess(
-      const Option<std::string>& principal);
+      const Option<process::http::authentication::Principal>& principal);
 
   process::Future<bool> authorizeSandboxAccess(
-      const Option<std::string>& principal,
+      const Option<process::http::authentication::Principal>& principal,
       const FrameworkID& frameworkId,
       const ExecutorID& executorId);
 
-  // Inner class used to namespace HTTP route handlers (see
-  // slave/http.cpp for implementations).
-  class Http
-  {
-  public:
-    explicit Http(Slave* _slave)
-      : slave(_slave),
-        statisticsLimiter(new process::RateLimiter(2, Seconds(1))) {}
+  void sendExecutorTerminatedStatusUpdate(
+      const TaskID& taskId,
+      const process::Future<Option<
+          mesos::slave::ContainerTermination>>& termination,
+      const FrameworkID& frameworkId,
+      const Executor* executor);
 
-    // Logs the request, route handlers can compose this with the
-    // desired request handler to get consistent request logging.
-    static void log(const process::http::Request& request);
+  void sendExitedExecutorMessage(
+      const FrameworkID& frameworkId,
+      const ExecutorID& executorId,
+      const Option<int>& status = None());
 
-    // /api/v1
-    process::Future<process::http::Response> api(
-        const process::http::Request& request,
-        const Option<std::string>& principal) const;
+  // Forwards the current total of oversubscribed resources.
+  void forwardOversubscribed();
+  void _forwardOversubscribed(
+      const process::Future<Resources>& oversubscribable);
 
-    // /api/v1/executor
-    process::Future<process::http::Response> executor(
-        const process::http::Request& request) const;
+  // Helper functions to generate `UpdateSlaveMessage` for either
+  // just updates to resource provider-related information, or both
+  // resource provider-related information and oversubscribed
+  // resources.
+  UpdateSlaveMessage generateResourceProviderUpdate() const;
+  UpdateSlaveMessage generateUpdateSlaveMessage() const;
 
-    // /slave/flags
-    process::Future<process::http::Response> flags(
-        const process::http::Request& request,
-        const Option<std::string>& principal) const;
+  void handleResourceProviderMessage(
+      const process::Future<ResourceProviderMessage>& message);
 
-    // /slave/health
-    process::Future<process::http::Response> health(
-        const process::http::Request& request) const;
+  void addOperation(Operation* operation);
 
-    // /slave/state
-    process::Future<process::http::Response> state(
-        const process::http::Request& request,
-        const Option<std::string>& /* principal */) const;
+  // Transitions the operation, and recovers resource if the operation becomes
+  // terminal.
+  void updateOperation(
+      Operation* operation,
+      const UpdateOperationStatusMessage& update);
 
-    // /slave/monitor/statistics
-    // /slave/monitor/statistics.json
-    process::Future<process::http::Response> statistics(
-        const process::http::Request& request,
-        const Option<std::string>& principal) const;
+  // Update the `latest_status` of the operation if it is not terminal.
+  void updateOperationLatestStatus(
+      Operation* operation,
+      const OperationStatus& status);
 
-    // /slave/containers
-    process::Future<process::http::Response> containers(
-        const process::http::Request& request,
-        const Option<std::string>& principal) const;
+  void removeOperation(Operation* operation);
 
-    static std::string API_HELP();
-    static std::string EXECUTOR_HELP();
-    static std::string FLAGS_HELP();
-    static std::string HEALTH_HELP();
-    static std::string STATE_HELP();
-    static std::string STATISTICS_HELP();
-    static std::string CONTAINERS_HELP();
+  Operation* getOperation(const UUID& uuid) const;
 
-  private:
-    JSON::Object _flags() const;
+  void addResourceProvider(ResourceProvider* resourceProvider);
+  ResourceProvider* getResourceProvider(const ResourceProviderID& id) const;
 
-    // Continuation for `/api` endpoint that handles streaming and non-streaming
-    // requests. In case of a streaming request, `call` would be the first
-    // record and additional records can be read using the `reader`. For
-    // non-streaming requests, `reader` would be set to `None()`.
-    process::Future<process::http::Response> _api(
-        const agent::Call& call,
-        Option<process::Owned<recordio::Reader<agent::Call>>>&& reader,
-        const RequestMediaTypes& mediaTypes,
-        const Option<std::string>& principal) const;
+  void apply(Operation* operation);
 
-    // Make continuation for `statistics` `static` as it might
-    // execute when the invoking `Http` is already destructed.
-    process::http::Response _statistics(
-        const ResourceUsage& usage,
-        const process::http::Request& request) const;
+  // Publish all resources that are needed to run the current set of
+  // tasks and executors on the agent.
+  // NOTE: The `additionalResources` parameter is for publishing
+  // additional task resources when launching executors. Consider
+  // removing this parameter once we revisited MESOS-600.
+  process::Future<Nothing> publishResources(
+      const Option<Resources>& additionalResources = None());
 
-    // Continuation for `/containers` endpoint
-    process::Future<process::http::Response> _containers(
-        const process::http::Request& request,
-        const Option<std::string>& principal) const;
-
-    // Helper function to collect containers status and resource statistics.
-    process::Future<JSON::Array> __containers(
-        Option<process::Owned<ObjectApprover>> approver) const;
-
-    // Helper routines for endpoint authorization.
-    Try<std::string> extractEndpoint(const process::http::URL& url) const;
-
-    // Agent API handlers.
-
-    process::Future<process::http::Response> getFlags(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> getHealth(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> getVersion(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> getMetrics(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> getLoggingLevel(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> setLoggingLevel(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> listFiles(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> getContainers(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> readFile(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> getFrameworks(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    mesos::agent::Response::GetFrameworks _getFrameworks(
-        const process::Owned<ObjectApprover>& frameworksApprover) const;
-
-    process::Future<process::http::Response> getExecutors(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    mesos::agent::Response::GetExecutors _getExecutors(
-        const process::Owned<ObjectApprover>& frameworksApprover,
-        const process::Owned<ObjectApprover>& executorsApprover) const;
-
-    process::Future<process::http::Response> getTasks(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    mesos::agent::Response::GetTasks _getTasks(
-        const process::Owned<ObjectApprover>& frameworksApprover,
-        const process::Owned<ObjectApprover>& tasksApprover,
-        const process::Owned<ObjectApprover>& executorsApprover) const;
-
-    process::Future<process::http::Response> getState(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    mesos::agent::Response::GetState _getState(
-        const process::Owned<ObjectApprover>& frameworksApprover,
-        const process::Owned<ObjectApprover>& taskApprover,
-        const process::Owned<ObjectApprover>& executorsApprover) const;
-
-    process::Future<process::http::Response> launchNestedContainer(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> _launchNestedContainer(
-        const ContainerID& containerId,
-        const CommandInfo& commandInfo,
-        const Option<ContainerInfo>& containerInfo,
-        const Option<mesos::slave::ContainerClass>& containerClass,
-        ContentType acceptType,
-        const process::Owned<ObjectApprover>& approver) const;
-
-    process::Future<process::http::Response> waitNestedContainer(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> killNestedContainer(
-        const mesos::agent::Call& call,
-        ContentType acceptType,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> launchNestedContainerSession(
-        const mesos::agent::Call& call,
-        const RequestMediaTypes& mediaTypes,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> attachContainerInput(
-        const mesos::agent::Call& call,
-        process::Owned<recordio::Reader<agent::Call>>&& decoder,
-        const RequestMediaTypes& mediaTypes,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> _attachContainerInput(
-        const mesos::agent::Call& call,
-        process::Owned<recordio::Reader<agent::Call>>&& decoder,
-        const RequestMediaTypes& mediaTypes) const;
-
-    process::Future<process::http::Response> attachContainerOutput(
-        const mesos::agent::Call& call,
-        const RequestMediaTypes& mediaTypes,
-        const Option<std::string>& principal) const;
-
-    process::Future<process::http::Response> _attachContainerOutput(
-        const mesos::agent::Call& call,
-        const RequestMediaTypes& mediaTypes) const;
-
-    Slave* slave;
-
-    // Used to rate limit the statistics endpoint.
-    process::Shared<process::RateLimiter> statisticsLimiter;
-  };
-
-  friend struct Framework;
-  friend struct Executor;
-  friend struct Metrics;
-
-  Slave(const Slave&);              // No copying.
-  Slave& operator=(const Slave&); // No assigning.
-
-  // Gauge methods.
+  // PullGauge methods.
   double _frameworks_active()
   {
     return static_cast<double>(frameworks.size());
@@ -727,17 +700,26 @@ private:
 
   double _executor_directory_max_allowed_age_secs();
 
-  void sendExecutorTerminatedStatusUpdate(
-      const TaskID& taskId,
-      const process::Future<Option<
-          mesos::slave::ContainerTermination>>& termination,
-      const FrameworkID& frameworkId,
-      const Executor* executor);
+  double _resources_total(const std::string& name);
+  double _resources_used(const std::string& name);
+  double _resources_percent(const std::string& name);
 
-  // Forwards the current total of oversubscribed resources.
-  void forwardOversubscribed();
-  void _forwardOversubscribed(
-      const process::Future<Resources>& oversubscribable);
+  double _resources_revocable_total(const std::string& name);
+  double _resources_revocable_used(const std::string& name);
+  double _resources_revocable_percent(const std::string& name);
+
+  // Checks whether the two `SlaveInfo` objects are considered
+  // compatible based on the value of the `--configuration_policy`
+  // flag.
+  Try<Nothing> compatible(
+      const SlaveInfo& previous,
+      const SlaveInfo& current) const;
+
+  void initializeResourceProviderManager(
+      const Flags& flags,
+      const SlaveID& slaveId);
+
+  protobuf::master::Capabilities requiredMasterCapabilities;
 
   const Flags flags;
 
@@ -745,17 +727,27 @@ private:
 
   SlaveInfo info;
 
+  protobuf::slave::Capabilities capabilities;
+
   // Resources that are checkpointed by the slave.
   Resources checkpointedResources;
 
-  // The current total resources of the agent, i.e.,
-  // `info.resources()` with checkpointed resources applied.
+  // The current total resources of the agent, i.e., `info.resources()` with
+  // checkpointed resources applied and resource provider resources.
   Resources totalResources;
 
   Option<process::UPID> master;
 
   hashmap<FrameworkID, Framework*> frameworks;
 
+  // Note that these frameworks are "completed" only in that
+  // they no longer have any active tasks or executors on this
+  // particular agent.
+  //
+  // TODO(bmahler): Implement a more accurate framework lifecycle
+  // in the agent code, ideally the master can inform the agent
+  // when a framework is actually completed, and the agent can
+  // perhaps store a cache of "idle" frameworks. See MESOS-7890.
   BoundedHashMap<FrameworkID, process::Owned<Framework>> completedFrameworks;
 
   mesos::master::detector::MasterDetector* detector;
@@ -766,19 +758,11 @@ private:
 
   Metrics metrics;
 
-  double _resources_total(const std::string& name);
-  double _resources_used(const std::string& name);
-  double _resources_percent(const std::string& name);
-
-  double _resources_revocable_total(const std::string& name);
-  double _resources_revocable_used(const std::string& name);
-  double _resources_revocable_percent(const std::string& name);
-
   process::Time startTime;
 
   GarbageCollector* gc;
 
-  StatusUpdateManager* statusUpdateManager;
+  TaskStatusUpdateManager* taskStatusUpdateManager;
 
   // Master detection future.
   process::Future<Option<MasterInfo>> detection;
@@ -815,9 +799,6 @@ private:
   // Indicates if a new authentication attempt should be enforced.
   bool reauthenticate;
 
-  // Indicates the number of failed authentication attempts.
-  uint64_t failedAuthentications;
-
   // Maximum age of executor directories. Will be recomputed
   // periodically every flags.disk_watch_interval.
   Duration executorDirectoryMaxAllowedAge;
@@ -826,11 +807,41 @@ private:
 
   mesos::slave::QoSController* qosController;
 
+  std::shared_ptr<DiskProfileAdaptor> diskProfileAdaptor;
+
+  mesos::SecretGenerator* secretGenerator;
+
   const Option<Authorizer*> authorizer;
 
   // The most recent estimate of the total amount of oversubscribed
   // (allocated and oversubscribable) resources.
   Option<Resources> oversubscribedResources;
+
+  process::Owned<ResourceProviderManager> resourceProviderManager;
+  process::Owned<LocalResourceProviderDaemon> localResourceProviderDaemon;
+
+  // Local resource providers known by the agent.
+  hashmap<ResourceProviderID, ResourceProvider*> resourceProviders;
+
+  // Used to establish the relationship between the operation and the
+  // resources that the operation is operating on. Each resource
+  // provider will keep a resource version UUID, and change it when it
+  // believes that the resources from this resource provider are out
+  // of sync from the master's view.  The master will keep track of
+  // the last known resource version UUID for each resource provider,
+  // and attach the resource version UUID in each operation it sends
+  // out. The resource provider should reject operations that have a
+  // different resource version UUID than that it maintains, because
+  // this means the operation is operating on resources that might
+  // have already been invalidated.
+  UUID resourceVersion;
+
+  // Keeps track of the following:
+  // (1) Pending operations for resources from the agent.
+  // (2) Pending operations or terminal operations that have
+  //     unacknowledged status updates for resource provider
+  //     provided resources.
+  hashmap<UUID, Operation*> operations;
 };
 
 
@@ -872,8 +883,9 @@ std::ostream& operator<<(std::ostream& stream, const Executor& executor);
 
 
 // Information describing an executor.
-struct Executor
+class Executor
 {
+public:
   Executor(
       Slave* slave,
       const FrameworkID& frameworkId,
@@ -885,15 +897,47 @@ struct Executor
 
   ~Executor();
 
-  Task* addTask(const TaskInfo& task);
+  // Note that these tasks will also be tracked within `queuedTasks`.
+  void enqueueTaskGroup(const TaskGroupInfo& taskGroup);
+
+  void enqueueTask(const TaskInfo& task);
+  Option<TaskInfo> dequeueTask(const TaskID& taskId);
+  Task* addLaunchedTask(const TaskInfo& task);
   void completeTask(const TaskID& taskId);
   void checkpointExecutor();
   void checkpointTask(const TaskInfo& task);
-  void recoverTask(const state::TaskState& state);
+  void checkpointTask(const Task& task);
+
+  void recoverTask(const state::TaskState& state, bool recheckpointTask);
+
   Try<Nothing> updateTaskState(const TaskStatus& status);
 
   // Returns true if there are any queued/launched/terminated tasks.
   bool incompleteTasks();
+
+  // Returns true if the agent ever sent any tasks to this executor.
+  // More precisely, this function returns whether either:
+  //
+  //  (1) There are terminated/completed tasks with a
+  //      SOURCE_EXECUTOR status.
+  //
+  //  (2) `launchedTasks` is not empty.
+  //
+  // If this function returns false and there are no queued tasks,
+  // we probably (see TODO below) have killed or dropped all of its
+  // initial tasks, in which case the agent will shut down the executor.
+  //
+  // TODO(mzhu): Note however, that since we look through the cache
+  // of completed tasks, we can have false positives when a task
+  // that was delivered to the executor has been evicted from the
+  // completed task cache by tasks that have been killed by the
+  // agent before delivery. This should be fixed.
+  //
+  // NOTE: This function checks whether any tasks has ever been sent,
+  // this does not necessarily mean the executor has ever received
+  // any tasks. Specifically, tasks in `launchedTasks` may be dropped
+  // before received by the executor if the agent restarts.
+  bool everSentTask() const;
 
   // Sends a message to the connected executor.
   template <typename Message>
@@ -917,8 +961,10 @@ struct Executor
     }
   }
 
-  // Returns true if this is a command executor.
-  bool isCommandExecutor() const;
+  // Returns true if this executor is generated by Mesos for a command
+  // task (either command executor for MesosContainerizer or docker
+  // executor for DockerContainerizer).
+  bool isGeneratedForCommandTask() const;
 
   // Closes the HTTP connection.
   void closeHttpConnection();
@@ -926,19 +972,7 @@ struct Executor
   // Returns the task group associated with the task.
   Option<TaskGroupInfo> getQueuedTaskGroup(const TaskID& taskId);
 
-  friend std::ostream& operator<<(
-      std::ostream& stream,
-      const Executor& executor);
-
-// Undefine NetBios preprocessor macros used by the `State` enum.
-#ifdef REGISTERING
-#undef REGISTERING
-#endif // REGISTERING
-
-#ifdef REGISTERED
-#undef REGISTERED
-#endif // REGISTERED
-
+  Resources allocatedResources() const;
 
   enum State
   {
@@ -984,10 +1018,11 @@ struct Executor
   Option<HttpConnection> http;
   Option<process::UPID> pid;
 
-  // Currently consumed resources.
-  Resources resources;
-
   // Tasks can be found in one of the following four data structures:
+  //
+  // TODO(bmahler): Make these private to enforce that the task
+  // lifecycle helper functions are not being bypassed, and provide
+  // public views into them.
 
   // Not yet launched tasks. This also includes tasks from `queuedTaskGroups`.
   LinkedHashMap<TaskID, TaskInfo> queuedTasks;
@@ -995,9 +1030,7 @@ struct Executor
   // Not yet launched task groups. This is needed for correctly sending
   // TASK_KILLED status updates for all tasks in the group if any of the
   // tasks were killed before the executor could register with the agent.
-  //
-  // TODO(anand): Replace this with `LinkedHashSet` when it is available.
-  std::list<TaskGroupInfo> queuedTaskGroups;
+  std::vector<TaskGroupInfo> queuedTaskGroups;
 
   // Running.
   LinkedHashMap<TaskID, Task*> launchedTasks;
@@ -1007,9 +1040,9 @@ struct Executor
 
   // Terminated and updates acked.
   // NOTE: We use a shared pointer for Task because clang doesn't like
-  // Boost's implementation of circular_buffer with Task (Boost
-  // attempts to do some memset's which are unsafe).
-  boost::circular_buffer<std::shared_ptr<Task>> completedTasks;
+  // stout's implementation of circular_buffer with Task (the Boost code
+  // used internally by stout attempts to do some memset's which are unsafe).
+  circular_buffer<std::shared_ptr<Task>> completedTasks;
 
   // When the slave initiates a destroy of the container, we expect a
   // termination to occur. The 'pendingTermation' indicates why the
@@ -1019,16 +1052,17 @@ struct Executor
   Option<mesos::slave::ContainerTermination> pendingTermination;
 
 private:
-  Executor(const Executor&);              // No copying.
-  Executor& operator=(const Executor&); // No assigning.
+  Executor(const Executor&) = delete;
+  Executor& operator=(const Executor&) = delete;
 
-  bool commandExecutor;
+  bool isGeneratedForCommandTask_;
 };
 
 
 // Information about a framework.
-struct Framework
+class Framework
 {
+public:
   Framework(
       Slave* slave,
       const Flags& slaveFlags,
@@ -1037,18 +1071,51 @@ struct Framework
 
   ~Framework();
 
-  // If an executor is launched for a task group, `taskInfo` would
-  // not be set.
-  Executor* launchExecutor(
-      const ExecutorInfo& executorInfo,
-      const Option<TaskInfo>& taskInfo);
-  void destroyExecutor(const ExecutorID& executorId);
-  Executor* getExecutor(const ExecutorID& executorId);
-  Executor* getExecutor(const TaskID& taskId);
-  void recoverExecutor(const state::ExecutorState& state);
+  // Returns whether the framework is idle, where idle is
+  // defined as having no activity:
+  //   (1) The framework has no non-terminal tasks and executors.
+  //   (2) All status updates have been acknowledged.
+  //
+  // TODO(bmahler): The framework should also not be considered
+  // idle if there are unacknowledged updates for "pending" tasks.
+  bool idle() const;
+
   void checkpointFramework() const;
 
   const FrameworkID id() const { return info.id(); }
+
+  Try<Executor*> addExecutor(const ExecutorInfo& executorInfo);
+  Executor* getExecutor(const ExecutorID& executorId) const;
+  Executor* getExecutor(const TaskID& taskId) const;
+
+  void destroyExecutor(const ExecutorID& executorId);
+
+  void recoverExecutor(
+      const state::ExecutorState& state,
+      bool recheckpointExecutor,
+      const hashset<TaskID>& tasksToRecheckpoint);
+
+  void addPendingTask(
+      const ExecutorID& executorId,
+      const TaskInfo& task);
+
+  // Note that these tasks will also be tracked within `pendingTasks`.
+  void addPendingTaskGroup(
+      const ExecutorID& executorId,
+      const TaskGroupInfo& taskGroup);
+
+  bool hasTask(const TaskID& taskId) const;
+  bool isPending(const TaskID& taskId) const;
+
+  // Returns the task group associated with a pending task.
+  Option<TaskGroupInfo> getTaskGroupForPendingTask(const TaskID& taskId);
+
+  // Returns whether the pending task was removed.
+  bool removePendingTask(const TaskID& taskId);
+
+  Option<ExecutorID> getExecutorIdForPendingTask(const TaskID& taskId) const;
+
+  Resources allocatedResources() const;
 
   enum State
   {
@@ -1061,7 +1128,7 @@ struct Framework
   // the 'Slave' class.
   Slave* slave;
 
-  const FrameworkInfo info;
+  FrameworkInfo info;
 
   protobuf::framework::Capabilities capabilities;
 
@@ -1072,36 +1139,77 @@ struct Framework
   // sent through the master.
   Option<process::UPID> pid;
 
+  // Executors can be found in one of the following
+  // data structures:
+  //
+  // TODO(bmahler): Make these private to enforce that
+  // the executors lifecycle helper functions are not
+  // being bypassed, and provide public views into them.
+
   // Executors with pending tasks.
-  hashmap<ExecutorID, hashmap<TaskID, TaskInfo>> pending;
+  hashmap<ExecutorID, hashmap<TaskID, TaskInfo>> pendingTasks;
+
+  // Sequences in this map are used to enforce the order of tasks launched on
+  // each executor.
+  //
+  // Note on the lifecycle of the sequence: if the corresponding executor struct
+  // has not been created, we tie the lifecycle of the sequence to the first
+  // task in the sequence (which must have the `launch_executor` flag set to
+  // true modulo MESOS-3870). If the task fails to launch before creating the
+  // executor struct, we will delete the sequence. Once the executor struct is
+  // created, we tie the lifecycle of the sequence to the executor struct.
+  //
+  // TODO(mzhu): Create the executor struct early and put the sequence in it.
+  hashmap<ExecutorID, process::Sequence> taskLaunchSequences;
+
+  // Pending task groups. This is needed for correctly sending
+  // TASK_KILLED status updates for all tasks in the group if
+  // any of the tasks are killed while pending.
+  std::vector<TaskGroupInfo> pendingTaskGroups;
 
   // Current running executors.
   hashmap<ExecutorID, Executor*> executors;
 
-  boost::circular_buffer<process::Owned<Executor>> completedExecutors;
-
-  bool hasTask(const TaskID& taskId)
-  {
-    foreachkey (const ExecutorID& executorId, pending) {
-      if (pending[executorId].contains(taskId)) {
-        return true;
-      }
-    }
-
-    foreachvalue (Executor* executor, executors) {
-      if (executor->queuedTasks.contains(taskId) ||
-          executor->launchedTasks.contains(taskId) ||
-          executor->terminatedTasks.contains(taskId)) {
-        return true;
-      }
-    }
-
-    return false;
-  }
+  circular_buffer<process::Owned<Executor>> completedExecutors;
 
 private:
-  Framework(const Framework&);              // No copying.
-  Framework& operator=(const Framework&); // No assigning.
+  Framework(const Framework&) = delete;
+  Framework& operator=(const Framework&) = delete;
+};
+
+
+struct ResourceProvider
+{
+  ResourceProvider(
+      const ResourceProviderInfo& _info,
+      const Resources& _totalResources,
+      const Option<UUID>& _resourceVersion)
+    : info(_info),
+      totalResources(_totalResources),
+      resourceVersion(_resourceVersion) {}
+
+  void addOperation(Operation* operation);
+  void removeOperation(Operation* operation);
+
+  ResourceProviderInfo info;
+  Resources totalResources;
+
+  // Used to establish the relationship between the operation and the
+  // resources that the operation is operating on. Each resource
+  // provider will keep a resource version UUID, and change it when it
+  // believes that the resources from this resource provider are out
+  // of sync from the master's view.  The master will keep track of
+  // the last known resource version UUID for each resource provider,
+  // and attach the resource version UUID in each operation it sends
+  // out. The resource provider should reject operations that have a
+  // different resource version UUID than that it maintains, because
+  // this means the operation is operating on resources that might
+  // have already been invalidated.
+  Option<UUID> resourceVersion;
+
+  // Pending operations or terminal operations that have
+  // unacknowledged status updates.
+  hashmap<UUID, Operation*> operations;
 };
 
 
@@ -1124,24 +1232,13 @@ std::map<std::string, std::string> executorEnvironment(
     const std::string& directory,
     const SlaveID& slaveId,
     const process::PID<Slave>& slavePid,
+    const Option<Secret>& authenticationToken,
     bool checkpoint);
 
 
-// Returns the command info for default executor.
-CommandInfo defaultExecutorCommandInfo(
-    const std::string& launcherDir,
-    const Option<std::string>& user);
-
-
-std::ostream& operator<<(std::ostream& stream, Slave::State state);
-std::ostream& operator<<(std::ostream& stream, Framework::State state);
 std::ostream& operator<<(std::ostream& stream, Executor::State state);
-
-
-// Needed for logging task/task group.
-std::string taskOrTaskGroup(
-    const Option<TaskInfo>& task,
-    const Option<TaskGroupInfo>& taskGroup);
+std::ostream& operator<<(std::ostream& stream, Framework::State state);
+std::ostream& operator<<(std::ostream& stream, Slave::State state);
 
 } // namespace slave {
 } // namespace internal {

@@ -31,6 +31,8 @@
 #include <stout/protobuf.hpp>
 #include <stout/uuid.hpp>
 
+#include <stout/os/constants.hpp>
+
 #include <mesos/http.hpp>
 #include <mesos/mesos.hpp>
 
@@ -61,6 +63,7 @@ namespace paths = mesos::internal::slave::containerizer::paths;
 using mesos::agent::Call;
 using mesos::agent::ProcessIO;
 
+using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::IOSwitchboardServer;
 using mesos::internal::slave::MesosContainerizer;
@@ -118,6 +121,19 @@ protected:
     return connection.send(request, true);
   }
 
+  // Helper that sends an acknowledgment for the `ATTACH_CONTAINER_INPUT`
+  // request.
+  Future<http::Response> acknowledgeContainerInputResponse(
+      http::Connection connection) const {
+    http::Request request;
+    request.method = "POST";
+    request.type = http::Request::BODY;
+    request.url.domain = "";
+    request.url.path = "/acknowledge_container_input_response";
+
+    return connection.send(request);
+  }
+
   // Reads `ProcessIO::Data` records from the pipe `reader` until EOF is reached
   // and returns the merged stdout and stderr.
   // NOTE: It ignores any `ProcessIO::Control` records.
@@ -162,17 +178,18 @@ protected:
 
 TEST_F(IOSwitchboardServerTest, RedirectLog)
 {
-  int stdoutPipe[2];
-  int stderrPipe[2];
-
-  Try<int> nullFd = os::open("/dev/null", O_RDWR);
+  Try<int> nullFd = os::open(os::DEV_NULL, O_RDWR);
   ASSERT_SOME(nullFd);
 
-  Try<Nothing> pipe = os::pipe(stdoutPipe);
-  ASSERT_SOME(pipe);
+  Try<std::array<int_fd, 2>> stdoutPipe_ = os::pipe();
+  ASSERT_SOME(stdoutPipe_);
 
-  pipe = os::pipe(stderrPipe);
-  ASSERT_SOME(pipe);
+  const std::array<int_fd, 2>& stdoutPipe = stdoutPipe_.get();
+
+  Try<std::array<int_fd, 2>> stderrPipe_ = os::pipe();
+  ASSERT_SOME(stderrPipe_);
+
+  const std::array<int_fd, 2>& stderrPipe = stderrPipe_.get();
 
   string stdoutPath = path::join(sandbox.get(), "stdout");
   Try<int> stdoutFd = os::open(
@@ -203,7 +220,7 @@ TEST_F(IOSwitchboardServerTest, RedirectLog)
 
   ASSERT_SOME(server);
 
-  Future<Nothing> runServer  = server.get()->run();
+  Future<Nothing> runServer = server.get()->run();
 
   string data =
     "Lorem ipsum dolor sit amet, consectetur adipisicing elit, sed do "
@@ -249,7 +266,7 @@ TEST_F(IOSwitchboardServerTest, RedirectLog)
 
 TEST_F(IOSwitchboardServerTest, AttachOutput)
 {
-  Try<int> nullFd = os::open("/dev/null", O_RDWR);
+  Try<int> nullFd = os::open(os::DEV_NULL, O_RDWR);
   ASSERT_SOME(nullFd);
 
   string stdoutPath = path::join(sandbox.get(), "stdout");
@@ -313,7 +330,7 @@ TEST_F(IOSwitchboardServerTest, AttachOutput)
   Future<Nothing> runServer = server.get()->run();
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Try<unix::Address> address = unix::Address::create(socketPath);
   ASSERT_SOME(address);
@@ -328,8 +345,8 @@ TEST_F(IOSwitchboardServerTest, AttachOutput)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
-  ASSERT_EQ(http::Response::PIPE, response.get().type);
-  ASSERT_SOME(response.get().reader);
+  ASSERT_EQ(http::Response::PIPE, response->type);
+  ASSERT_SOME(response->reader);
 
   Future<tuple<string, string>> received =
     getProcessIOData(response->reader.get());
@@ -360,12 +377,12 @@ TEST_F(IOSwitchboardServerTest, SendHeartbeat)
   // We use a pipe in this test to prevent the switchboard from
   // reading EOF on its `stdoutFromFd` until we are ready for the
   // switchboard to terminate.
-  int stdoutPipe[2];
+  Try<std::array<int_fd, 2>> stdoutPipe_ = os::pipe();
+  ASSERT_SOME(stdoutPipe_);
 
-  Try<Nothing> pipe = os::pipe(stdoutPipe);
-  ASSERT_SOME(pipe);
+  const std::array<int_fd, 2>& stdoutPipe = stdoutPipe_.get();
 
-  Try<int> nullFd = os::open("/dev/null", O_RDWR);
+  Try<int> nullFd = os::open(os::DEV_NULL, O_RDWR);
   ASSERT_SOME(nullFd);
 
   Duration heartbeat = Milliseconds(10);
@@ -391,7 +408,7 @@ TEST_F(IOSwitchboardServerTest, SendHeartbeat)
   call.set_type(Call::ATTACH_CONTAINER_OUTPUT);
 
   Call::AttachContainerOutput* attach = call.mutable_attach_container_output();
-  attach->mutable_container_id()->set_value(UUID::random().toString());
+  attach->mutable_container_id()->set_value(id::UUID::random().toString());
 
   http::Request request;
   request.method = "POST";
@@ -415,9 +432,9 @@ TEST_F(IOSwitchboardServerTest, SendHeartbeat)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
-  ASSERT_EQ(http::Response::PIPE, response.get().type);
+  ASSERT_EQ(http::Response::PIPE, response->type);
 
-  Option<http::Pipe::Reader> reader = response.get().reader;
+  Option<http::Pipe::Reader> reader = response->reader;
   ASSERT_SOME(reader);
 
   auto deserializer = [](const string& body) {
@@ -440,7 +457,7 @@ TEST_F(IOSwitchboardServerTest, SendHeartbeat)
     // Expect for the message to have been received by now.
     ASSERT_SOME(_message.get());
 
-    agent::ProcessIO message = _message.get().get();
+    agent::ProcessIO message = _message->get();
 
     EXPECT_EQ(agent::ProcessIO::CONTROL, message.type());
 
@@ -462,18 +479,17 @@ TEST_F(IOSwitchboardServerTest, SendHeartbeat)
 }
 
 
-// TODO(alexr): Enable this test once MESOS-6912 is resolved.
-TEST_F(IOSwitchboardServerTest, DISABLED_AttachInput)
+TEST_F(IOSwitchboardServerTest, AttachInput)
 {
   // We use a pipe in this test to prevent the switchboard from
   // reading EOF on its `stdoutFromFd` until we are ready for the
   // switchboard to terminate.
-  int stdoutPipe[2];
+  Try<std::array<int_fd, 2>> stdoutPipe_ = os::pipe();
+  ASSERT_SOME(stdoutPipe_);
 
-  Try<Nothing> pipe = os::pipe(stdoutPipe);
-  ASSERT_SOME(pipe);
+  const std::array<int_fd, 2>& stdoutPipe = stdoutPipe_.get();
 
-  Try<int> nullFd = os::open("/dev/null", O_RDWR);
+  Try<int> nullFd = os::open(os::DEV_NULL, O_RDWR);
   ASSERT_SOME(nullFd);
 
   string stdinPath = path::join(sandbox.get(), "stdin");
@@ -525,7 +541,8 @@ TEST_F(IOSwitchboardServerTest, DISABLED_AttachInput)
   request.url.path = "/";
   request.keepAlive = true;
   request.headers["Accept"] = APPLICATION_JSON;
-  request.headers["Content-Type"] = APPLICATION_JSON;
+  request.headers["Content-Type"] = APPLICATION_RECORDIO;
+  request.headers[MESSAGE_CONTENT_TYPE] = APPLICATION_JSON;
 
   Try<unix::Address> address = unix::Address::create(socketPath);
   ASSERT_SOME(address);
@@ -546,7 +563,7 @@ TEST_F(IOSwitchboardServerTest, DISABLED_AttachInput)
 
   Call::AttachContainerInput* attach = call.mutable_attach_container_input();
   attach->set_type(Call::AttachContainerInput::CONTAINER_ID);
-  attach->mutable_container_id()->set_value(UUID::random().toString());
+  attach->mutable_container_id()->set_value(id::UUID::random().toString());
 
   writer.write(encoder.encode(call));
 
@@ -574,6 +591,8 @@ TEST_F(IOSwitchboardServerTest, DISABLED_AttachInput)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
 
+  acknowledgeContainerInputResponse(connection);
+
   AWAIT_READY(connection.disconnect());
   AWAIT_READY(connection.disconnected());
 
@@ -598,12 +617,12 @@ TEST_F(IOSwitchboardServerTest, ReceiveHeartbeat)
   // We use a pipe in this test to prevent the switchboard from
   // reading EOF on its `stdoutFromFd` until we are ready for the
   // switchboard to terminate.
-  int stdoutPipe[2];
+  Try<std::array<int_fd, 2>> stdoutPipe_ = os::pipe();
+  ASSERT_SOME(stdoutPipe_);
 
-  Try<Nothing> pipe = os::pipe(stdoutPipe);
-  ASSERT_SOME(pipe);
+  const std::array<int_fd, 2>& stdoutPipe = stdoutPipe_.get();
 
-  Try<int> nullFd = os::open("/dev/null", O_RDWR);
+  Try<int> nullFd = os::open(os::DEV_NULL, O_RDWR);
   ASSERT_SOME(nullFd);
 
   string socketPath = path::join(sandbox.get(), "mesos-io-switchboard");
@@ -656,7 +675,7 @@ TEST_F(IOSwitchboardServerTest, ReceiveHeartbeat)
 
   Call::AttachContainerInput* attach = call.mutable_attach_container_input();
   attach->set_type(Call::AttachContainerInput::CONTAINER_ID);
-  attach->mutable_container_id()->set_value(UUID::random().toString());
+  attach->mutable_container_id()->set_value(id::UUID::random().toString());
 
   writer.write(encoder.encode(call));
 
@@ -685,6 +704,8 @@ TEST_F(IOSwitchboardServerTest, ReceiveHeartbeat)
   // result of receiving the heartbeats.
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
 
+  acknowledgeContainerInputResponse(connection);
+
   AWAIT_READY(connection.disconnect());
   AWAIT_READY(connection.disconnected());
 
@@ -707,11 +728,8 @@ TEST_F(IOSwitchboardTest, ContainerAttach)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
   flags.isolation = "posix/cpu";
-#ifdef __linux__
-  flags.agent_subsystems = None();
-#endif
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -728,7 +746,7 @@ TEST_F(IOSwitchboardTest, ContainerAttach)
   AWAIT_READY(containerizer->recover(state));
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Try<string> directory = environment->mkdtemp();
   ASSERT_SOME(directory);
@@ -742,30 +760,24 @@ TEST_F(IOSwitchboardTest, ContainerAttach)
   executorInfo.mutable_container()->set_type(ContainerInfo::MESOS);
   executorInfo.mutable_container()->mutable_tty_info();
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      executorInfo,
-      directory.get(),
-      None(),
-      SlaveID(),
+      createContainerConfig(None(), executorInfo, directory.get()),
       map<string, string>(),
-      true); // TODO(benh): Ever want to test not checkpointing?
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   Future<http::Connection> connection = containerizer->attach(containerId);
   AWAIT_READY(connection);
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  Future<bool> destroy = containerizer->destroy(containerId);
-  AWAIT_READY(destroy);
-
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-  ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
 }
 
 
@@ -776,11 +788,8 @@ TEST_F(IOSwitchboardTest, OutputRedirectionWithTTY)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
   flags.isolation = "posix/cpu";
-#ifdef __linux__
-  flags.agent_subsystems = None();
-#endif
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -797,7 +806,7 @@ TEST_F(IOSwitchboardTest, OutputRedirectionWithTTY)
   AWAIT_READY(containerizer->recover(state));
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Try<string> directory = environment->mkdtemp();
   ASSERT_SOME(directory);
@@ -814,17 +823,13 @@ TEST_F(IOSwitchboardTest, OutputRedirectionWithTTY)
   executorInfo.mutable_container()->set_type(ContainerInfo::MESOS);
   executorInfo.mutable_container()->mutable_tty_info();
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      executorInfo,
-      directory.get(),
-      None(),
-      SlaveID(),
+      createContainerConfig(None(), executorInfo, directory.get()),
       map<string, string>(),
-      true); // TODO(benh): Ever want to test not checkpointing?
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
 
@@ -844,11 +849,8 @@ TEST_F(IOSwitchboardTest, KillSwitchboardContainerDestroyed)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
   flags.isolation = "posix/cpu";
-#ifdef __linux__
-  flags.agent_subsystems = None();
-#endif
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -865,7 +867,7 @@ TEST_F(IOSwitchboardTest, KillSwitchboardContainerDestroyed)
   AWAIT_READY(containerizer->recover(state));
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Try<string> directory = environment->mkdtemp();
   ASSERT_SOME(directory);
@@ -875,31 +877,28 @@ TEST_F(IOSwitchboardTest, KillSwitchboardContainerDestroyed)
       "sleep 1000",
       "cpus:1");
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      executorInfo,
-      directory.get(),
-      None(),
-      SlaveID(),
+      createContainerConfig(None(), executorInfo, directory.get()),
       map<string, string>(),
-      true); // TODO(benh): Ever want to test not checkpointing?
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   ContainerID childContainerId;
   childContainerId.mutable_parent()->CopyFrom(containerId);
-  childContainerId.set_value(UUID::random().toString());
+  childContainerId.set_value(id::UUID::random().toString());
 
   launch = containerizer->launch(
       childContainerId,
-      createCommandInfo("sleep 1000"),
-      None(),
-      None(),
-      state.id,
-      mesos::slave::ContainerClass::DEBUG);
+      createContainerConfig(
+          createCommandInfo("sleep 1000"),
+          None(),
+          mesos::slave::ContainerClass::DEBUG),
+      map<string, string>(),
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   Result<pid_t> pid = paths::getContainerIOSwitchboardPid(
         flags.runtime_dir, childContainerId);
@@ -917,24 +916,25 @@ TEST_F(IOSwitchboardTest, KillSwitchboardContainerDestroyed)
   ASSERT_TRUE(wait.get()->has_status());
   EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
 
-  ASSERT_TRUE(wait.get()->reasons().size() == 1);
+  ASSERT_TRUE(wait.get()->has_reason());
   ASSERT_EQ(TaskStatus::REASON_IO_SWITCHBOARD_EXITED,
-            wait.get()->reasons().Get(0));
+            wait.get()->reason());
 
-  wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
 
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-
-  ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
 }
 
 
 // This test verifies that the io switchboard isolator recovers properly.
-TEST_F(IOSwitchboardTest, RecoverThenKillSwitchboardContainerDestroyed)
+//
+// TODO(alexr): Enable after MESOS-7023 is resolved.
+TEST_F(IOSwitchboardTest, DISABLED_RecoverThenKillSwitchboardContainerDestroyed)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -942,11 +942,8 @@ TEST_F(IOSwitchboardTest, RecoverThenKillSwitchboardContainerDestroyed)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
   flags.isolation = "posix/cpu";
-#ifdef __linux__
-  flags.agent_subsystems = None();
-#endif
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -985,7 +982,7 @@ TEST_F(IOSwitchboardTest, RecoverThenKillSwitchboardContainerDestroyed)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with tty to start the switchboard server.
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
@@ -1013,13 +1010,16 @@ TEST_F(IOSwitchboardTest, RecoverThenKillSwitchboardContainerDestroyed)
 
   containerizer.reset(create.get());
 
-  // Expect three task updates.
-  // (1) TASK_RUNNING before recovery.
-  // (2) TASK_RUNNING after recovery.
-  // (3) TASK_FAILED after the io switchboard is killed.
+  // Expect four task updates.
+  // (1) TASK_STARTING when the task starts.
+  // (2) TASK_RUNNING before recovery.
+  // (3) TASK_RUNNING after recovery.
+  // (4) TASK_FAILED after the io switchboard is killed.
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFailed;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFailed))
@@ -1028,14 +1028,17 @@ TEST_F(IOSwitchboardTest, RecoverThenKillSwitchboardContainerDestroyed)
   slave = StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
   // Make sure the task comes back as running.
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   // Kill the io switchboard for the task.
-  Future<hashset<ContainerID>> containers = containerizer.get()->containers();
+  Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
-  ASSERT_EQ(1u, containers.get().size());
+  ASSERT_EQ(1u, containers->size());
 
   Result<pid_t> pid = paths::getContainerIOSwitchboardPid(
         flags.runtime_dir, *containers->begin());
@@ -1066,11 +1069,8 @@ TEST_F(IOSwitchboardTest, ContainerAttachAfterSlaveRestart)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
   flags.isolation = "posix/cpu";
-#ifdef __linux__
-  flags.agent_subsystems = None();
-#endif
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -1108,13 +1108,18 @@ TEST_F(IOSwitchboardTest, ContainerAttachAfterSlaveRestart)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
-  Future<Nothing> _ack =
+  Future<Nothing> _ackRunning =
+    FUTURE_DISPATCH(_, &slave::Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _ackStarting =
     FUTURE_DISPATCH(_, &slave::Slave::_statusUpdateAcknowledgement);
 
   // Launch a task with tty to start the switchboard server.
@@ -1124,10 +1129,11 @@ TEST_F(IOSwitchboardTest, ContainerAttachAfterSlaveRestart)
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
+  // Ultimately wait for the `TASK_RUNNING` ack to be checkpointed.
+  AWAIT_READY(statusStarting);
+  AWAIT_READY(_ackStarting);
   AWAIT_READY(statusRunning);
-
-  // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_ack);
+  AWAIT_READY(_ackRunning);
 
   // Restart the slave with a new containerizer.
   slave.get()->terminate();
@@ -1149,9 +1155,9 @@ TEST_F(IOSwitchboardTest, ContainerAttachAfterSlaveRestart)
   // Wait until containerizer is recovered.
   AWAIT_READY(_recover);
 
-  Future<hashset<ContainerID>> containers = containerizer.get()->containers();
+  Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
-  ASSERT_EQ(1u, containers.get().size());
+  ASSERT_EQ(1u, containers->size());
 
   ContainerID containerId;
   containerId.set_value(containers->begin()->value());

@@ -37,4 +37,5 @@ if [ -n "$ADDED_OR_MODIFIED" ]; then
 fi
 
 # Check that the commits are properly split between mesos, libprocess and stout.
+# TODO(ArmandGrillet): Remove the if to really switch to Python 3.
 git diff --cached --name-only --diff-filter=AMD | xargs ./support/mesos-split.py || exit 1

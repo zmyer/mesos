@@ -14,18 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "slave/constants.hpp"
 #include "slave/validation.hpp"
 
 #include <string>
+
+#include <mesos/resources.hpp>
 
 #include <mesos/agent/agent.hpp>
 
 #include <stout/stringify.hpp>
 #include <stout/unreachable.hpp>
-#include <stout/uuid.hpp>
 
-#include "checks/checker.hpp"
-
+#include "common/resources_utils.hpp"
 #include "common/validation.hpp"
 
 using std::string;
@@ -49,6 +50,12 @@ Option<Error> validateContainerId(const ContainerID& containerId)
 
   // Check ContainerID specific rules.
   //
+  // Valid the container id length
+  if (id.length() > MAX_CONTAINER_ID_LENGTH) {
+    return Error("'ContainerID.value' '" + id + "' exceeds the maximum"
+                 " length (" + stringify(MAX_CONTAINER_ID_LENGTH) + ")");
+  }
+
   // Periods are disallowed because our string representation of
   // ContainerID uses periods: <uuid>.<child>.<grandchild>.
   // For example: <uuid>.redis.backup
@@ -147,7 +154,16 @@ Option<Error> validate(
     case mesos::agent::Call::GET_EXECUTORS:
       return None();
 
+    case mesos::agent::Call::GET_OPERATIONS:
+      return None();
+
     case mesos::agent::Call::GET_TASKS:
+      return None();
+
+    case mesos::agent::Call::GET_AGENT:
+      return None();
+
+    case mesos::agent::Call::GET_RESOURCE_PROVIDERS:
       return None();
 
     case mesos::agent::Call::LAUNCH_NESTED_CONTAINER: {
@@ -175,6 +191,15 @@ Option<Error> validate(
             call.launch_nested_container().command());
         if (error.isSome()) {
           return Error("'launch_nested_container.command' is invalid"
+                       ": " + error->message);
+        }
+      }
+
+      if (call.launch_nested_container().has_container()) {
+        error = common::validation::validateContainerInfo(
+            call.launch_nested_container().container());
+        if (error.isSome()) {
+          return Error("'launch_nested_container.container' is invalid"
                        ": " + error->message);
         }
       }
@@ -226,6 +251,28 @@ Option<Error> validate(
       return None();
     }
 
+    case mesos::agent::Call::REMOVE_NESTED_CONTAINER: {
+      if (!call.has_remove_nested_container()) {
+        return Error("Expecting 'remove_nested_container' to be present");
+      }
+
+      Option<Error> error = validation::container::validateContainerId(
+          call.remove_nested_container().container_id());
+
+      if (error.isSome()) {
+        return Error("'remove_nested_container.container_id' is invalid"
+                     ": " + error->message);
+      }
+
+      // Nested containers always have at least one parent.
+      if (!call.remove_nested_container().container_id().has_parent()) {
+        return Error("Expecting 'remove_nested_container.container_id.parent'"
+                     " to be present");
+      }
+
+      return None();
+    }
+
     case mesos::agent::Call::LAUNCH_NESTED_CONTAINER_SESSION: {
       if (!call.has_launch_nested_container_session()) {
         return Error(
@@ -253,6 +300,15 @@ Option<Error> validate(
             call.launch_nested_container_session().command());
         if (error.isSome()) {
           return Error("'launch_nested_container_session.command' is invalid"
+                       ": " + error->message);
+        }
+      }
+
+      if (call.launch_nested_container_session().has_container()) {
+        error = common::validation::validateContainerInfo(
+            call.launch_nested_container_session().container());
+        if (error.isSome()) {
+          return Error("'launch_nested_container_session.container' is invalid"
                        ": " + error->message);
         }
       }
@@ -305,6 +361,181 @@ Option<Error> validate(
 
       return None();
     }
+
+    case mesos::agent::Call::LAUNCH_CONTAINER: {
+      if (!call.has_launch_container()) {
+        return Error("Expecting 'launch_container' to be present");
+      }
+
+      Option<Error> error = validation::container::validateContainerId(
+          call.launch_container().container_id());
+
+      if (error.isSome()) {
+        return Error(
+            "'launch_container.container_id' is invalid: " + error->message);
+      }
+
+      // Nested containers share resources with their parent so are
+      // not allowed to specify resources in this call.
+      if (call.launch_container().container_id().has_parent() &&
+          call.launch_container().resources().size() != 0) {
+        return Error(
+            "Resources may not be specified when using "
+            "'launch_container' to launch nested containers");
+      }
+
+      // General resource validation first.
+      error = Resources::validate(call.launch_container().resources());
+      if (error.isSome()) {
+        return Error("Invalid resources: " + error->message);
+      }
+
+      error = common::validation::validateGpus(
+          call.launch_container().resources());
+
+      if (error.isSome()) {
+        return Error("Invalid GPU resources: " + error->message);
+      }
+
+      // Because standalone containers are launched outside of the master's
+      // offer cycle, some resource types or fields may not be specified.
+      foreach (Resource resource, call.launch_container().resources()) {
+        // Upgrade the resources (in place) to simplify validation.
+        upgradeResource(&resource);
+
+        // Standalone containers may only use unreserved resources.
+        // There is no accounting in the master for resources consumed
+        // by standalone containers, so allowing reserved resources would
+        // only increase code complexity with no change in behavior.
+        if (Resources::isReserved(resource)) {
+          return Error("'launch_container.resources' must be unreserved");
+        }
+
+        // NOTE: The master normally requires all volumes be persistent,
+        // and that all persistent volumes belong to a role. Standalone
+        // containers therefore cannot use persistent volumes.
+        if (Resources::isPersistentVolume(resource)) {
+          return Error(
+              "'launch_container.resources' may not use persistent volumes");
+        }
+
+        // Standalone containers are expected to occupy resources *not*
+        // advertised by the agent and hence do not need to worry about
+        // being preempted or throttled.
+        if (Resources::isRevocable(resource)) {
+          return Error("'launch_container.resources' must be non-revocable");
+        }
+      }
+
+      if (call.launch_container().has_command()) {
+        error = common::validation::validateCommandInfo(
+            call.launch_container().command());
+        if (error.isSome()) {
+          return Error(
+              "'launch_container.command' is invalid: " + error->message);
+        }
+      }
+
+      if (call.launch_container().has_container()) {
+        error = common::validation::validateContainerInfo(
+            call.launch_container().container());
+        if (error.isSome()) {
+          return Error(
+              "'launch_container.container' is invalid: " + error->message);
+        }
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::WAIT_CONTAINER: {
+      if (!call.has_wait_container()) {
+        return Error("Expecting 'wait_container' to be present");
+      }
+
+      Option<Error> error = validation::container::validateContainerId(
+          call.wait_container().container_id());
+
+      if (error.isSome()) {
+        return Error("'wait_container.container_id' is invalid"
+                     ": " + error->message);
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::KILL_CONTAINER: {
+      if (!call.has_kill_container()) {
+        return Error("Expecting 'kill_container' to be present");
+      }
+
+      Option<Error> error = validation::container::validateContainerId(
+          call.kill_container().container_id());
+
+      if (error.isSome()) {
+        return Error("'kill_container.container_id' is invalid"
+                     ": " + error->message);
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::REMOVE_CONTAINER: {
+      if (!call.has_remove_container()) {
+        return Error("Expecting 'remove_container' to be present");
+      }
+
+      Option<Error> error = validation::container::validateContainerId(
+          call.remove_container().container_id());
+
+      if (error.isSome()) {
+        return Error("'remove_container.container_id' is invalid"
+                     ": " + error->message);
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::ADD_RESOURCE_PROVIDER_CONFIG: {
+      if (!call.has_add_resource_provider_config()) {
+        return Error(
+            "Expecting 'add_resource_provider_config' to be present");
+      }
+
+      if (call.add_resource_provider_config().info().has_id()) {
+        return Error(
+            "Expecting 'add_resource_provider_config.info.id' to be unset");
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::UPDATE_RESOURCE_PROVIDER_CONFIG: {
+      if (!call.has_update_resource_provider_config()) {
+        return Error(
+            "Expecting 'update_resource_provider_config' to be present");
+      }
+
+      if (call.update_resource_provider_config().info().has_id()) {
+        return Error(
+            "Expecting 'update_resource_provider_config.info.id' to be unset");
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::REMOVE_RESOURCE_PROVIDER_CONFIG: {
+      if (!call.has_remove_resource_provider_config()) {
+        return Error(
+            "Expecting 'remove_resource_provider_config' to be present");
+      }
+
+      return None();
+    }
+
+    case mesos::agent::Call::PRUNE_IMAGES: {
+      return None();
+    }
   }
 
   UNREACHABLE();
@@ -312,113 +543,6 @@ Option<Error> validate(
 
 } // namespace call {
 } // namespace agent {
-
-namespace executor {
-namespace call {
-
-Option<Error> validate(const mesos::executor::Call& call)
-{
-  if (!call.IsInitialized()) {
-    return Error("Not initialized: " + call.InitializationErrorString());
-  }
-
-  if (!call.has_type()) {
-    return Error("Expecting 'type' to be present");
-  }
-
-  // All calls should have executor id set.
-  if (!call.has_executor_id()) {
-    return Error("Expecting 'executor_id' to be present");
-  }
-
-  // All calls should have framework id set.
-  if (!call.has_framework_id()) {
-    return Error("Expecting 'framework_id' to be present");
-  }
-
-  switch (call.type()) {
-    case mesos::executor::Call::SUBSCRIBE: {
-      if (!call.has_subscribe()) {
-        return Error("Expecting 'subscribe' to be present");
-      }
-      return None();
-    }
-
-    case mesos::executor::Call::UPDATE: {
-      if (!call.has_update()) {
-        return Error("Expecting 'update' to be present");
-      }
-
-      const TaskStatus& status = call.update().status();
-
-      if (!status.has_uuid()) {
-        return Error("Expecting 'uuid' to be present");
-      }
-
-      Try<UUID> uuid = UUID::fromBytes(status.uuid());
-      if (uuid.isError()) {
-        return uuid.error();
-      }
-
-      if (status.has_executor_id() &&
-          status.executor_id().value()
-          != call.executor_id().value()) {
-        return Error("ExecutorID in Call: " +
-                     call.executor_id().value() +
-                     " does not match ExecutorID in TaskStatus: " +
-                     call.update().status().executor_id().value()
-                     );
-      }
-
-      if (status.source() != TaskStatus::SOURCE_EXECUTOR) {
-        return Error("Received Call from executor " +
-                     call.executor_id().value() +
-                     " of framework " +
-                     call.framework_id().value() +
-                     " with invalid source, expecting 'SOURCE_EXECUTOR'"
-                     );
-      }
-
-      if (status.state() == TASK_STAGING) {
-        return Error("Received TASK_STAGING from executor " +
-                     call.executor_id().value() +
-                     " of framework " +
-                     call.framework_id().value() +
-                     " which is not allowed"
-                     );
-      }
-
-      // TODO(alexr): Validate `check_status` is present if
-      // the corresponding `TaskInfo.check` has been defined.
-
-      if (status.has_check_status()) {
-        Option<Error> validate =
-          checks::validation::checkStatusInfo(status.check_status());
-
-        if (validate.isSome()) {
-          return validate.get();
-        }
-      }
-
-      return None();
-    }
-
-    case mesos::executor::Call::MESSAGE: {
-      if (!call.has_message()) {
-        return Error("Expecting 'message' to be present");
-      }
-      return None();
-    }
-
-    case mesos::executor::Call::UNKNOWN: {
-      return None();
-    }
-  }
-  UNREACHABLE();
-}
-
-} // namespace call {
-} // namespace executor {
 } // namespace validation {
 } // namespace slave {
 } // namespace internal {

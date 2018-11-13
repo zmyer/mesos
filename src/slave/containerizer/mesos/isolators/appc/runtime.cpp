@@ -62,6 +62,12 @@ bool AppcRuntimeIsolatorProcess::supportsNesting()
 }
 
 
+bool AppcRuntimeIsolatorProcess::supportsStandalone()
+{
+  return true;
+}
+
+
 Try<Isolator*> AppcRuntimeIsolatorProcess::create(const Flags& flags)
 {
   process::Owned<MesosIsolatorProcess> process(
@@ -103,10 +109,6 @@ Future<Option<ContainerLaunchInfo>> AppcRuntimeIsolatorProcess::prepare(
   // Set 'launchInfo'.
   ContainerLaunchInfo launchInfo;
 
-  if (environment.isSome()) {
-    launchInfo.mutable_environment()->CopyFrom(environment.get());
-  }
-
   // If working directory or command exists, operation has to be
   // handled specially for the command task. For the command task,
   // the working directory and task command will be passed to
@@ -115,27 +117,30 @@ Future<Option<ContainerLaunchInfo>> AppcRuntimeIsolatorProcess::prepare(
   // be included in 'ContainerLaunchInfo', and will be passed back
   // to containerizer.
   if (containerConfig.has_task_info()) {
-    // Command task case. The 'executorCommand' below is the
-    // command with value as 'mesos-executor'.
-    CommandInfo executorCommand = containerConfig.executor_info().command();
+    // Command task case.
+    if (environment.isSome()) {
+      launchInfo.mutable_task_environment()->CopyFrom(environment.get());
+    }
 
     // Pass working directory to command executor as a flag.
     if (workingDirectory.isSome()) {
-      executorCommand.add_arguments(
+      launchInfo.mutable_command()->add_arguments(
           "--working_directory=" + workingDirectory.get());
     }
 
     // Pass task command as a flag, which will be loaded by
     // command executor.
     if (command.isSome()) {
-      executorCommand.add_arguments(
+      launchInfo.mutable_command()->add_arguments(
           "--task_command=" +
           stringify(JSON::protobuf(command.get())));
     }
-
-    launchInfo.mutable_command()->CopyFrom(executorCommand);
   } else {
     // The custom executor, default executor and nested container cases.
+    if (environment.isSome()) {
+      launchInfo.mutable_environment()->CopyFrom(environment.get());
+    }
+
     if (workingDirectory.isSome()) {
       launchInfo.set_working_directory(workingDirectory.get());
     }

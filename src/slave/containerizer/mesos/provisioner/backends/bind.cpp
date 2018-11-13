@@ -128,27 +128,13 @@ Future<Nothing> BindBackendProcess::provision(
       layers.front(),
       rootfs,
       None(),
-      MS_BIND,
+      MS_BIND | MS_RDONLY,
       nullptr);
 
   if (mount.isError()) {
     return Failure(
         "Failed to bind mount rootfs '" + layers.front() +
         "' to '" + rootfs + "': " + mount.error());
-  }
-
-  // And remount it read-only.
-  mount = fs::mount(
-      None(), // Ignored.
-      rootfs,
-      None(),
-      MS_BIND | MS_RDONLY | MS_REMOUNT,
-      nullptr);
-
-  if (mount.isError()) {
-    return Failure(
-        "Failed to remount rootfs '" + rootfs + "' read-only: " +
-        mount.error());
   }
 
   // Mark the mount as shared+slave.
@@ -190,13 +176,16 @@ Future<bool> BindBackendProcess::destroy(const string& rootfs)
     return Failure("Failed to read mount table: " + mountTable.error());
   }
 
-  foreach (const fs::MountInfoTable::Entry& entry, mountTable.get().entries) {
+  foreach (const fs::MountInfoTable::Entry& entry, mountTable->entries) {
     // TODO(xujyan): If MS_REC was used in 'provision()' we would need
     // to check `strings::startsWith(entry.target, rootfs)` here to
     // unmount all nested mounts.
     if (entry.target == rootfs) {
-      // NOTE: This would fail if the rootfs is still in use.
-      Try<Nothing> unmount = fs::unmount(entry.target);
+      // NOTE: Use MNT_DETACH here so that if there are still
+      // processes holding files or directories in the rootfs, the
+      // unmount will still be successful. The kernel will cleanup the
+      // mount when the number of references reach zero.
+      Try<Nothing> unmount = fs::unmount(entry.target, MNT_DETACH);
       if (unmount.isError()) {
         return Failure(
             "Failed to destroy bind-mounted rootfs '" + rootfs + "': " +

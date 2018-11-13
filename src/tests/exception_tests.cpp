@@ -148,8 +148,7 @@ TEST_F(ExceptionTest, DisallowSchedulerCallbacksOnAbort)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -162,23 +161,23 @@ TEST_F(ExceptionTest, DisallowSchedulerCallbacksOnAbort)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // None of these callbacks should be invoked.
   EXPECT_CALL(sched, offerRescinded(&driver, _))
     .Times(0);
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-      .Times(0);
+    .Times(0);
 
   EXPECT_CALL(sched, frameworkMessage(&driver, _, _, _))
-      .Times(0);
+    .Times(0);
 
   EXPECT_CALL(sched, slaveLost(&driver, _))
-      .Times(0);
+    .Times(0);
 
   EXPECT_CALL(sched, error(&driver, _))
-      .Times(0);
+    .Times(0);
 
   ASSERT_EQ(DRIVER_ABORTED, driver.abort());
 
@@ -189,7 +188,7 @@ TEST_F(ExceptionTest, DisallowSchedulerCallbacksOnAbort)
   RescindResourceOfferMessage rescindMessage;
   rescindMessage.mutable_offer_id()->MergeFrom(offers.get()[0].id());
 
-  process::post(message.get().to, rescindMessage);
+  process::post(message->to, rescindMessage);
 
   AWAIT_READY(rescindMsg);
 

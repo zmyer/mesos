@@ -32,9 +32,12 @@ class PosixRLimitsIsolatorProcess : public MesosIsolatorProcess
 public:
   static Try<mesos::slave::Isolator*> create(const Flags& flags);
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  bool supportsNesting() override;
+  bool supportsStandalone() override;
+
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
 private:
   PosixRLimitsIsolatorProcess(const Flags& flags) {}

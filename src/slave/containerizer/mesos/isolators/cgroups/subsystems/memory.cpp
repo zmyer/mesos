@@ -43,7 +43,6 @@ using process::Future;
 using process::Owned;
 using process::PID;
 
-using std::list;
 using std::ostringstream;
 using std::string;
 using std::vector;
@@ -58,7 +57,7 @@ static const vector<Level> levels()
 }
 
 
-Try<Owned<Subsystem>> MemorySubsystem::create(
+Try<Owned<SubsystemProcess>> MemorySubsystemProcess::create(
     const Flags& flags,
     const string& hierarchy)
 {
@@ -104,18 +103,18 @@ Try<Owned<Subsystem>> MemorySubsystem::create(
     }
   }
 
-  return Owned<Subsystem>(new MemorySubsystem(flags, hierarchy));
+  return Owned<SubsystemProcess>(new MemorySubsystemProcess(flags, hierarchy));
 }
 
 
-MemorySubsystem::MemorySubsystem(
+MemorySubsystemProcess::MemorySubsystemProcess(
     const Flags& _flags,
     const string& _hierarchy)
   : ProcessBase(process::ID::generate("cgroups-memory-subsystem")),
-    Subsystem(_flags, _hierarchy) {}
+    SubsystemProcess(_flags, _hierarchy) {}
 
 
-Future<Nothing> MemorySubsystem::recover(
+Future<Nothing> MemorySubsystemProcess::recover(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -132,7 +131,7 @@ Future<Nothing> MemorySubsystem::recover(
 }
 
 
-Future<Nothing> MemorySubsystem::prepare(
+Future<Nothing> MemorySubsystemProcess::prepare(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -149,7 +148,7 @@ Future<Nothing> MemorySubsystem::prepare(
 }
 
 
-Future<ContainerLimitation> MemorySubsystem::watch(
+Future<ContainerLimitation> MemorySubsystemProcess::watch(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -163,7 +162,7 @@ Future<ContainerLimitation> MemorySubsystem::watch(
 }
 
 
-Future<Nothing> MemorySubsystem::update(
+Future<Nothing> MemorySubsystemProcess::update(
     const ContainerID& containerId,
     const string& cgroup,
     const Resources& resources)
@@ -211,11 +210,53 @@ Future<Nothing> MemorySubsystem::update(
         ": " + currentLimit.error());
   }
 
-  // Determine whether to set the hard limit. We only update the hard
-  // limit if this is the first time or when we're raising the
+  bool limitSwap = flags.cgroups_limit_swap;
+
+  auto setLimitInBytes = [=]() -> Try<Nothing> {
+    Try<Nothing> write = cgroups::memory::limit_in_bytes(
+        hierarchy,
+        cgroup,
+        limit);
+
+    if (write.isError()) {
+      return Error(
+          "Failed to set 'memory.limit_in_bytes'"
+          ": " + write.error());
+    }
+
+    LOG(INFO) << "Updated 'memory.limit_in_bytes' to " << limit
+              << " for container " << containerId;
+
+    return Nothing();
+  };
+
+  auto setMemswLimitInBytes = [=]() -> Try<Nothing> {
+    if (limitSwap) {
+      Try<bool> write = cgroups::memory::memsw_limit_in_bytes(
+          hierarchy,
+          cgroup,
+          limit);
+
+      if (write.isError()) {
+        return Error(
+            "Failed to set 'memory.memsw.limit_in_bytes'"
+            ": " + write.error());
+      }
+
+      LOG(INFO) << "Updated 'memory.memsw.limit_in_bytes' to " << limit
+                << " for container " << containerId;
+    }
+
+    return Nothing();
+  };
+
+  vector<lambda::function<Try<Nothing>(void)>> setFunctions;
+
+  // Now, determine whether to set the hard limit. We only update the
+  // hard limit if this is the first time or when we're raising the
   // existing limit, then we can update the hard limit safely.
   // Otherwise, if we need to decrease 'memory.limit_in_bytes' we may
-  // induce an OOM if too much memory is in use.  As a result, we only
+  // induce an OOM if too much memory is in use. As a result, we only
   // update the soft limit when the memory reservation is being
   // reduced. This is probably okay if the machine has available
   // resources.
@@ -224,47 +265,33 @@ Future<Nothing> MemorySubsystem::update(
   // discrepancy between usage and soft limit and introduces a "manual
   // oom" if necessary.
   //
-  // If this is the first time, 'memory.limit_in_bytes' is the inital
-  // value which may be one of following possible values:
+  // If this is the first time, 'memory.limit_in_bytes' is unlimited
+  // which may be one of following possible values:
   //   * LONG_MAX (Linux Kernel Version < 3.12)
   //   * ULONG_MAX (3.12 <= Linux Kernel Version < 3.19)
   //   * LONG_MAX / pageSize * pageSize (Linux Kernel Version >= 3.19)
-  // Thus, if 'currentLimit' is greater or equals to 'initialLimit'
-  // below, we know it's the first time.
   static const size_t pageSize = os::pagesize();
-  Bytes initialLimit(static_cast<uint64_t>(LONG_MAX / pageSize * pageSize));
+  Bytes unlimited(static_cast<uint64_t>(LONG_MAX / pageSize * pageSize));
 
-  if (currentLimit.get() >= initialLimit || limit > currentLimit.get()) {
-    // We always set limit_in_bytes first and optionally set
-    // memsw.limit_in_bytes if `cgroups_limit_swap` is true.
-    Try<Nothing> write = cgroups::memory::limit_in_bytes(
-        hierarchy,
-        cgroup,
-        limit);
+  // NOTE: It's required by the Linux kernel that
+  // 'memory.limit_in_bytes' should be less than or equal to
+  // 'memory.memsw.limit_in_bytes'. Otherwise, the kernel will fail
+  // the cgroup write with EINVAL. As a result, the order of setting
+  // these two control files is important. See MESOS-7237 for details.
+  if (currentLimit.get() >= unlimited) {
+    // This is the first time memory limit is being set. So
+    // effectively we are reducing the memory limits because of which
+    // we need to set the 'memory.limit_in_bytes' before setting
+    // 'memory.memsw.limit_in_bytes'
+    setFunctions = {setLimitInBytes, setMemswLimitInBytes};
+  } else if (limit > currentLimit.get()) {
+    setFunctions = {setMemswLimitInBytes, setLimitInBytes};
+  }
 
-    if (write.isError()) {
-      return Failure(
-          "Failed to set 'memory.limit_in_bytes'"
-          ": " + write.error());
-    }
-
-    LOG(INFO) << "Updated 'memory.limit_in_bytes' to " << limit
-              << " for container " << containerId;
-
-    if (flags.cgroups_limit_swap) {
-      Try<bool> write = cgroups::memory::memsw_limit_in_bytes(
-          hierarchy,
-          cgroup,
-          limit);
-
-      if (write.isError()) {
-        return Failure(
-            "Failed to set 'memory.memsw.limit_in_bytes'"
-            ": " + write.error());
-      }
-
-      LOG(INFO) << "Updated 'memory.memsw.limit_in_bytes' to " << limit
-                << " for container " << containerId;
+  foreach (const auto& setFunction, setFunctions) {
+    Try<Nothing> result = setFunction();
+    if (result.isError()) {
+      return Failure(result.error());
     }
   }
 
@@ -272,7 +299,7 @@ Future<Nothing> MemorySubsystem::update(
 }
 
 
-Future<ResourceStatistics> MemorySubsystem::usage(
+Future<ResourceStatistics> MemorySubsystemProcess::usage(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -295,7 +322,7 @@ Future<ResourceStatistics> MemorySubsystem::usage(
     return Failure("Failed to parse 'memory.usage_in_bytes': " + usage.error());
   }
 
-  result.set_mem_total_bytes(usage.get().bytes());
+  result.set_mem_total_bytes(usage->bytes());
 
   if (flags.cgroups_limit_swap) {
     Try<Bytes> usage = cgroups::memory::memsw_usage_in_bytes(hierarchy, cgroup);
@@ -305,7 +332,7 @@ Future<ResourceStatistics> MemorySubsystem::usage(
         "Failed to parse 'memory.memsw.usage_in_bytes': " + usage.error());
     }
 
-    result.set_mem_total_memsw_bytes(usage.get().bytes());
+    result.set_mem_total_memsw_bytes(usage->bytes());
   }
 
   // TODO(bmahler): Add namespacing to cgroups to enforce the expected
@@ -319,7 +346,7 @@ Future<ResourceStatistics> MemorySubsystem::usage(
     return Failure("Failed to read 'memory.stat': " + stat.error());
   }
 
-  Option<uint64_t> total_cache = stat.get().get("total_cache");
+  Option<uint64_t> total_cache = stat->get("total_cache");
   if (total_cache.isSome()) {
     // TODO(chzhcn): mem_file_bytes is deprecated in 0.23.0 and will
     // be removed in 0.24.0.
@@ -327,7 +354,7 @@ Future<ResourceStatistics> MemorySubsystem::usage(
     result.set_mem_cache_bytes(total_cache.get());
   }
 
-  Option<uint64_t> total_rss = stat.get().get("total_rss");
+  Option<uint64_t> total_rss = stat->get("total_rss");
   if (total_rss.isSome()) {
     // TODO(chzhcn): mem_anon_bytes is deprecated in 0.23.0 and will
     // be removed in 0.24.0.
@@ -335,24 +362,24 @@ Future<ResourceStatistics> MemorySubsystem::usage(
     result.set_mem_rss_bytes(total_rss.get());
   }
 
-  Option<uint64_t> total_mapped_file = stat.get().get("total_mapped_file");
+  Option<uint64_t> total_mapped_file = stat->get("total_mapped_file");
   if (total_mapped_file.isSome()) {
     result.set_mem_mapped_file_bytes(total_mapped_file.get());
   }
 
-  Option<uint64_t> total_swap = stat.get().get("total_swap");
+  Option<uint64_t> total_swap = stat->get("total_swap");
   if (total_swap.isSome()) {
     result.set_mem_swap_bytes(total_swap.get());
   }
 
-  Option<uint64_t> total_unevictable = stat.get().get("total_unevictable");
+  Option<uint64_t> total_unevictable = stat->get("total_unevictable");
   if (total_unevictable.isSome()) {
     result.set_mem_unevictable_bytes(total_unevictable.get());
   }
 
   // Get pressure counter readings.
-  list<Level> levels;
-  list<Future<uint64_t>> values;
+  vector<Level> levels;
+  vector<Future<uint64_t>> values;
   foreachpair (Level level,
                const Owned<Counter>& counter,
                info->pressureCounters) {
@@ -361,8 +388,8 @@ Future<ResourceStatistics> MemorySubsystem::usage(
   }
 
   return await(values)
-    .then(defer(PID<MemorySubsystem>(this),
-                &MemorySubsystem::_usage,
+    .then(defer(PID<MemorySubsystemProcess>(this),
+                &MemorySubsystemProcess::_usage,
                 containerId,
                 result,
                 levels,
@@ -370,11 +397,11 @@ Future<ResourceStatistics> MemorySubsystem::usage(
 }
 
 
-Future<ResourceStatistics> MemorySubsystem::_usage(
+Future<ResourceStatistics> MemorySubsystemProcess::_usage(
     const ContainerID& containerId,
     ResourceStatistics result,
-    const list<Level>& levels,
-    const list<Future<uint64_t>>& values)
+    const vector<Level>& levels,
+    const vector<Future<uint64_t>>& values)
 {
   if (!infos.contains(containerId)) {
     return Failure(
@@ -382,7 +409,7 @@ Future<ResourceStatistics> MemorySubsystem::_usage(
         ": Unknown container");
   }
 
-  list<Level>::const_iterator iterator = levels.begin();
+  vector<Level>::const_iterator iterator = levels.begin();
   foreach (const Future<uint64_t>& value, values) {
     if (value.isReady()) {
       switch (*iterator) {
@@ -409,7 +436,7 @@ Future<ResourceStatistics> MemorySubsystem::_usage(
 }
 
 
-Future<Nothing> MemorySubsystem::cleanup(
+Future<Nothing> MemorySubsystemProcess::cleanup(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -430,7 +457,7 @@ Future<Nothing> MemorySubsystem::cleanup(
 }
 
 
-void MemorySubsystem::oomListen(
+void MemorySubsystemProcess::oomListen(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -451,16 +478,16 @@ void MemorySubsystem::oomListen(
   LOG(INFO) << "Started listening for OOM events for container "
             << containerId;
 
-  info->oomNotifier.onReady(
-      defer(PID<MemorySubsystem>(this),
-            &MemorySubsystem::oomWaited,
+  info->oomNotifier.onAny(
+      defer(PID<MemorySubsystemProcess>(this),
+            &MemorySubsystemProcess::oomWaited,
             containerId,
             cgroup,
             lambda::_1));
 }
 
 
-void MemorySubsystem::oomWaited(
+void MemorySubsystemProcess::oomWaited(
     const ContainerID& containerId,
     const string& cgroup,
     const Future<Nothing>& future)
@@ -532,7 +559,8 @@ void MemorySubsystem::oomWaited(
   // we should save the resources passed in and report it here.
   Resources mem = Resources::parse(
       "mem",
-      stringify(usage.isSome() ? usage.get().megabytes() : 0),
+      stringify(usage.isSome()
+        ? (double) usage->bytes() / Bytes::MEGABYTES : 0),
       "*").get();
 
   infos[containerId]->limitation.set(
@@ -543,7 +571,7 @@ void MemorySubsystem::oomWaited(
 }
 
 
-void MemorySubsystem::pressureListen(
+void MemorySubsystemProcess::pressureListen(
     const ContainerID& containerId,
     const string& cgroup)
 {

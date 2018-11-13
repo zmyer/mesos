@@ -178,6 +178,13 @@ namespace fs {
 Try<bool> supported(const std::string& fsname);
 
 
+// Detect whether the given file system supports `d_type`
+// in `struct dirent`.
+// @directory must not be empty for correct `d_type` detection.
+// It is the caller's responsibility to ensure this holds.
+Try<bool> dtypeSupported(const std::string& directory);
+
+
 // Returns a filesystem type id, given a directory.
 // http://man7.org/linux/man-pages/man2/fstatfs64.2.html
 Try<uint32_t> type(const std::string& path);
@@ -185,7 +192,6 @@ Try<uint32_t> type(const std::string& path);
 
 // Returns the filesystem type name, given a filesystem type id.
 Try<std::string> typeName(uint32_t fsType);
-
 
 // TODO(idownes): These different variations of mount information
 // should be consolidated and moved to stout, along with mount and
@@ -271,8 +277,11 @@ struct MountInfoTable {
       const std::string& lines,
       bool hierarchicalSort = true);
 
-  // TODO(jieyu): Introduce 'find' methods to find entries that match
-  // the given conditions (e.g., target, root, devno, etc.).
+  // Find the mount table entry by the given target path. If there is
+  // no mount table entry that matches the exact target path, return
+  // the mount table entry that is the immediate parent of the given
+  // target path (similar to `findmnt --target [TARGET]`).
+  static Try<Entry> findByTarget(const std::string& target);
 
   std::vector<Entry> entries;
 };
@@ -339,6 +348,10 @@ struct MountTable {
 // @param   flags     Mount flags.
 // @param   data      Extra data interpreted by different file systems.
 // @return  Whether the mount operation succeeds.
+//
+// Note that if this is a read-only bind mount (both the MS_BIND
+// and MS_READONLY flags are set), the target will automatically
+// be remounted in read-only mode.
 Try<Nothing> mount(const Option<std::string>& source,
                    const std::string& target,
                    const Option<std::string>& type,
@@ -374,10 +387,15 @@ Try<Nothing> pivot_root(const std::string& newRoot, const std::string& putOld);
 
 namespace chroot {
 
-// Enter a 'chroot' enviroment. The caller should be in a new mount
+// Enter a 'chroot' environment. The caller should be in a new mount
 // namespace. Basic configuration of special filesystems and device
-// nodes is performed. Any mounts to the current root will be
-// unmounted.
+// nodes is performed.
+Try<Nothing> prepare(const std::string& root);
+
+
+//  Enter a 'chroot' environment. The caller should be in a new mount
+//  unmounted. The root path must have already been provisioned by
+//  calling `prepare`()`.
 Try<Nothing> enter(const std::string& root);
 
 } // namespace chroot {

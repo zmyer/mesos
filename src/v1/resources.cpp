@@ -39,9 +39,13 @@
 #include <stout/strings.hpp>
 #include <stout/unreachable.hpp>
 
+#include "common/resources_utils.hpp"
+
+using std::make_shared;
 using std::map;
 using std::ostream;
 using std::set;
+using std::shared_ptr;
 using std::string;
 using std::vector;
 
@@ -82,6 +86,14 @@ bool operator==(
     const Resource::ReservationInfo& left,
     const Resource::ReservationInfo& right)
 {
+  if (left.type() != right.type()) {
+    return false;
+  }
+
+  if (left.role() != right.role()) {
+    return false;
+  }
+
   if (left.has_principal() != right.has_principal()) {
     return false;
   }
@@ -114,7 +126,15 @@ bool operator==(
     const Resource::DiskInfo::Source::Path& left,
     const Resource::DiskInfo::Source::Path& right)
 {
-  return left.root() == right.root();
+  if (left.has_root() != right.has_root()) {
+    return false;
+  }
+
+  if (left.has_root() && left.root() != right.root()) {
+    return false;
+  }
+
+  return true;
 }
 
 
@@ -122,6 +142,14 @@ bool operator==(
     const Resource::DiskInfo::Source::Mount& left,
     const Resource::DiskInfo::Source::Mount& right)
 {
+  if (left.has_root() != right.has_root()) {
+    return false;
+  }
+
+  if (left.has_root() && left.root() != right.root()) {
+    return false;
+  }
+
   return left.root() == right.root();
 }
 
@@ -150,11 +178,43 @@ bool operator==(
     return false;
   }
 
+  if (left.has_path() != right.has_path()) {
+    return false;
+  }
+
   if (left.has_path() && left.path() != right.path()) {
     return false;
   }
 
+  if (left.has_mount() != right.has_mount()) {
+    return false;
+  }
+
   if (left.has_mount() && left.mount() != right.mount()) {
+    return false;
+  }
+
+  if (left.has_id() != right.has_id()) {
+    return false;
+  }
+
+  if (left.has_id() && left.id() != right.id()) {
+    return false;
+  }
+
+  if (left.has_metadata() != right.has_metadata()) {
+    return false;
+  }
+
+  if (left.has_metadata() && left.metadata() != right.metadata()) {
+    return false;
+  }
+
+  if (left.has_profile() != right.has_profile()) {
+    return false;
+  }
+
+  if (left.has_profile() && left.profile() != right.profile()) {
     return false;
   }
 
@@ -189,8 +249,9 @@ bool operator==(const Resource::DiskInfo& left, const Resource::DiskInfo& right)
     return false;
   }
 
-  if (left.has_persistence()) {
-    return left.persistence().id() == right.persistence().id();
+  if (left.has_persistence() &&
+      left.persistence().id() != right.persistence().id()) {
+    return false;
   }
 
   return true;
@@ -205,9 +266,7 @@ bool operator!=(const Resource::DiskInfo& left, const Resource::DiskInfo& right)
 
 bool operator==(const Resource& left, const Resource& right)
 {
-  if (left.name() != right.name() ||
-      left.type() != right.type() ||
-      left.role() != right.role()) {
+  if (left.name() != right.name() || left.type() != right.type()) {
     return false;
   }
 
@@ -221,13 +280,15 @@ bool operator==(const Resource& left, const Resource& right)
     return false;
   }
 
-  // Check ReservationInfo.
-  if (left.has_reservation() != right.has_reservation()) {
+  // Check the stack of ReservationInfo.
+  if (left.reservations_size() != right.reservations_size()) {
     return false;
   }
 
-  if (left.has_reservation() && left.reservation() != right.reservation()) {
-    return false;
+  for (int i = 0; i < left.reservations_size(); ++i) {
+    if (left.reservations(i) != right.reservations(i)) {
+      return false;
+    }
   }
 
   // Check DiskInfo.
@@ -241,6 +302,15 @@ bool operator==(const Resource& left, const Resource& right)
 
   // Check RevocableInfo.
   if (left.has_revocable() != right.has_revocable()) {
+    return false;
+  }
+
+  // Check ResourceProviderID.
+  if (left.has_provider_id() != right.has_provider_id()) {
+    return false;
+  }
+
+  if (left.has_provider_id() && left.provider_id() != right.provider_id()) {
     return false;
   }
 
@@ -285,9 +355,7 @@ static bool addable(const Resource& left, const Resource& right)
   }
 
   // Now, we verify if the two non-shared resources can be added.
-  if (left.name() != right.name() ||
-      left.type() != right.type() ||
-      left.role() != right.role()) {
+  if (left.name() != right.name() || left.type() != right.type()) {
     return false;
   }
 
@@ -301,13 +369,15 @@ static bool addable(const Resource& left, const Resource& right)
     return false;
   }
 
-  // Check ReservationInfo.
-  if (left.has_reservation() != right.has_reservation()) {
+  // Check the stack of ReservationInfo.
+  if (left.reservations_size() != right.reservations_size()) {
     return false;
   }
 
-  if (left.has_reservation() && left.reservation() != right.reservation()) {
-    return false;
+  for (int i = 0; i < left.reservations_size(); ++i) {
+    if (left.reservations(i) != right.reservations(i)) {
+      return false;
+    }
   }
 
   // Check DiskInfo.
@@ -316,11 +386,29 @@ static bool addable(const Resource& left, const Resource& right)
   if (left.has_disk()) {
     if (left.disk() != right.disk()) { return false; }
 
-    // Two non-shared resources that represent exclusive 'MOUNT' disks
-    // cannot be added together; this would defeat the exclusivity.
-    if (left.disk().has_source() &&
-        left.disk().source().type() == Resource::DiskInfo::Source::MOUNT) {
-      return false;
+    if (left.disk().has_source()) {
+      switch (left.disk().source().type()) {
+        case Resource::DiskInfo::Source::PATH: {
+          // Two PATH resources can be added if their disks are identical.
+          break;
+        }
+        case Resource::DiskInfo::Source::BLOCK:
+        case Resource::DiskInfo::Source::MOUNT: {
+          // Two resources that represent exclusive 'MOUNT' or 'BLOCK' disks
+          // cannot be added together; this would defeat the exclusivity.
+          return false;
+        }
+        case Resource::DiskInfo::Source::RAW: {
+          // We can only add resources representing 'RAW' disks if
+          // they have no identity or are identical.
+          if (left.disk().source().has_id()) {
+            return false;
+          }
+          break;
+        }
+        case Resource::DiskInfo::Source::UNKNOWN:
+          UNREACHABLE();
+      }
     }
 
     // TODO(jieyu): Even if two Resource objects with DiskInfo have
@@ -335,6 +423,15 @@ static bool addable(const Resource& left, const Resource& right)
 
   // Check RevocableInfo.
   if (left.has_revocable() != right.has_revocable()) {
+    return false;
+  }
+
+  // Check ResourceProviderID.
+  if (left.has_provider_id() != right.has_provider_id()) {
+    return false;
+  }
+
+  if (left.has_provider_id() && left.provider_id() != right.provider_id()) {
     return false;
   }
 
@@ -363,9 +460,7 @@ static bool subtractable(const Resource& left, const Resource& right)
   }
 
   // Now, we verify if the two non-shared resources can be subtracted.
-  if (left.name() != right.name() ||
-      left.type() != right.type() ||
-      left.role() != right.role()) {
+  if (left.name() != right.name() || left.type() != right.type()) {
     return false;
   }
 
@@ -379,13 +474,15 @@ static bool subtractable(const Resource& left, const Resource& right)
     return false;
   }
 
-  // Check ReservationInfo.
-  if (left.has_reservation() != right.has_reservation()) {
+  // Check the stack of ReservationInfo.
+  if (left.reservations_size() != right.reservations_size()) {
     return false;
   }
 
-  if (left.has_reservation() && left.reservation() != right.reservation()) {
-    return false;
+  for (int i = 0; i < left.reservations_size(); ++i) {
+    if (left.reservations(i) != right.reservations(i)) {
+      return false;
+    }
   }
 
   // Check DiskInfo.
@@ -394,13 +491,33 @@ static bool subtractable(const Resource& left, const Resource& right)
   if (left.has_disk()) {
     if (left.disk() != right.disk()) { return false; }
 
-    // Two resources that represent exclusive 'MOUNT' disks cannot be
-    // subtracted from each other if they are not the exact same mount;
-    // this would defeat the exclusivity.
-    if (left.disk().has_source() &&
-        left.disk().source().type() == Resource::DiskInfo::Source::MOUNT &&
-        left != right) {
-      return false;
+    if (left.disk().has_source()) {
+      switch (left.disk().source().type()) {
+        case Resource::DiskInfo::Source::PATH: {
+          // Two PATH resources can be subtracted if their disks are identical.
+          break;
+        }
+        case Resource::DiskInfo::Source::BLOCK:
+        case Resource::DiskInfo::Source::MOUNT: {
+          // Two resources that represent exclusive 'MOUNT' or 'BLOCK' disks
+          // cannot be subtracted from each other if they are not the exact same
+          // mount; this would defeat the exclusivity.
+          if (left != right) {
+            return false;
+          }
+          break;
+        }
+        case Resource::DiskInfo::Source::RAW: {
+          // We can only subtract resources representing 'RAW' disks
+          // if they have no identity.
+          if (left.disk().source().has_id() && left != right) {
+            return false;
+          }
+          break;
+        }
+        case Resource::DiskInfo::Source::UNKNOWN:
+          UNREACHABLE();
+      }
     }
 
     // NOTE: For Resource objects that have DiskInfo, we can only subtract
@@ -415,6 +532,15 @@ static bool subtractable(const Resource& left, const Resource& right)
     return false;
   }
 
+  // Check ResourceProviderID.
+  if (left.has_provider_id() != right.has_provider_id()) {
+    return false;
+  }
+
+  if (left.has_provider_id() && left.provider_id() != right.provider_id()) {
+    return false;
+  }
+
   return true;
 }
 
@@ -424,7 +550,8 @@ static bool contains(const Resource& left, const Resource& right)
 {
   // NOTE: This is a necessary condition for 'contains'.
   // 'subtractable' will verify name, role, type, ReservationInfo,
-  // DiskInfo, SharedInfo and RevocableInfo compatibility.
+  // DiskInfo, SharedInfo, RevocableInfo, and ResourceProviderID
+  // compatibility.
   if (!subtractable(left, right)) {
     return false;
   }
@@ -465,19 +592,19 @@ static Option<Error> validateCommandLineResources(const Resources& resources)
           "Persistent volumes cannot be specified at the command line");
     } else if (Resources::isRevocable(resource)) {
       return Error(
-          "Revocable resources cannot be specified at the command line; do "
-          "not include a 'revocable' key in the resources JSON");
+          "Revocable resources cannot be specified at the command line; do"
+          " not include a 'revocable' key in the resources JSON");
     } else if (Resources::isDynamicallyReserved(resource)) {
       return Error(
-          "Dynamic reservations cannot be specified at the command line; "
-          "do not include a 'reservation' key in the resources JSON");
+          "Dynamic reservations cannot be specified at the command line; do"
+          " not include a reservation with DYNAMIC type in the resources JSON");
     }
 
     if (nameTypes.contains(resource.name()) &&
         nameTypes[resource.name()] != resource.type()) {
       return Error(
-          "Resources with the same name ('" + resource.name() + "') but "
-          "different types are not allowed");
+          "Resources with the same name ('" + resource.name() + "') but"
+          " different types are not allowed");
     } else if (!nameTypes.contains(resource.name())) {
       nameTypes[resource.name()] = resource.type();
     }
@@ -553,7 +680,12 @@ Try<Resource> Resources::parse(
 
   Value _value = result.get();
   resource.set_name(name);
-  resource.set_role(role);
+
+  if (role != "*") {
+    Resource::ReservationInfo* reservation = resource.add_reservations();
+    reservation->set_type(Resource::ReservationInfo::STATIC);
+    reservation->set_role(role);
+  }
 
   if (_value.type() == Value::SCALAR) {
     resource.set_type(Value::SCALAR);
@@ -581,12 +713,7 @@ Try<Resources> Resources::parse(
     const string& text,
     const string& defaultRole)
 {
-  // Try to parse as a JSON Array. Otherwise, parse as a text string.
-  Try<JSON::Array> json = JSON::parse<JSON::Array>(text);
-
-  Try<vector<Resource>> resources = json.isSome() ?
-    Resources::fromJSON(json.get(), defaultRole) :
-    Resources::fromSimpleString(text, defaultRole);
+  Try<vector<Resource>> resources = Resources::fromString(text, defaultRole);
 
   if (resources.isError()) {
     return Error(resources.error());
@@ -594,15 +721,49 @@ Try<Resources> Resources::parse(
 
   Resources result;
 
-  // Validate individual Resource objects.
-  foreach(const Resource& resource, resources.get()) {
+  // Validate the Resource objects and convert them
+  // to the "post-reservation-refinement" format.
+  foreach (Resource& resource, CHECK_NOTERROR(resources)) {
     // If invalid, propgate error instead of skipping the resource.
     Option<Error> error = Resources::validate(resource);
     if (error.isSome()) {
       return error.get();
     }
 
-    result.add(resource);
+    // Convert the resource to the "post-reservation-refinement" format.
+    if (resource.reservations_size() > 0) {
+      // In this case, we're either already in
+      // the "post-reservation-refinement" format,
+      // or we're in the "endpoint" format.
+
+      // We clear out the "pre-reservation-refinement" fields
+      // in case the resources are in the "endpoint" format.
+      resource.clear_role();
+      resource.clear_reservation();
+    } else if (resource.role() == "*") {
+      CHECK(!resource.has_reservation()) << resource;
+      // Unreserved resources.
+      resource.clear_role();
+    } else {
+      // Resource with a single reservation.
+      Resource::ReservationInfo* reservation = resource.add_reservations();
+
+      // Check the `Resource.reservation` to determine whether
+      // we have a static or dynamic reservation.
+      if (!resource.has_reservation()) {
+        reservation->set_type(Resource::ReservationInfo::STATIC);
+      } else {
+        reservation->CopyFrom(resource.reservation());
+        resource.clear_reservation();
+        reservation->set_type(Resource::ReservationInfo::DYNAMIC);
+      }
+
+      reservation->set_role(resource.role());
+      resource.clear_role();
+    }
+
+    // Add the validated and converted resource to the result.
+    result.add(std::move(resource));
   }
 
   // TODO(jmlvanre): Move this up into `Containerizer::resources`.
@@ -634,7 +795,10 @@ Try<vector<Resource>> Resources::fromJSON(
 
   foreach (Resource& resource, resourcesProtobuf.get()) {
     // Set the default role if none was specified.
-    if (!resource.has_role()) {
+    //
+    // NOTE: We rely on the fact that the result of this function is
+    // converted to the "post-reservation-refinement" format.
+    if (!resource.has_role() && resource.reservations_size() == 0) {
       resource.set_role(defaultRole);
     }
 
@@ -653,6 +817,8 @@ Try<vector<Resource>> Resources::fromSimpleString(
   vector<Resource> resources;
 
   foreach (const string& token, strings::tokenize(text, ";")) {
+    // TODO(anindya_sinha): Allow text based representation of resources
+    // to specify PATH or MOUNT type disks along with its root.
     vector<string> pair = strings::tokenize(token, ":");
     if (pair.size() != 2) {
       return Error(
@@ -689,6 +855,19 @@ Try<vector<Resource>> Resources::fromSimpleString(
   }
 
   return resources;
+}
+
+
+Try<vector<Resource>> Resources::fromString(
+    const string& text,
+    const string& defaultRole)
+{
+  // Try to parse as a JSON Array. Otherwise, parse as a text string.
+  Try<JSON::Array> json = JSON::parse<JSON::Array>(text);
+
+  return json.isSome() ?
+    Resources::fromJSON(json.get(), defaultRole) :
+    Resources::fromSimpleString(text, defaultRole);
 }
 
 
@@ -769,30 +948,191 @@ Option<Error> Resources::validate(const Resource& resource)
     if (disk.has_source()) {
       const Resource::DiskInfo::Source& source = disk.source();
 
-      if (source.type() == Resource::DiskInfo::Source::PATH &&
-          !source.has_path()) {
-        return Error(
-            "DiskInfo::Source 'type' set to 'PATH' but missing 'path' data");
-      }
+      switch (source.type()) {
+        case Resource::DiskInfo::Source::PATH:
+        case Resource::DiskInfo::Source::MOUNT:
+          // `PATH` and `MOUNT` contain only `optional` members.
+          break;
+        case Resource::DiskInfo::Source::BLOCK:
+        case Resource::DiskInfo::Source::RAW:
+          if (source.has_mount()) {
+            return Error(
+                "Mount should not be set for " +
+                Resource::DiskInfo::Source::Type_Name(source.type()) +
+                " disk source");
+          }
 
-      if (source.type() == Resource::DiskInfo::Source::MOUNT &&
-          !source.has_mount()) {
-        return Error(
-            "DiskInfo::Source 'type' set to 'MOUNT' but missing 'mount' data");
+          if (source.has_path()) {
+            return Error(
+                "Path should not be set for " +
+                Resource::DiskInfo::Source::Type_Name(source.type()) +
+                " disk source");
+          }
+
+          break;
+        case Resource::DiskInfo::Source::UNKNOWN:
+          return Error(
+              "Unsupported 'DiskInfo.Source.Type' in "
+              "'" + stringify(source) + "'");
       }
     }
   }
 
-  // Checks for the invalid state of (role, reservation) pair.
-  if (resource.role() == "*" && resource.has_reservation()) {
-    return Error(
-        "Invalid reservation: role \"*\" cannot be dynamically reserved");
-  }
+  // Validate the reservation format.
 
-  // Check role name.
-  Option<Error> error = roles::validate(resource.role());
-  if (error.isSome()) {
-    return error;
+  if (resource.reservations_size() == 0) {
+    // Check for the "pre-reservation-refinement" format.
+
+    // Check role name.
+    Option<Error> error = roles::validate(resource.role());
+    if (error.isSome()) {
+      return error;
+    }
+
+    // Check reservation.
+    if (resource.has_reservation()) {
+      if (resource.reservation().has_type()) {
+        return Error(
+            "'Resource.ReservationInfo.type' must not be set for"
+            " the 'Resource.reservation' field");
+      }
+
+      if (resource.reservation().has_role()) {
+        return Error(
+            "'Resource.ReservationInfo.role' must not be set for"
+            " the 'Resource.reservation' field");
+      }
+
+      // Checks for the invalid state of (role, reservation) pair.
+      if (resource.role() == "*") {
+        return Error(
+            "Invalid reservation: role \"*\" cannot be dynamically reserved");
+      }
+    }
+  } else {
+    // Check for the "post-reservation-refinement" format.
+
+    CHECK_GT(resource.reservations_size(), 0);
+
+    // Validate all of the roles in `reservations`.
+    foreach (
+        const Resource::ReservationInfo& reservation, resource.reservations()) {
+      if (!reservation.has_type()) {
+        return Error(
+            "Invalid reservation: 'Resource.ReservationInfo.type'"
+            " field must be set.");
+      }
+
+      if (!reservation.has_role()) {
+        return Error(
+            "Invalid reservation: 'Resource.ReservationInfo.role'"
+            " field must be set.");
+      }
+
+      Option<Error> error = roles::validate(reservation.role());
+      if (error.isSome()) {
+        return error;
+      }
+
+      if (reservation.role() == "*") {
+        return Error("Invalid reservation: role \"*\" cannot be reserved");
+      }
+    }
+
+    // Check that the reservations are correctly refined.
+    string ancestor = resource.reservations(0).role();
+    for (int i = 1; i < resource.reservations_size(); ++i) {
+      const Resource::ReservationInfo& reservation = resource.reservations(i);
+
+      if (reservation.type() == Resource::ReservationInfo::STATIC) {
+        return Error(
+            "Invalid refined reservation: A refined reservation"
+            " cannot be STATIC");
+      }
+
+      const string& descendant = reservation.role();
+
+      if (!roles::isStrictSubroleOf(descendant, ancestor)) {
+        return Error(
+            "Invalid refined reservation: role '" + descendant + "'" +
+            " is not a refinement of '" + ancestor + "'");
+      }
+
+      ancestor = descendant;
+    }
+
+    // Additionally, we allow the "pre-reservation-refinement" format to be set
+    // as long as there is only one reservation, and the `Resource.role` and
+    // `Resource.reservation` fields are consistent with the reservation.
+    if (resource.reservations_size() == 1) {
+      const Resource::ReservationInfo& reservation = resource.reservations(0);
+      if (resource.has_role() && resource.role() != reservation.role()) {
+        return Error(
+            "Invalid resource format: 'Resource.role' field with"
+            " '" + resource.role() + "' does not match the role"
+            " '" + reservation.role() + "' in 'Resource.reservations'");
+      }
+
+      switch (reservation.type()) {
+        case Resource::ReservationInfo::STATIC: {
+          if (resource.has_reservation()) {
+            return Error(
+                "Invalid resource format: 'Resource.reservation' must not be"
+                " set if the single reservation in 'Resource.reservations' is"
+                " STATIC");
+          }
+
+          break;
+        }
+        case Resource::ReservationInfo::DYNAMIC: {
+          if (resource.has_role() != resource.has_reservation()) {
+            return Error(
+                "Invalid resource format: 'Resource.role' and"
+                " 'Resource.reservation' must either be both set or both not"
+                " set if the single reservation in 'Resource.reservations' is"
+                " DYNAMIC");
+          }
+
+          if (resource.has_reservation() &&
+              resource.reservation().principal() != reservation.principal()) {
+            return Error(
+                "Invalid resource format: 'Resource.reservation.principal'"
+                " field with '" + resource.reservation().principal() + "' does"
+                " not match the principal '" + reservation.principal() + "'"
+                " in 'Resource.reservations'");
+          }
+
+          if (resource.has_reservation() &&
+              resource.reservation().labels() != reservation.labels()) {
+            return Error(
+                "Invalid resource format: 'Resource.reservation.labels' field"
+                " with '" + stringify(resource.reservation().labels()) + "'"
+                " does not match the labels"
+                " '" + stringify(reservation.labels()) + "'"
+                " in 'Resource.reservations'");
+          }
+
+          break;
+        }
+        case Resource::ReservationInfo::UNKNOWN: {
+          return Error("Unsupported 'Resource.ReservationInfo.Type'");
+        }
+      }
+
+    } else {
+      CHECK_GT(resource.reservations_size(), 1);
+      if (resource.has_role()) {
+        return Error(
+            "Invalid resource format: 'Resource.role' must not be set if"
+            " there is more than one reservation in 'Resource.reservations'");
+      }
+
+      if (resource.has_reservation()) {
+        return Error(
+            "Invalid resource format: 'Resource.reservation' must not be set if"
+            " there is more than one reservation in 'Resource.reservations'");
+      }
+    }
   }
 
   // Check that shareability is enabled for supported resource types.
@@ -829,8 +1169,13 @@ Option<Error> Resources::validate(const RepeatedPtrField<Resource>& resources)
 
 bool Resources::isEmpty(const Resource& resource)
 {
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
   if (resource.type() == Value::SCALAR) {
-    return resource.scalar().value() == 0;
+    Value::Scalar zero;
+    zero.set_value(0);
+    return resource.scalar() == zero;
   } else if (resource.type() == Value::RANGES) {
     return resource.ranges().range_size() == 0;
   } else if (resource.type() == Value::SET) {
@@ -843,7 +1188,23 @@ bool Resources::isEmpty(const Resource& resource)
 
 bool Resources::isPersistentVolume(const Resource& resource)
 {
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
   return resource.has_disk() && resource.disk().has_persistence();
+}
+
+
+bool Resources::isDisk(
+    const Resource& resource,
+    const Resource::DiskInfo::Source::Type& type)
+{
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return resource.has_disk() &&
+         resource.disk().has_source() &&
+         resource.disk().source().type() == type;
 }
 
 
@@ -851,35 +1212,119 @@ bool Resources::isReserved(
     const Resource& resource,
     const Option<string>& role)
 {
-  if (role.isSome()) {
-    return !isUnreserved(resource) && role.get() == resource.role();
-  } else {
-    return !isUnreserved(resource);
-  }
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return !isUnreserved(resource) &&
+         (role.isNone() || role.get() == reservationRole(resource));
+}
+
+
+bool Resources::isAllocatableTo(
+    const Resource& resource,
+    const std::string& role)
+{
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return isUnreserved(resource) ||
+         role == reservationRole(resource) ||
+         roles::isStrictSubroleOf(role, reservationRole(resource));
 }
 
 
 bool Resources::isUnreserved(const Resource& resource)
 {
-  return resource.role() == "*" && !resource.has_reservation();
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return resource.reservations_size() == 0;
 }
 
 
 bool Resources::isDynamicallyReserved(const Resource& resource)
 {
-  return resource.has_reservation();
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return isReserved(resource) && (resource.reservations().rbegin()->type() ==
+                                  Resource::ReservationInfo::DYNAMIC);
 }
 
 
 bool Resources::isRevocable(const Resource& resource)
 {
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
   return resource.has_revocable();
 }
 
 
 bool Resources::isShared(const Resource& resource)
 {
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
   return resource.has_shared();
+}
+
+
+bool Resources::isScalarQuantity(const Resources& resources)
+{
+  // Instead of checking the absence of non-scalar-quantity fields,
+  // we do an equality check between the original `Resources` object and
+  // its stripped counterpart.
+  //
+  // We remove the static reservation metadata here via `toUnreserved()`.
+  return resources == resources.createStrippedScalarQuantity().toUnreserved();
+}
+
+
+bool Resources::hasRefinedReservations(const Resource& resource)
+{
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return resource.reservations_size() > 1;
+}
+
+
+bool Resources::hasResourceProvider(const Resource& resource)
+{
+  CHECK(!resource.has_role()) << resource;
+  CHECK(!resource.has_reservation()) << resource;
+
+  return resource.has_provider_id();
+}
+
+
+const string& Resources::reservationRole(const Resource& resource)
+{
+  CHECK_GT(resource.reservations_size(), 0);
+  return resource.reservations().rbegin()->role();
+}
+
+
+bool Resources::shrink(Resource* resource, const Value::Scalar& target)
+{
+  if (resource->scalar() <= target) {
+    return true; // Already within target.
+  }
+
+  Resource copy = *resource;
+  copy.mutable_scalar()->CopyFrom(target);
+
+  // Some resources (e.g. MOUNT disk) are indivisible. We use
+  // a containement check to verify this. Specifically, if a
+  // contains a smaller version of itself, then it can safely
+  // be chopped into a smaller amount.
+  if (Resources(*resource).contains(copy)) {
+    resource->CopyFrom(copy);
+    return true;
+  }
+
+  return false;
 }
 
 
@@ -994,11 +1439,28 @@ Resources::Resources(const Resource& resource)
 }
 
 
+Resources::Resources(Resource&& resource)
+{
+  // NOTE: Invalid and zero Resource object will be ignored.
+  *this += std::move(resource);
+}
+
+
 Resources::Resources(const vector<Resource>& _resources)
 {
   foreach (const Resource& resource, _resources) {
     // NOTE: Invalid and zero Resource objects will be ignored.
     *this += resource;
+  }
+}
+
+
+Resources::Resources(vector<Resource>&& _resources)
+{
+  resourcesNoMutationWithoutExclusiveOwnership.reserve(_resources.size());
+  foreach (Resource& resource, _resources) {
+    // NOTE: Invalid and zero Resource objects will be ignored.
+    *this += std::move(resource);
   }
 }
 
@@ -1012,20 +1474,32 @@ Resources::Resources(const RepeatedPtrField<Resource>& _resources)
 }
 
 
+Resources::Resources(RepeatedPtrField<Resource>&& _resources)
+{
+  resourcesNoMutationWithoutExclusiveOwnership.reserve(_resources.size());
+  foreach (Resource& resource, _resources) {
+    // NOTE: Invalid and zero Resource objects will be ignored.
+    *this += std::move(resource);
+  }
+}
+
+
 bool Resources::contains(const Resources& that) const
 {
   Resources remaining = *this;
 
-  foreach (const Resource_& resource_, that.resources) {
+  foreach (
+      const Resource_Unsafe& resource_,
+      that.resourcesNoMutationWithoutExclusiveOwnership) {
     // NOTE: We use _contains because Resources only contain valid
     // Resource objects, and we don't want the performance hit of the
     // validity check.
-    if (!remaining._contains(resource_)) {
+    if (!remaining._contains(*resource_)) {
       return false;
     }
 
-    if (isPersistentVolume(resource_.resource)) {
-      remaining.subtract(resource_);
+    if (isPersistentVolume(resource_->resource)) {
+      remaining.subtract(*resource_);
     }
   }
 
@@ -1044,11 +1518,13 @@ bool Resources::contains(const Resource& that) const
 
 size_t Resources::count(const Resource& that) const
 {
-  foreach (const Resource_& resource_, resources) {
-    if (resource_.resource == that) {
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (resource_->resource == that) {
       // Return 1 for non-shared resources because non-shared
       // Resource objects in Resources are unique.
-      return resource_.isShared() ? resource_.sharedCount.get() : 1;
+      return resource_->isShared() ? CHECK_NOTNONE(resource_->sharedCount) : 1;
     }
   }
 
@@ -1058,17 +1534,29 @@ size_t Resources::count(const Resource& that) const
 
 void Resources::allocate(const string& role)
 {
-  foreach (Resource_& resource_, resources) {
-    resource_.resource.mutable_allocation_info()->set_role(role);
+  foreach (
+      Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    // Copy-on-write (if more than 1 reference).
+    if (resource_.use_count() > 1) {
+      resource_ = make_shared<Resource_>(*resource_);
+    }
+    resource_->resource.mutable_allocation_info()->set_role(role);
   }
 }
 
 
 void Resources::unallocate()
 {
-  foreach (Resource_& resource_, resources) {
-    if (resource_.resource.has_allocation_info()) {
-      resource_.resource.clear_allocation_info();
+  foreach (
+      Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (resource_->resource.has_allocation_info()) {
+      // Copy-on-write (if more than 1 reference).
+      if (resource_.use_count() > 1) {
+        resource_ = make_shared<Resource_>(*resource_);
+      }
+      resource_->resource.clear_allocation_info();
     }
   }
 }
@@ -1078,9 +1566,16 @@ Resources Resources::filter(
     const lambda::function<bool(const Resource&)>& predicate) const
 {
   Resources result;
-  foreach (const Resource_& resource_, resources) {
-    if (predicate(resource_.resource)) {
-      result.add(resource_);
+  result.resourcesNoMutationWithoutExclusiveOwnership.reserve(this->size());
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (predicate(resource_->resource)) {
+      // We `push_back()` here instead of `add()` (which is O(n)). `add()` is
+      // not necessary because we assume all Resource objects are already
+      // combined in `Resources` and `filter()` should only take away
+      // resource objects.
+      result.resourcesNoMutationWithoutExclusiveOwnership.push_back(resource_);
     }
   }
   return result;
@@ -1091,9 +1586,11 @@ hashmap<string, Resources> Resources::reservations() const
 {
   hashmap<string, Resources> result;
 
-  foreach (const Resource_& resource_, resources) {
-    if (isReserved(resource_.resource)) {
-      result[resource_.resource.role()].add(resource_);
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (isReserved(resource_->resource)) {
+      result[reservationRole(resource_->resource)].add(resource_);
     }
   }
 
@@ -1104,6 +1601,12 @@ hashmap<string, Resources> Resources::reservations() const
 Resources Resources::reserved(const Option<string>& role) const
 {
   return filter(lambda::bind(isReserved, lambda::_1, role));
+}
+
+
+Resources Resources::allocatableTo(const string& role) const
+{
+  return filter(lambda::bind(isAllocatableTo, lambda::_1, role));
 }
 
 
@@ -1149,57 +1652,72 @@ hashmap<string, Resources> Resources::allocations() const
 {
   hashmap<string, Resources> result;
 
-  foreach (const Resource_& resource_, resources) {
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
     // We require that this is called only when
     // the resources are allocated.
-    CHECK(resource_.resource.has_allocation_info());
-    CHECK(resource_.resource.allocation_info().has_role());
-    result[resource_.resource.allocation_info().role()].add(resource_);
+    CHECK(resource_->resource.has_allocation_info());
+    CHECK(resource_->resource.allocation_info().has_role());
+    result[resource_->resource.allocation_info().role()].add(resource_);
   }
 
   return result;
 }
 
 
-Try<Resources> Resources::flatten(
-    const string& role,
-    const Option<Resource::ReservationInfo>& reservation) const
+Resources Resources::pushReservation(
+    const Resource::ReservationInfo& reservation) const
 {
-  // Check role name.
-  Option<Error> error = roles::validate(role);
-  if (error.isSome()) {
-    return error.get();
+  Resources result;
+
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    Resource_ r_ = *resource_;
+    r_.resource.add_reservations()->CopyFrom(reservation);
+    CHECK_NONE(Resources::validate(r_.resource));
+    result.add(std::move(r_));
   }
 
-  // Checks for the invalid state of (role, reservation) pair.
-  if (role == "*" && reservation.isSome()) {
-    return Error(
-        "Invalid reservation: role \"*\" cannot be dynamically reserved");
-  }
-
-  Resources flattened;
-
-  foreach (Resource_ resource_, resources) {
-    // With the above checks, we are certain that `resource_` will
-    // remain valid after the modifications.
-    resource_.resource.set_role(role);
-    if (reservation.isNone()) {
-      resource_.resource.clear_reservation();
-    } else {
-      resource_.resource.mutable_reservation()->CopyFrom(reservation.get());
-    }
-    flattened.add(resource_);
-  }
-
-  return flattened;
+  return result;
 }
 
 
-Resources Resources::flatten() const
+Resources Resources::popReservation() const
 {
-  Try<Resources> flattened = flatten("*");
-  CHECK_SOME(flattened);
-  return flattened.get();
+  Resources result;
+
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    CHECK_GT(resource_->resource.reservations_size(), 0);
+    Resource_ r_ = *resource_;
+    r_.resource.mutable_reservations()->RemoveLast();
+    result.add(std::move(r_));
+  }
+
+  return result;
+}
+
+
+Resources Resources::toUnreserved() const
+{
+  Resources result;
+
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (isReserved(resource_->resource)) {
+      Resource_ r_ = *resource_;
+      r_.resource.clear_reservations();
+      result.add(std::move(r_));
+    } else {
+      result.add(resource_);
+    }
+  }
+
+  return result;
 }
 
 
@@ -1207,14 +1725,17 @@ Resources Resources::createStrippedScalarQuantity() const
 {
   Resources stripped;
 
-  foreach (const Resource& resource, resources) {
-    if (resource.type() == Value::SCALAR) {
-      Resource scalar = resource;
-      scalar.clear_allocation_info();
-      scalar.clear_reservation();
-      scalar.clear_disk();
-      scalar.clear_shared();
-      stripped.add(scalar);
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (resource_->resource.type() == Value::SCALAR) {
+      Resource scalar;
+
+      scalar.set_name(resource_->resource.name());
+      scalar.set_type(resource_->resource.type());
+      scalar.mutable_scalar()->CopyFrom(resource_->resource.scalar());
+
+      stripped.add(std::move(scalar));
     }
   }
 
@@ -1241,167 +1762,35 @@ Option<Resources> Resources::find(const Resources& targets) const
 }
 
 
+Try<Resources> Resources::apply(const ResourceConversion& conversion) const
+{
+  return conversion.apply(*this);
+}
+
+
 Try<Resources> Resources::apply(const Offer::Operation& operation) const
 {
-  Resources result = *this;
+  Try<vector<ResourceConversion>> conversions =
+    getResourceConversions(operation);
 
-  switch (operation.type()) {
-    case Offer::Operation::LAUNCH:
-      // Launch operation does not alter the offered resources.
-      break;
-
-    case Offer::Operation::LAUNCH_GROUP:
-      // LaunchGroup operation does not alter the offered resources.
-      break;
-
-    case Offer::Operation::RESERVE: {
-      Option<Error> error = validate(operation.reserve().resources());
-      if (error.isSome()) {
-        return Error("Invalid RESERVE Operation: " + error->message);
-      }
-
-      foreach (const Resource& reserved, operation.reserve().resources()) {
-        if (!Resources::isReserved(reserved)) {
-          return Error("Invalid RESERVE Operation: Resource must be reserved");
-        } else if (!reserved.has_reservation()) {
-          return Error("Invalid RESERVE Operation: Missing 'reservation'");
-        }
-
-        Resources unreserved = Resources(reserved).flatten();
-
-        if (!result.contains(unreserved)) {
-          return Error("Invalid RESERVE Operation: " + stringify(result) +
-                       " does not contain " + stringify(unreserved));
-        }
-
-        result -= unreserved;
-        result.add(reserved);
-      }
-      break;
-    }
-
-    case Offer::Operation::UNRESERVE: {
-      Option<Error> error = validate(operation.unreserve().resources());
-      if (error.isSome()) {
-        return Error("Invalid UNRESERVE Operation: " + error->message);
-      }
-
-      foreach (const Resource& reserved, operation.unreserve().resources()) {
-        if (!Resources::isReserved(reserved)) {
-          return Error("Invalid UNRESERVE Operation: Resource is not reserved");
-        } else if (!reserved.has_reservation()) {
-          return Error("Invalid UNRESERVE Operation: Missing 'reservation'");
-        }
-
-        if (!result.contains(reserved)) {
-          return Error("Invalid UNRESERVE Operation: " + stringify(result) +
-                       " does not contain " + stringify(reserved));
-        }
-
-        Resources unreserved = Resources(reserved).flatten();
-
-        result.subtract(reserved);
-        result += unreserved;
-      }
-      break;
-    }
-
-    case Offer::Operation::CREATE: {
-      Option<Error> error = validate(operation.create().volumes());
-      if (error.isSome()) {
-        return Error("Invalid CREATE Operation: " + error->message);
-      }
-
-      foreach (const Resource& volume, operation.create().volumes()) {
-        if (!volume.has_disk()) {
-          return Error("Invalid CREATE Operation: Missing 'disk'");
-        } else if (!volume.disk().has_persistence()) {
-          return Error("Invalid CREATE Operation: Missing 'persistence'");
-        }
-
-        // Strip persistence and volume from the disk info so that we
-        // can subtract it from the original resources.
-        // TODO(jieyu): Non-persistent volumes are not supported for
-        // now. Persistent volumes can only be be created from regular
-        // disk resources. Revisit this once we start to support
-        // non-persistent volumes.
-        Resource stripped = volume;
-
-        if (stripped.disk().has_source()) {
-          stripped.mutable_disk()->clear_persistence();
-          stripped.mutable_disk()->clear_volume();
-        } else {
-          stripped.clear_disk();
-        }
-
-        // Since we only allow persistent volumes to be shared, the
-        // original resource must be non-shared.
-        stripped.clear_shared();
-
-        if (!result.contains(stripped)) {
-          return Error("Invalid CREATE Operation: Insufficient disk resources"
-                       " for persistent volume " + stringify(volume));
-        }
-
-        result.subtract(stripped);
-        result.add(volume);
-      }
-      break;
-    }
-
-    case Offer::Operation::DESTROY: {
-      Option<Error> error = validate(operation.destroy().volumes());
-      if (error.isSome()) {
-        return Error("Invalid DESTROY Operation: " + error->message);
-      }
-
-      foreach (const Resource& volume, operation.destroy().volumes()) {
-        if (!volume.has_disk()) {
-          return Error("Invalid DESTROY Operation: Missing 'disk'");
-        } else if (!volume.disk().has_persistence()) {
-          return Error("Invalid DESTROY Operation: Missing 'persistence'");
-        }
-
-        if (!result.contains(volume)) {
-          return Error(
-              "Invalid DESTROY Operation: Persistent volume does not exist");
-        }
-
-        // Strip persistence and volume from the disk info so that we
-        // can subtract it from the original resources.
-        Resource stripped = volume;
-
-        if (stripped.disk().has_source()) {
-          stripped.mutable_disk()->clear_persistence();
-          stripped.mutable_disk()->clear_volume();
-        } else {
-          stripped.clear_disk();
-        }
-
-        // Since we only allow persistent volumes to be shared, we
-        // return the resource to non-shared state after destroy.
-        stripped.clear_shared();
-
-        result.subtract(volume);
-        result.add(stripped);
-      }
-      break;
-    }
-
-    case Offer::Operation::UNKNOWN:
-      return Error("Unknown offer operation");
+  if (conversions.isError()) {
+    return Error("Cannot get conversions: " + conversions.error());
   }
 
-  // The following are sanity checks to ensure the amount of each type of
-  // resource does not change.
+  Try<Resources> result = apply(conversions.get());
+  if (result.isError()) {
+    return Error(result.error());
+  }
+
+  // The following are sanity checks to ensure the amount of each type
+  // of resource does not change.
   // TODO(jieyu): Currently, we only check known resource types like
   // cpus, gpus, mem, disk, ports, etc. We should generalize this.
-
-  CHECK(result.cpus() == cpus());
-  CHECK(result.gpus() == gpus());
-  CHECK(result.mem() == mem());
-  CHECK(result.disk() == disk());
-  CHECK(result.ports() == ports());
+  CHECK(result->cpus() == cpus());
+  CHECK(result->gpus() == gpus());
+  CHECK(result->mem() == mem());
+  CHECK(result->disk() == disk());
+  CHECK(result->ports() == ports());
 
   return result;
 }
@@ -1413,10 +1802,12 @@ Option<Value::Scalar> Resources::get(const string& name) const
   Value::Scalar total;
   bool found = false;
 
-  foreach (const Resource& resource, resources) {
-    if (resource.name() == name &&
-        resource.type() == Value::SCALAR) {
-      total += resource.scalar();
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (resource_->resource.name() == name &&
+        resource_->resource.type() == Value::SCALAR) {
+      total += resource_->resource.scalar();
       found = true;
     }
   }
@@ -1435,10 +1826,12 @@ Option<Value::Set> Resources::get(const string& name) const
   Value::Set total;
   bool found = false;
 
-  foreach (const Resource& resource, resources) {
-    if (resource.name() == name &&
-        resource.type() == Value::SET) {
-      total += resource.set();
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (resource_->resource.name() == name &&
+        resource_->resource.type() == Value::SET) {
+      total += resource_->resource.set();
       found = true;
     }
   }
@@ -1457,10 +1850,12 @@ Option<Value::Ranges> Resources::get(const string& name) const
   Value::Ranges total;
   bool found = false;
 
-  foreach (const Resource& resource, resources) {
-    if (resource.name() == name &&
-        resource.type() == Value::RANGES) {
-      total += resource.ranges();
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (resource_->resource.name() == name &&
+        resource_->resource.type() == Value::RANGES) {
+      total += resource_->resource.ranges();
       found = true;
     }
   }
@@ -1492,8 +1887,10 @@ Resources Resources::scalars() const
 set<string> Resources::names() const
 {
   set<string> result;
-  foreach (const Resource& resource, resources) {
-    result.insert(resource.name());
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    result.insert(resource_->resource.name());
   }
 
   return result;
@@ -1503,8 +1900,10 @@ set<string> Resources::names() const
 map<string, Value_Type> Resources::types() const
 {
   map<string, Value_Type> result;
-  foreach (const Resource& resource, resources) {
-    result[resource.name()] = resource.type();
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    result[resource_->resource.name()] = resource_->resource.type();
   }
 
   return result;
@@ -1583,8 +1982,10 @@ Option<Value::Ranges> Resources::ephemeral_ports() const
 
 bool Resources::_contains(const Resource_& that) const
 {
-  foreach (const Resource_& resource_, resources) {
-    if (resource_.contains(that)) {
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (resource_->contains(that)) {
       return true;
     }
   }
@@ -1597,39 +1998,41 @@ Option<Resources> Resources::find(const Resource& target) const
 {
   Resources found;
   Resources total = *this;
-  Resources remaining = Resources(target).flatten();
+  Resources remaining = Resources(target).toUnreserved();
 
   // First look in the target role, then unreserved, then any remaining role.
-  vector<lambda::function<bool(const Resource&)>> predicates = {
-    lambda::bind(isReserved, lambda::_1, target.role()),
-    isUnreserved,
-    [](const Resource&) { return true; }
-  };
+  vector<lambda::function<bool(const Resource&)>> predicates;
+
+  if (isReserved(target)) {
+    predicates.push_back(
+        lambda::bind(isReserved, lambda::_1, reservationRole(target)));
+  }
+
+  predicates.push_back(isUnreserved);
+  predicates.push_back([](const Resource&) { return true; });
 
   foreach (const auto& predicate, predicates) {
-    foreach (const Resource_& resource_, total.filter(predicate)) {
-      // Need to flatten to ignore the roles in contains().
-      Resources flattened = Resources(resource_.resource).flatten();
+    foreach (
+        const Resource_Unsafe& resource_,
+        total.filter(predicate).resourcesNoMutationWithoutExclusiveOwnership) {
+      // Need to `toUnreserved` to ignore the roles in contains().
+      Resources unreserved;
+      unreserved.add(resource_);
+      unreserved = unreserved.toUnreserved();
 
-      if (flattened.contains(remaining)) {
+      if (unreserved.contains(remaining)) {
         // The target has been found, return the result.
-        if (!resource_.resource.has_reservation()) {
-          Try<Resources> _flattened =
-            remaining.flatten(resource_.resource.role());
-
-          CHECK_SOME(_flattened);
-          return found + _flattened.get();
-        } else {
-          Try<Resources> _flattened = remaining.flatten(
-              resource_.resource.role(), resource_.resource.reservation());
-
-          CHECK_SOME(_flattened);
-          return found + _flattened.get();
+        foreach (Resource r, remaining) {
+          r.mutable_reservations()->CopyFrom(
+              resource_->resource.reservations());
+          found.add(std::move(r));
         }
-      } else if (remaining.contains(flattened)) {
+
+        return found;
+      } else if (remaining.contains(unreserved)) {
         found.add(resource_);
-        total.subtract(resource_);
-        remaining -= flattened;
+        total.subtract(*resource_);
+        remaining -= unreserved;
         break;
       }
     }
@@ -1643,11 +2046,13 @@ Option<Resources> Resources::find(const Resource& target) const
 // Overloaded operators.
 /////////////////////////////////////////////////
 
-Resources::operator const RepeatedPtrField<Resource>() const
+Resources::operator RepeatedPtrField<Resource>() const
 {
   RepeatedPtrField<Resource> all;
-  foreach(const Resource& resource, resources) {
-    all.Add()->CopyFrom(resource);
+  foreach (
+      const Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    all.Add()->CopyFrom(resource_->resource);
   }
 
   return all;
@@ -1666,7 +2071,7 @@ bool Resources::operator!=(const Resources& that) const
 }
 
 
-Resources Resources::operator+(const Resource_& that) const
+Resources Resources::operator+(const Resource& that) const &
 {
   Resources result = *this;
   result += that;
@@ -1674,7 +2079,31 @@ Resources Resources::operator+(const Resource_& that) const
 }
 
 
-Resources Resources::operator+(const Resource& that) const
+Resources Resources::operator+(const Resource& that) &&
+{
+  Resources result = std::move(*this);
+  result += that;
+  return result;
+}
+
+
+Resources Resources::operator+(Resource&& that) const &
+{
+  Resources result = *this;
+  result += std::move(that);
+  return result;
+}
+
+
+Resources Resources::operator+(Resource&& that) &&
+{
+  Resources result = std::move(*this);
+  result += std::move(that);
+  return result;
+}
+
+
+Resources Resources::operator+(const Resources& that) const &
 {
   Resources result = *this;
   result += that;
@@ -1682,10 +2111,26 @@ Resources Resources::operator+(const Resource& that) const
 }
 
 
-Resources Resources::operator+(const Resources& that) const
+Resources Resources::operator+(const Resources& that) &&
 {
-  Resources result = *this;
+  Resources result = std::move(*this);
   result += that;
+  return result;
+}
+
+
+Resources Resources::operator+(Resources&& that) const &
+{
+  Resources result = std::move(that);
+  result += *this;
+  return result;
+}
+
+
+Resources Resources::operator+(Resources&& that) &&
+{
+  Resources result = std::move(*this);
+  result += std::move(that);
   return result;
 }
 
@@ -1697,9 +2142,16 @@ void Resources::add(const Resource_& that)
   }
 
   bool found = false;
-  foreach (Resource_& resource_, resources) {
-    if (internal::addable(resource_.resource, that)) {
-      resource_ += that;
+  foreach (
+      Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (internal::addable(resource_->resource, that.resource)) {
+      // Copy-on-write (if more than 1 reference).
+      if (resource_.use_count() > 1) {
+        resource_ = make_shared<Resource_>(*resource_);
+      }
+
+      *resource_ += that;
       found = true;
       break;
     }
@@ -1707,7 +2159,69 @@ void Resources::add(const Resource_& that)
 
   // Cannot be combined with any existing Resource object.
   if (!found) {
-    resources.push_back(that);
+    resourcesNoMutationWithoutExclusiveOwnership.push_back(
+        make_shared<Resource_>(that));
+  }
+}
+
+
+void Resources::add(Resource_&& that)
+{
+  if (that.isEmpty()) {
+    return;
+  }
+
+  bool found = false;
+  foreach (
+      Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (internal::addable(resource_->resource, that.resource)) {
+      // Copy-on-write (if more than 1 reference).
+      if (resource_.use_count() > 1) {
+        that += *resource_;
+        resource_ = make_shared<Resource_>(std::move(that));
+      } else {
+        *resource_ += that;
+      }
+
+      found = true;
+      break;
+    }
+  }
+
+  // Cannot be combined with any existing Resource object.
+  if (!found) {
+    resourcesNoMutationWithoutExclusiveOwnership.push_back(
+        make_shared<Resource_>(std::move(that)));
+  }
+}
+
+
+void Resources::add(const Resource_Unsafe& that)
+{
+  if (that->isEmpty()) {
+    return;
+  }
+
+  bool found = false;
+  foreach (
+      Resource_Unsafe& resource_,
+      resourcesNoMutationWithoutExclusiveOwnership) {
+    if (internal::addable(resource_->resource, that->resource)) {
+      // Copy-on-write (if more than 1 reference).
+      if (resource_.use_count() > 1) {
+        resource_ = make_shared<Resource_>(*resource_);
+      }
+
+      *resource_ += *that;
+      found = true;
+      break;
+    }
+  }
+
+  // Cannot be combined with any existing Resource object.
+  if (!found) {
+    resourcesNoMutationWithoutExclusiveOwnership.push_back(that);
   }
 }
 
@@ -1722,6 +2236,16 @@ Resources& Resources::operator+=(const Resource_& that)
 }
 
 
+Resources& Resources::operator+=(Resource_&& that)
+{
+  if (that.validate().isNone()) {
+    add(std::move(that));
+  }
+
+  return *this;
+}
+
+
 Resources& Resources::operator+=(const Resource& that)
 {
   *this += Resource_(that);
@@ -1730,9 +2254,19 @@ Resources& Resources::operator+=(const Resource& that)
 }
 
 
+Resources& Resources::operator+=(Resource&& that)
+{
+  *this += Resource_(std::move(that));
+
+  return *this;
+}
+
+
 Resources& Resources::operator+=(const Resources& that)
 {
-  foreach (const Resource_& resource_, that) {
+  foreach (
+      const Resource_Unsafe& resource_,
+      that.resourcesNoMutationWithoutExclusiveOwnership) {
     add(resource_);
   }
 
@@ -1740,11 +2274,15 @@ Resources& Resources::operator+=(const Resources& that)
 }
 
 
-Resources Resources::operator-(const Resource_& that) const
+Resources& Resources::operator+=(Resources&& that)
 {
-  Resources result = *this;
-  result -= that;
-  return result;
+  foreach (
+      const Resource_Unsafe& resource_,
+      that.resourcesNoMutationWithoutExclusiveOwnership) {
+    add(std::move(resource_));
+  }
+
+  return *this;
 }
 
 
@@ -1770,11 +2308,18 @@ void Resources::subtract(const Resource_& that)
     return;
   }
 
-  for (size_t i = 0; i < resources.size(); i++) {
-    Resource_& resource_ = resources[i];
+  for (size_t i = 0; i < resourcesNoMutationWithoutExclusiveOwnership.size();
+       i++) {
+    Resource_Unsafe& resource_ =
+      resourcesNoMutationWithoutExclusiveOwnership[i];
 
-    if (internal::subtractable(resource_.resource, that)) {
-      resource_ -= that;
+    if (internal::subtractable(resource_->resource, that)) {
+      // Copy-on-write (if more than 1 reference).
+      if (resource_.use_count() > 1) {
+        resource_ = make_shared<Resource_>(*resource_);
+      }
+
+      *resource_ -= that;
 
       // Remove the resource if it has become negative or empty.
       // Note that a negative resource means the caller is
@@ -1786,16 +2331,17 @@ void Resources::subtract(const Resource_& that)
       // A "negative" Resource_ either has a negative sharedCount or
       // a negative scalar value.
       bool negative =
-        (resource_.isShared() && resource_.sharedCount.get() < 0) ||
-        (resource_.resource.type() == Value::SCALAR &&
-         resource_.resource.scalar().value() < 0);
+        (resource_->isShared() && resource_->sharedCount.get() < 0) ||
+        (resource_->resource.type() == Value::SCALAR &&
+         resource_->resource.scalar().value() < 0);
 
-      if (negative || resource_.isEmpty()) {
+      if (negative || resource_->isEmpty()) {
         // As `resources` is not ordered, and erasing an element
         // from the middle is expensive, we swap with the last element
         // and then shrink the vector by one.
-        resources[i] = resources.back();
-        resources.pop_back();
+        resourcesNoMutationWithoutExclusiveOwnership[i] =
+          resourcesNoMutationWithoutExclusiveOwnership.back();
+        resourcesNoMutationWithoutExclusiveOwnership.pop_back();
       }
 
       break;
@@ -1824,8 +2370,10 @@ Resources& Resources::operator-=(const Resource& that)
 
 Resources& Resources::operator-=(const Resources& that)
 {
-  foreach (const Resource_& resource_, that) {
-    subtract(resource_);
+  foreach (
+      const Resource_Unsafe& resource_,
+      that.resourcesNoMutationWithoutExclusiveOwnership) {
+    subtract(*resource_);
   }
 
   return *this;
@@ -1836,9 +2384,29 @@ ostream& operator<<(ostream& stream, const Resource::DiskInfo::Source& source)
 {
   switch (source.type()) {
     case Resource::DiskInfo::Source::MOUNT:
-      return stream << "MOUNT:" + source.mount().root();
+      return stream
+        << "MOUNT"
+        << ((source.has_id() || source.has_profile())
+              ? "(" + source.id() + "," + source.profile() + ")"
+              : (source.mount().has_root() ? ":" + source.mount().root() : ""));
     case Resource::DiskInfo::Source::PATH:
-      return stream << "PATH:" + source.path().root();
+      return stream
+        << "PATH"
+        << ((source.has_id() || source.has_profile())
+              ? "(" + source.id() + "," + source.profile() + ")"
+              : (source.path().has_root() ? ":" + source.path().root() : ""));
+    case Resource::DiskInfo::Source::BLOCK:
+      return stream
+        << "BLOCK"
+        << ((source.has_id() || source.has_profile())
+              ? "(" + source.id() + "," + source.profile() + ")" : "");
+    case Resource::DiskInfo::Source::RAW:
+      return stream
+        << "RAW"
+        << ((source.has_id() || source.has_profile())
+              ? "(" + source.id() + "," + source.profile() + ")" : "");
+    case Resource::DiskInfo::Source::UNKNOWN:
+      return stream << "UNKNOWN";
   }
 
   UNREACHABLE();
@@ -1869,27 +2437,6 @@ ostream& operator<<(ostream& stream, const Volume& volume)
 }
 
 
-ostream& operator<<(ostream& stream, const Resource::DiskInfo& disk)
-{
-  if (disk.has_source()) {
-    stream << disk.source();
-  }
-
-  if (disk.has_persistence()) {
-    if (disk.has_source()) {
-      stream << ",";
-    }
-    stream << disk.persistence().id();
-  }
-
-  if (disk.has_volume()) {
-    stream << ":" << disk.volume();
-  }
-
-  return stream;
-}
-
-
 ostream& operator<<(ostream& stream, const Labels& labels)
 {
   stream << "{";
@@ -1914,28 +2461,65 @@ ostream& operator<<(ostream& stream, const Labels& labels)
 }
 
 
+ostream& operator<<(
+    ostream& stream,
+    const Resource::ReservationInfo& reservation)
+{
+  stream << Resource::ReservationInfo::Type_Name(reservation.type()) << ","
+         << reservation.role();
+
+  if (reservation.has_principal()) {
+    stream << "," << reservation.principal();
+  }
+
+  if (reservation.has_labels()) {
+    stream << "," << reservation.labels();
+  }
+
+  return stream;
+}
+
+
+ostream& operator<<(ostream& stream, const Resource::DiskInfo& disk)
+{
+  if (disk.has_source()) {
+    stream << disk.source();
+  }
+
+  if (disk.has_persistence()) {
+    if (disk.has_source()) {
+      stream << ",";
+    }
+    stream << disk.persistence().id();
+  }
+
+  if (disk.has_volume()) {
+    stream << ":" << disk.volume();
+  }
+
+  return stream;
+}
+
+
 ostream& operator<<(ostream& stream, const Resource& resource)
 {
   stream << resource.name();
 
-  stream << "(" << resource.role();
-
-  if (resource.has_reservation()) {
-    const Resource::ReservationInfo& reservation = resource.reservation();
-
-    if (reservation.has_principal()) {
-      stream << ", " << reservation.principal();
-    }
-
-    if (reservation.has_labels()) {
-      stream << ", " << reservation.labels();
-    }
-  }
-
-  stream << ")";
-
   if (resource.has_allocation_info()) {
     stream << "(allocated: " << resource.allocation_info().role() << ")";
+  }
+
+  if (resource.reservations_size() > 0) {
+    stream << "(reservations: [";
+
+    for (int i = 0; i < resource.reservations_size(); ++i) {
+      if (i > 0) {
+        stream << ", ";
+      }
+      stream << "(" << resource.reservations(i) << ")";
+    }
+
+    stream << "])";
   }
 
   if (resource.has_disk()) {
@@ -1998,11 +2582,38 @@ ostream& operator<<(ostream& stream, const Resources& resources)
 }
 
 
+// We use `JSON::protobuf` to print the resources here because these
+// resources may not have been validated, or not converted to
+// "post-reservation-refinement" format at this point.
 ostream& operator<<(
     ostream& stream,
     const google::protobuf::RepeatedPtrField<Resource>& resources)
 {
-  return stream << Resources(resources);
+  return stream << JSON::protobuf(resources);
+}
+
+
+Try<Resources> ResourceConversion::apply(const Resources& resources) const
+{
+  Resources result = resources;
+
+  if (!result.contains(consumed)) {
+    return Error(
+        stringify(result) + " does not contain " +
+        stringify(consumed));
+  }
+
+  result -= consumed;
+  result += converted;
+
+  if (postValidation.isSome()) {
+    Try<Nothing> validation = postValidation.get()(result);
+    if (validation.isError()) {
+      return Error(validation.error());
+    }
+  }
+
+  return result;
 }
 
 } // namespace v1 {

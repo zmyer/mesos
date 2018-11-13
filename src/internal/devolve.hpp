@@ -28,6 +28,8 @@
 
 #include <mesos/master/master.hpp>
 
+#include <mesos/resource_provider/resource_provider.hpp>
+
 #include <mesos/scheduler/scheduler.hpp>
 
 #include <mesos/v1/mesos.hpp>
@@ -38,6 +40,8 @@
 #include <mesos/v1/executor/executor.hpp>
 
 #include <mesos/v1/master/master.hpp>
+
+#include <mesos/v1/resource_provider/resource_provider.hpp>
 
 #include <mesos/v1/scheduler/scheduler.hpp>
 
@@ -56,20 +60,29 @@ FrameworkInfo devolve(const v1::FrameworkInfo& frameworkInfo);
 HealthCheck devolve(const v1::HealthCheck& check);
 InverseOffer devolve(const v1::InverseOffer& inverseOffer);
 Offer devolve(const v1::Offer& offer);
+OperationStatus devolve(const v1::OperationStatus& status);
 Resource devolve(const v1::Resource& resource);
+ResourceProviderID devolve(const v1::ResourceProviderID& resourceProviderId);
+ResourceProviderInfo devolve(
+    const v1::ResourceProviderInfo& resourceProviderInfo);
 Resources devolve(const v1::Resources& resources);
 SlaveID devolve(const v1::AgentID& agentId);
 SlaveInfo devolve(const v1::AgentInfo& agentInfo);
 TaskID devolve(const v1::TaskID& taskId);
 TaskStatus devolve(const v1::TaskStatus& status);
 
-scheduler::Call devolve(const v1::scheduler::Call& call);
-scheduler::Event devolve(const v1::scheduler::Event& event);
+mesos::resource_provider::Call devolve(const v1::resource_provider::Call& call);
+mesos::resource_provider::Event devolve(
+    const v1::resource_provider::Event& event);
+
+mesos::scheduler::Call devolve(const v1::scheduler::Call& call);
+mesos::scheduler::Event devolve(const v1::scheduler::Event& event);
 
 executor::Call devolve(const v1::executor::Call& call);
 executor::Event devolve(const v1::executor::Event& event);
 
 mesos::agent::Call devolve(const v1::agent::Call& call);
+mesos::agent::Response devolve(const v1::agent::Response& response);
 
 mesos::master::Call devolve(const v1::master::Call& call);
 

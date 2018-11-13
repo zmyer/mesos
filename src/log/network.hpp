@@ -20,9 +20,10 @@
 // TODO(benh): Eventually move and associate this code with the
 // libprocess protobuf code rather than keep it here.
 
-#include <list>
+#include <deque>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <mesos/zookeeper/group.hpp>
 
@@ -130,7 +131,7 @@ private:
 
   // Invoked when group members data has been collected.
   void collected(
-      const process::Future<std::list<Option<std::string>>>& datas);
+      const process::Future<std::vector<Option<std::string>>>& datas);
 
   zookeeper::Group group;
   process::Future<std::set<zookeeper::Group::Membership>> memberships;
@@ -216,7 +217,7 @@ public:
     return watch->promise.future();
   }
 
-  // Sends a request to each of the groups members and returns a set
+  // Sends a request to each of the group members and returns a set
   // of futures that represent their responses.
   template <typename Req, typename Res>
   std::set<process::Future<Res>> broadcast(
@@ -235,6 +236,7 @@ public:
     return futures;
   }
 
+  // Sends a request to each of the group members without expecting responses.
   template <typename M>
   Nothing broadcast(
       const M& m,
@@ -244,14 +246,17 @@ public:
     for (iterator = pids.begin(); iterator != pids.end(); ++iterator) {
       const process::UPID& pid = *iterator;
       if (filter.count(pid) == 0) {
-        process::post(pid, m);
+        // NOTE: Just send this message as the network process itself
+        // since we don't need to deliver responses back to the caller.
+        // Incoming messages addressed to the network are simply dropped.
+        send(pid, m);
       }
     }
     return Nothing();
   }
 
 protected:
-  virtual void finalize()
+  void finalize() override
   {
     foreach (Watch* watch, watches) {
       watch->promise.fail("Network is being terminated");
@@ -316,7 +321,7 @@ private:
   }
 
   std::set<process::UPID> pids;
-  std::list<Watch*> watches;
+  std::deque<Watch*> watches;
 };
 
 
@@ -432,7 +437,7 @@ inline void ZooKeeperNetwork::watched(
   LOG(INFO) << "ZooKeeper group memberships changed";
 
   // Get data for each membership in order to convert them to PIDs.
-  std::list<process::Future<Option<std::string>>> futures;
+  std::vector<process::Future<Option<std::string>>> futures;
 
   foreach (const zookeeper::Group::Membership& membership, memberships.get()) {
     futures.push_back(group.data(membership));
@@ -440,7 +445,7 @@ inline void ZooKeeperNetwork::watched(
 
   process::collect(futures)
     .after(Seconds(5),
-           [](process::Future<std::list<Option<std::string>>> datas) {
+           [](process::Future<std::vector<Option<std::string>>> datas) {
              // Handling time outs when collecting membership
              // data. For now, a timeout is treated as a failure.
              datas.discard();
@@ -451,7 +456,7 @@ inline void ZooKeeperNetwork::watched(
 
 
 inline void ZooKeeperNetwork::collected(
-    const process::Future<std::list<Option<std::string>>>& datas)
+    const process::Future<std::vector<Option<std::string>>>& datas)
 {
   if (datas.isFailed()) {
     LOG(WARNING) << "Failed to get data for ZooKeeper group members: "

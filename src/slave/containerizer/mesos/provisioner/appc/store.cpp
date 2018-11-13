@@ -14,9 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <list>
+#include <vector>
 
 #include <glog/logging.h>
+
+#include <mesos/appc/spec.hpp>
+
+#include <mesos/secret/resolver.hpp>
 
 #include <process/collect.hpp>
 #include <process/defer.hpp>
@@ -28,14 +32,12 @@
 #include <stout/os.hpp>
 #include <stout/path.hpp>
 
-#include <mesos/appc/spec.hpp>
+#include <stout/os/realpath.hpp>
 
 #include "slave/containerizer/mesos/provisioner/appc/cache.hpp"
 #include "slave/containerizer/mesos/provisioner/appc/fetcher.hpp"
 #include "slave/containerizer/mesos/provisioner/appc/paths.hpp"
 #include "slave/containerizer/mesos/provisioner/appc/store.hpp"
-
-using namespace process;
 
 namespace spec = appc::spec;
 
@@ -43,7 +45,17 @@ using std::list;
 using std::string;
 using std::vector;
 
+using process::Failure;
+using process::Future;
 using process::Owned;
+using process::Process;
+using process::Promise;
+
+using process::defer;
+using process::dispatch;
+using process::spawn;
+using process::terminate;
+using process::wait;
 
 namespace mesos {
 namespace internal {
@@ -58,7 +70,7 @@ public:
       Owned<Cache> cache,
       Owned<Fetcher> fetcher);
 
-  ~StoreProcess() {}
+  ~StoreProcess() override {}
 
   Future<Nothing> recover();
 
@@ -88,7 +100,9 @@ private:
 };
 
 
-Try<Owned<slave::Store>> Store::create(const Flags& flags)
+Try<Owned<slave::Store>> Store::create(
+    const Flags& flags,
+    SecretResolver* secretResolver)
 {
   Try<Nothing> mkdir = os::mkdir(paths::getImagesDir(flags.appc_store_dir));
   if (mkdir.isError()) {
@@ -117,7 +131,10 @@ Try<Owned<slave::Store>> Store::create(const Flags& flags)
   // TODO(jojy): Uri fetcher has 'shared' semantics for the
   // provisioner. It's a shared pointer which needs to be injected
   // from top level into the store (instead of being created here).
-  Try<Owned<uri::Fetcher>> uriFetcher = uri::fetcher::create();
+  uri::fetcher::Flags _flags;
+  _flags.curl_stall_timeout = flags.fetcher_stall_timeout;
+
+  Try<Owned<uri::Fetcher>> uriFetcher = uri::fetcher::create(_flags);
   if (uriFetcher.isError()) {
     return Error("Failed to create uri fetcher: " + uriFetcher.error());
   }
@@ -364,13 +381,14 @@ Future<vector<string>> StoreProcess::fetchDependencies(
   }
 
   // Do a depth first search.
-  list<Future<vector<string>>> futures;
+  vector<Future<vector<string>>> futures;
+  futures.reserve(dependencies.size());
   foreach (const Image::Appc& appc, dependencies) {
     futures.emplace_back(fetchImage(appc, cached));
   }
 
   return collect(futures)
-    .then(defer(self(), [=](const list<vector<string>>& imageIdsList) {
+    .then(defer(self(), [=](const vector<vector<string>>& imageIdsList) {
       vector<string> result;
       foreach (const vector<string>& imageIds, imageIdsList) {
         result.insert(result.end(), imageIds.begin(), imageIds.end());

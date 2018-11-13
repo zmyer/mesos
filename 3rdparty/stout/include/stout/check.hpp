@@ -23,11 +23,17 @@
 #include <stout/error.hpp>
 #include <stout/none.hpp>
 #include <stout/option.hpp>
-#include <stout/result.hpp>
 #include <stout/some.hpp>
-#include <stout/try.hpp>
 
-// A generic macro to faciliate definitions of CHECK_*, akin to CHECK.
+
+template <typename T>
+class Result;
+
+template <typename T, typename E>
+class Try;
+
+
+// A generic macro to facilitate definitions of CHECK_*, akin to CHECK.
 // This appends the error if possible to the end of the log message,
 // so there's no need to append the error message explicitly.
 // To define a new CHECK_*, provide the name, the function that performs the
@@ -53,8 +59,117 @@
   CHECK_STATE(CHECK_ERROR, _check_error, expression)
 
 
-// Private structs/functions used for CHECK_*.
+// A private helper for CHECK_NOTNONE which is similar to the
+// CHECK_NOTNULL provided by glog.
+template <typename T>
+T&& _check_not_none(
+    const char* file,
+    int line,
+    const char* message,
+    Option<T>&& t) {
+  if (t.isNone()) {
+    google::LogMessageFatal(file, line, new std::string(message));
+  }
+  return std::move(t).get();
+}
 
+
+template <typename T>
+T& _check_not_none(
+    const char* file,
+    int line,
+    const char* message,
+    Option<T>& t) {
+  if (t.isNone()) {
+    google::LogMessageFatal(file, line, new std::string(message));
+  }
+  return t.get();
+}
+
+
+template <typename T>
+const T& _check_not_none(
+    const char* file,
+    int line,
+    const char* message,
+    const Option<T>& t) {
+  if (t.isNone()) {
+    google::LogMessageFatal(file, line, new std::string(message));
+  }
+  return t.get();
+}
+
+
+#define CHECK_NOTNONE(expression) \
+  _check_not_none( \
+      __FILE__, \
+      __LINE__, \
+      "'" #expression "' Must be SOME", \
+      (expression))
+
+
+// A private helper for CHECK_NOTERROR which is similar to the
+// CHECK_NOTNULL provided by glog.
+template <typename T, typename E>
+T&& _check_not_error(
+    const char* file,
+    int line,
+    const char* message,
+    Try<T, E>&& t) {
+  if (t.isError()) {
+    google::LogMessageFatal(
+        file,
+        line,
+        new std::string(
+            std::string(message) + ": " + Error(t.error()).message));
+  }
+  return std::move(t).get();
+}
+
+
+template <typename T, typename E>
+T& _check_not_error(
+    const char* file,
+    int line,
+    const char* message,
+    Try<T, E>& t) {
+  if (t.isError()) {
+    google::LogMessageFatal(
+        file,
+        line,
+        new std::string(
+            std::string(message) + ": " + Error(t.error()).message));
+  }
+  return t.get();
+}
+
+
+template <typename T, typename E>
+const T& _check_not_error(
+    const char* file,
+    int line,
+    const char* message,
+    const Try<T, E>& t) {
+  if (t.isError()) {
+    google::LogMessageFatal(
+        file,
+        line,
+        new std::string(
+            std::string(message) + ": " + Error(t.error()).message));
+  }
+  return t.get();
+}
+
+
+#define CHECK_NOTERROR(expression) \
+  _check_not_error( \
+      __FILE__, \
+      __LINE__, \
+      "'" #expression "' Must be SOME", \
+      (expression))
+
+
+// Private structs/functions used for CHECK_*.
 
 template <typename T>
 Option<Error> _check_some(const Option<T>& o)
@@ -68,8 +183,8 @@ Option<Error> _check_some(const Option<T>& o)
 }
 
 
-template <typename T>
-Option<Error> _check_some(const Try<T>& t)
+template <typename T, typename E>
+Option<Error> _check_some(const Try<T, E>& t)
 {
   if (t.isError()) {
     return Error(t.error());
@@ -120,8 +235,8 @@ Option<Error> _check_none(const Result<T>& r)
 }
 
 
-template <typename T>
-Option<Error> _check_error(const Try<T>& t)
+template <typename T, typename E>
+Option<Error> _check_error(const Try<T, E>& t)
 {
   if (t.isSome()) {
     return Error("is SOME");

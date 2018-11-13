@@ -35,22 +35,26 @@ namespace slave {
 /**
  * Represent cgroups blkio subsystem.
  */
-class BlkioSubsystem : public Subsystem
+class BlkioSubsystemProcess : public SubsystemProcess
 {
 public:
-  static Try<process::Owned<Subsystem>> create(
+  static Try<process::Owned<SubsystemProcess>> create(
       const Flags& flags,
       const std::string& hierarchy);
 
-  virtual ~BlkioSubsystem() {}
+  ~BlkioSubsystemProcess() override = default;
 
-  virtual std::string name() const
+  std::string name() const override
   {
     return CGROUP_SUBSYSTEM_BLKIO_NAME;
   };
 
+  process::Future<ResourceStatistics> usage(
+      const ContainerID& containerId,
+      const std::string& cgroup) override;
+
 private:
-  BlkioSubsystem(const Flags& flags, const std::string& hierarchy);
+  BlkioSubsystemProcess(const Flags& flags, const std::string& hierarchy);
 };
 
 } // namespace slave {

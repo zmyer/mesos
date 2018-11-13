@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <string>
+
 #include <mesos/mesos.hpp>
 #include <mesos/resources.hpp>
 
@@ -22,9 +24,21 @@
 
 #include "tests/resources_utils.hpp"
 
+using std::string;
+
 namespace mesos {
 namespace internal {
 namespace tests {
+
+Resources allocatedResources(
+    const Resources& resources,
+    const string& role)
+{
+  Resources result = resources;
+  result.allocate(role);
+  return result;
+}
+
 
 Resource createPorts(const ::mesos::Value::Ranges& ranges)
 {
@@ -33,7 +47,6 @@ Resource createPorts(const ::mesos::Value::Ranges& ranges)
   value.mutable_ranges()->CopyFrom(ranges);
 
   Resource resource;
-  resource.set_role("*");
   resource.set_name("ports");
   resource.set_type(Value::RANGES);
   resource.mutable_ranges()->CopyFrom(value.ranges());
@@ -77,7 +90,7 @@ Try<::mesos::Value::Ranges> fragment(
   // We fragment from the front of the bounds until we have the
   // desired number of ranges.
   ::mesos::Value::Ranges ranges;
-  ranges.mutable_range()->Reserve(numRanges);
+  ranges.mutable_range()->Reserve(static_cast<int>(numRanges));
 
   for (size_t i = 0; i < numRanges; ++i) {
     Value::Range* range = ranges.add_range();

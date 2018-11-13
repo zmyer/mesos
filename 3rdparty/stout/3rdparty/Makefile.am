@@ -31,17 +31,22 @@ include ../../versions.am
 
 BOOST = boost-$(BOOST_VERSION)
 GLOG = glog-$(GLOG_VERSION)
-GMOCK = gmock-$(GMOCK_VERSION)
-GTEST = $(GMOCK)/gtest
-PROTOBUF = protobuf-$(PROTOBUF_VERSION)
+GOOGLETEST = googletest-release-$(GOOGLETEST_VERSION)
+GMOCK = $(GOOGLETEST)/googlemock
+GTEST = $(GOOGLETEST)/googletest
+LIBARCHIVE = libarchive-$(LIBARCHIVE_VERSION)
 PICOJSON = picojson-$(PICOJSON_VERSION)
+PROTOBUF = protobuf-$(PROTOBUF_VERSION)
+RAPIDJSON = rapidjson-$(RAPIDJSON_VERSION)
 
 EXTRA_DIST =		\
   $(BOOST).tar.gz	\
   $(GLOG).tar.gz	\
-  $(GMOCK).tar.gz	\
+  $(GOOGLETEST).tar.gz	\
+  $(LIBARCHIVE).tar.gz	\
+  $(PICOJSON).tar.gz	\
   $(PROTOBUF).tar.gz	\
-  $(PICOJSON).tar.gz
+  $(RAPIDJSON).tar.gz
 
 # We need to patch glog in order to deal with a compilation issue when
 # compiling with clang (and C++11); see MESOS-860, MESOS-966.
@@ -57,7 +62,9 @@ CLEAN_EXTRACTED =	\
   $(BOOST)		\
   $(GLOG)		\
   $(GMOCK)		\
+  $(LIBARCHIVE)		\
   $(PICOJSON)		\
+  $(RAPIDJSON)		\
   $(PROTOBUF)
 
 # This is where the magic happens: we use stamp files as dependencies
@@ -111,6 +118,10 @@ ALL_LOCAL += $(PROTOBUF)/src/libprotobuf.la
 ALL_LOCAL += $(PROTOBUF)/src/protoc
 endif
 
+if WITH_BUNDLED_RAPIDJSON
+ALL_LOCAL += $(RAPIDJSON)-stamp
+endif
+
 # Convenience library for gmock/gtest.
 check_LTLIBRARIES = libgmock.la
 nodist_libgmock_la_SOURCES = gmock_sources.cc
@@ -120,11 +131,35 @@ libgmock_la_CPPFLAGS =			\
   -I$(GTEST)/include -I$(GTEST) -I$(GTEST)/src	\
   -I$(GMOCK)/include -I$(GMOCK) -I$(GMOCK)/src
 
-  gmock_sources.cc: $(GMOCK)-stamp
+  gmock_sources.cc: $(GOOGLETEST)-stamp
 
 $(GMOCK)-build-stamp: libgmock.la
 	touch $@
 ALL_LOCAL += $(GMOCK)-build-stamp
+endif
+
+if WITH_BUNDLED_LIBARCHIVE
+LIB_LIBARCHIVE = $(LIBARCHIVE)/.libs/libarchive.la
+
+$(LIB_LIBARCHIVE): $(LIBARCHIVE)-build-stamp
+
+$(LIBARCHIVE)-build-stamp: $(LIBARCHIVE)-stamp
+	cd $(LIBARCHIVE) &&			\
+	  ./configure $(CONFIGURE_ARGS)		\
+	      --without-bz2lib			\
+	      --without-cng			\
+	      --without-expat			\
+	      --without-iconv			\
+	      --without-libiconv-prefix		\
+	      --without-lz4			\
+	      --without-lzma			\
+	      --without-nettle			\
+	      --without-openssl			\
+	      --without-xml2
+	cd $(LIBARCHIVE) && $(MAKE) $(AM_MAKEFLAGS)
+	touch $@
+
+ALL_LOCAL += $(LIB_LIBARCHIVE)
 endif
 
 if LINKGTEST

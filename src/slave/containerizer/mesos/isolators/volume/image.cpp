@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sys/mount.h>
+
 #include <list>
 #include <string>
 #include <vector>
@@ -27,6 +29,9 @@
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
 #include <stout/strings.hpp>
+
+#include <stout/os/exists.hpp>
+#include <stout/os/mkdir.hpp>
 
 #include "slave/containerizer/mesos/isolators/volume/image.hpp"
 
@@ -46,6 +51,7 @@ using process::Shared;
 using mesos::slave::ContainerClass;
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
+using mesos::slave::ContainerMountInfo;
 using mesos::slave::Isolator;
 
 namespace mesos {
@@ -64,6 +70,12 @@ VolumeImageIsolatorProcess::~VolumeImageIsolatorProcess() {}
 
 
 bool VolumeImageIsolatorProcess::supportsNesting()
+{
+  return true;
+}
+
+
+bool VolumeImageIsolatorProcess::supportsStandalone()
 {
   return true;
 }
@@ -101,8 +113,12 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::prepare(
     return Failure("Can only prepare image volumes for a MESOS container");
   }
 
+  // TODO(qianzhang): Here we use vector to ensure the order of mount target,
+  // mount source and volume mode which is kind of hacky, we could consider
+  // to introduce a dedicated struct for it in future.
   vector<string> targets;
-  list<Future<ProvisionInfo>> futures;
+  vector<Volume::Mode> volumeModes;
+  vector<Future<ProvisionInfo>> futures;
 
   for (int i = 0; i < containerConfig.container_info().volumes_size(); i++) {
     const Volume& volume = containerConfig.container_info().volumes(i);
@@ -176,6 +192,7 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::prepare(
     }
 
     targets.push_back(target);
+    volumeModes.push_back(volume.mode());
     futures.push_back(provisioner->provision(containerId, volume.image()));
   }
 
@@ -185,6 +202,7 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::prepare(
         &VolumeImageIsolatorProcess::_prepare,
         containerId,
         targets,
+        volumeModes,
         lambda::_1));
 }
 
@@ -192,7 +210,8 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::prepare(
 Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::_prepare(
     const ContainerID& containerId,
     const vector<string>& targets,
-    const list<Future<ProvisionInfo>>& futures)
+    const vector<Volume::Mode>& volumeModes,
+    const vector<Future<ProvisionInfo>>& futures)
 {
   ContainerLaunchInfo launchInfo;
 
@@ -205,7 +224,7 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::_prepare(
       continue;
     }
 
-    sources.push_back(future.get().rootfs);
+    sources.push_back(future->rootfs);
   }
 
   if (!messages.empty()) {
@@ -213,10 +232,12 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::_prepare(
   }
 
   CHECK_EQ(sources.size(), targets.size());
+  CHECK_EQ(sources.size(), volumeModes.size());
 
   for (size_t i = 0; i < sources.size(); i++) {
     const string& source = sources[i];
     const string& target = targets[i];
+    const Volume::Mode volumeMode = volumeModes[i];
 
     LOG(INFO) << "Mounting image volume rootfs '" << source
               << "' to '" << target << "' for container " << containerId;
@@ -226,14 +247,11 @@ Future<Option<ContainerLaunchInfo>> VolumeImageIsolatorProcess::_prepare(
           "Provisioned rootfs '" + source + "' does not exist");
     }
 
-    CommandInfo* command = launchInfo.add_pre_exec_commands();
-    command->set_shell(false);
-    command->set_value("mount");
-    command->add_arguments("mount");
-    command->add_arguments("-n");
-    command->add_arguments("--rbind");
-    command->add_arguments(source);
-    command->add_arguments(target);
+    ContainerMountInfo* mount = launchInfo.add_mounts();
+    mount->set_source(source);
+    mount->set_target(target);
+    mount->set_flags(
+        MS_BIND | MS_REC | (volumeMode == Volume::RO ? MS_RDONLY : 0));
   }
 
   return launchInfo;

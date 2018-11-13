@@ -31,6 +31,7 @@
 #include <tuple>
 #include <vector>
 
+#include <process/after.hpp>
 #include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
@@ -43,7 +44,9 @@
 #include <process/process.hpp>
 #include <process/queue.hpp>
 #include <process/socket.hpp>
+#include <process/state_machine.hpp>
 
+#include <stout/error.hpp>
 #include <stout/foreach.hpp>
 #include <stout/ip.hpp>
 #include <stout/lambda.hpp>
@@ -61,6 +64,7 @@
 
 using std::deque;
 using std::istringstream;
+using std::list;
 using std::map;
 using std::ostream;
 using std::ostringstream;
@@ -72,6 +76,8 @@ using std::vector;
 using process::http::Request;
 using process::http::Response;
 
+namespace inet4 = process::network::inet4;
+
 using process::network::inet::Address;
 using process::network::inet::Socket;
 
@@ -80,8 +86,15 @@ using process::network::internal::SocketImpl;
 namespace process {
 namespace http {
 
+struct StatusDescription {
+  uint16_t code;
+  const char* description;
+};
 
-hashmap<uint16_t, string>* statuses = new hashmap<uint16_t, string> {
+
+// Status code reason strings, from the HTTP1.1 RFC:
+// http://www.w3.org/Protocols/rfc2616/rfc2616-sec6.html
+StatusDescription statuses[] = {
   {100, "100 Continue"},
   {101, "101 Switching Protocols"},
   {200, "200 OK"},
@@ -167,10 +180,36 @@ const uint16_t Status::GATEWAY_TIMEOUT = 504;
 const uint16_t Status::HTTP_VERSION_NOT_SUPPORTED = 505;
 
 
+// Since the status codes are stored in increasing order, we could also
+// use std::lower_bound to do the lookup with logarithmic complexity.
+// However, according to some cursory research, on most CPUs this will
+// be slower until the array size is around 100 elemnts.
+//
+// [1]: https://schani.wordpress.com/2010/04/30/linear-vs-binary-search/
+// [2]: https://stackoverflow.com/questions/1275665/at-which-n-does-binary-search-become-faster-than-linear-search-on-a-modern-cpu
+
 string Status::string(uint16_t code)
 {
-  return http::statuses->get(code)
-    .getOrElse(stringify(code));
+  auto value = std::find_if(
+      std::begin(statuses),
+      std::end(statuses),
+      [code](const StatusDescription& sd) { return sd.code == code; });
+
+  if (value != std::end(statuses)) {
+    return value->description;
+  }
+
+  // Fallback for unknown status codes.
+  return stringify(code);
+}
+
+
+bool isValidStatus(uint16_t code)
+{
+  return std::end(statuses) != std::find_if(
+      std::begin(statuses),
+      std::end(statuses),
+      [code](const StatusDescription& sd) { return sd.code == code; });
 }
 
 
@@ -206,7 +245,7 @@ Try<URL> URL::parse(const string& urlString)
   }
 
   // If path is specified in the URL, try to capture the host and path
-  // seperately.
+  // separately.
   string host = urlPath;
   string path = "/";
   if (pathPos != string::npos) {
@@ -286,7 +325,7 @@ bool Request::acceptsEncoding(const string& encoding) const
   // then the server SHOULD use the "identity" content-coding...
   Option<string> accept = headers.get("Accept-Encoding");
 
-  if (accept.isNone() || accept.get().empty()) {
+  if (accept.isNone() || accept->empty()) {
     return false;
   }
 
@@ -417,26 +456,23 @@ Pipe::Writer Pipe::writer() const
 
 Future<string> Pipe::Reader::read()
 {
-  Future<string> future;
-
   synchronized (data->lock) {
     if (data->readEnd == Reader::CLOSED) {
-      future = Failure("closed");
+      return Failure("closed");
     } else if (!data->writes.empty()) {
-      future = data->writes.front();
+      Future<string> future = data->writes.front();
       data->writes.pop();
+      return future;
     } else if (data->writeEnd == Writer::CLOSED) {
-      future = ""; // End-of-file.
+      return ""; // End-of-file.
     } else if (data->writeEnd == Writer::FAILED) {
       CHECK_SOME(data->failure);
-      future = data->failure.get();
+      return data->failure.get();
     } else {
       data->reads.push(Owned<Promise<string>>(new Promise<string>()));
-      future = data->reads.back()->future();
+      return data->reads.back()->future();
     }
   }
-
-  return future;
 }
 
 
@@ -531,7 +567,7 @@ bool Pipe::Writer::write(string s)
   // NOTE: We set the promise outside the critical section to avoid
   // triggering callbacks that try to reacquire the lock.
   if (read.get() != nullptr) {
-    read->set(std::move(s));
+    read->set(std::move(s)); // NOLINT(misc-use-after-move)
   }
 
   return written;
@@ -597,28 +633,79 @@ Future<Nothing> Pipe::Writer::readerClosed() const
 }
 
 
+namespace header {
+
+Try<WWWAuthenticate> WWWAuthenticate::create(const string& value)
+{
+  // Set `maxTokens` as 2 since auth-param quoted string may
+  // contain space (e.g., "Basic realm="Registry Realm").
+  vector<string> tokens = strings::tokenize(value, " ", 2);
+  if (tokens.size() != 2) {
+    return Error("Unexpected WWW-Authenticate header format: '" + value + "'");
+  }
+
+  hashmap<string, string> authParam;
+  foreach (const string& token, strings::split(tokens[1], ",")) {
+    vector<string> split = strings::split(token, "=");
+    if (split.size() != 2) {
+      return Error(
+          "Unexpected auth-param format: '" +
+          token + "' in '" + tokens[1] + "'");
+    }
+
+    // Auth-param values can be a quoted-string or directive values.
+    // Please see section "3.2.2.4 Directive values and quoted-string":
+    // https://tools.ietf.org/html/rfc2617.
+    authParam[split[0]] = strings::trim(split[1], strings::ANY, "\"");
+  }
+
+  // The realm directive (case-insensitive) is required for all
+  // authentication schemes that issue a challenge.
+  if (!authParam.contains("realm")) {
+    return Error(
+        "Unexpected auth-param '" +
+        tokens[1] + "': 'realm' is not defined");
+  }
+
+  return WWWAuthenticate(tokens[0], authParam);
+}
+
+
+string WWWAuthenticate::authScheme()
+{
+  return authScheme_;
+}
+
+
+hashmap<string, string> WWWAuthenticate::authParam()
+{
+  return authParam_;
+}
+
+} // namespace header {
+
+
 OK::OK(const JSON::Value& value, const Option<string>& jsonp)
   : Response(Status::OK)
 {
   type = BODY;
 
-  std::ostringstream out;
-
   if (jsonp.isSome()) {
-    out << jsonp.get() << "(";
-  }
-
-  out << value;
-
-  if (jsonp.isSome()) {
-    out << ");";
     headers["Content-Type"] = "text/javascript";
+
+    string stringified = stringify(value);
+
+    body.reserve(jsonp->size() + 1 + stringified.size() + 1);
+    body += jsonp.get();
+    body += "(";
+    body += stringified;
+    body += ")";
   } else {
     headers["Content-Type"] = "application/json";
+    body = stringify(value);
   }
 
-  headers["Content-Length"] = stringify(out.str().size());
-  body = out.str().data();
+  headers["Content-Length"] = stringify(body.size());
 }
 
 
@@ -627,22 +714,21 @@ OK::OK(JSON::Proxy&& value, const Option<string>& jsonp)
 {
   type = BODY;
 
-  std::ostringstream out;
-
   if (jsonp.isSome()) {
-    out << jsonp.get() << "(";
-  }
-
-  out << std::move(value);
-
-  if (jsonp.isSome()) {
-    out << ");";
     headers["Content-Type"] = "text/javascript";
+
+    string stringified = std::move(value);
+
+    body.reserve(jsonp->size() + 1 + stringified.size() + 1);
+    body += jsonp.get();
+    body += "(";
+    body += stringified;
+    body += ")";
   } else {
     headers["Content-Type"] = "application/json";
+    body = std::move(value);
   }
 
-  body = out.str();
   headers["Content-Length"] = stringify(body.size());
 }
 
@@ -686,7 +772,7 @@ Try<hashmap<string, string>> parse(const string& pattern, const string& path)
 } // namespace path {
 
 
-string encode(const string& s)
+string encode(const string& s, const string& additional_chars)
 {
   ostringstream out;
 
@@ -726,7 +812,9 @@ string encode(const string& s)
       default:
         // ASCII control characters and non-ASCII characters.
         // NOTE: The cast to unsigned int is needed.
-        if (c < 0x20 || c > 0x7F) {
+        if (c < 0x20 ||
+            c > 0x7F ||
+            additional_chars.find_first_of(c) != string::npos) {
           out << '%' << std::setfill('0') << std::setw(2) << std::hex
               << std::uppercase << (unsigned int) c;
         } else {
@@ -883,9 +971,6 @@ ostream& operator<<(ostream& stream, const URL& url)
 
 namespace internal {
 
-void _encode(Pipe::Reader reader, Pipe::Writer writer); // Forward declaration.
-
-
 // Encodes the request by writing into a pipe, the caller can
 // read the encoded data from the returned read end of the pipe.
 // A pipe is used since the request body can be a pipe and must
@@ -903,7 +988,7 @@ Pipe::Reader encode(const Request& request)
     vector<string> query;
 
     foreachpair (const string& key, const string& value, request.url.query) {
-      query.push_back(key + "=" + value);
+      query.push_back(http::encode(key) + "=" + http::encode(value));
     }
 
     out << "?" << strings::join("&", query);
@@ -981,38 +1066,38 @@ Pipe::Reader encode(const Request& request)
     case Request::PIPE:
       CHECK_SOME(request.reader);
       CHECK(request.body.empty());
-      _encode(request.reader.get(), writer);
+      Pipe::Reader requestReader = request.reader.get();
+      loop(None(),
+           [=]() mutable {
+             return requestReader.read();
+           },
+           [=](const string& chunk) mutable -> ControlFlow<Nothing> {
+             if (chunk.empty()) {
+               // EOF case.
+               writer.write("0\r\n\r\n");
+               writer.close();
+               return Break();
+             }
+
+             std::ostringstream out;
+             out << std::hex << chunk.size() << "\r\n";
+             out << chunk;
+             out << "\r\n";
+
+             writer.write(out.str());
+
+             return Continue();
+           })
+        .onDiscarded([=]() mutable {
+          writer.fail("discarded");
+        })
+        .onFailed([=](const string& failure) mutable {
+          writer.fail(failure);
+        });
       break;
   }
 
   return reader;
-}
-
-
-void _encode(Pipe::Reader reader, Pipe::Writer writer)
-{
-  reader.read()
-    .onAny([reader, writer](const Future<string>& chunk) mutable {
-      if (!chunk.isReady()) {
-        writer.fail(chunk.isFailed() ? chunk.failure() : "discarded");
-        return;
-      }
-
-      if (chunk->empty()) {
-        // EOF case.
-        writer.write("0\r\n\r\n");
-        writer.close();
-        return;
-      }
-
-      std::ostringstream out;
-      out << std::hex << chunk->size() << "\r\n";
-      out << chunk.get();
-      out << "\r\n";
-
-      writer.write(out.str());
-      _encode(reader, writer);
-    });
 }
 
 
@@ -1099,7 +1184,7 @@ public:
 
   Future<Nothing> disconnect(const Option<string>& message = None())
   {
-    Try<Nothing> shutdown = socket.shutdown(
+    Try<Nothing, SocketError> shutdown = socket.shutdown(
         network::Socket::Shutdown::READ_WRITE);
 
     // If a response is still streaming, we send EOF to
@@ -1117,7 +1202,8 @@ public:
 
     disconnection.set(Nothing());
 
-    return shutdown;
+    return shutdown.isSome() ? Future<Nothing>(Nothing())
+                             : Failure(shutdown.error().message);
   }
 
   Future<Nothing> disconnected()
@@ -1126,7 +1212,7 @@ public:
   }
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
     // Start the read loop on the socket. We read independently
     // of the requests being sent in order to detect socket
@@ -1134,7 +1220,7 @@ protected:
     read();
   }
 
-  virtual void finalize()
+  void finalize() override
   {
     disconnect("Connection object was destructed");
   }
@@ -1142,15 +1228,20 @@ protected:
 private:
   static Future<Nothing> _send(network::Socket socket, Pipe::Reader reader)
   {
-    return reader.read()
-      .then([socket, reader](const string& data) mutable -> Future<Nothing> {
-        if (data.empty()) {
-          return Nothing(); // EOF.
-        }
-
-        return socket.send(data)
-          .then(lambda::bind(_send, socket, reader));
-      });
+    return loop(
+        None(),
+        [=]() mutable {
+          return reader.read();
+        },
+        [=](const string& data) mutable -> Future<ControlFlow<Nothing>> {
+          if (data.empty()) {
+            return Break(); // EOF.
+          }
+          return socket.send(data)
+            .then([]() -> ControlFlow<Nothing> {
+              return Continue();
+            });
+        });
   }
 
   void read()
@@ -1295,8 +1386,12 @@ struct Connection::Data
 };
 
 
-Connection::Connection(const network::Socket& s)
-  : data(std::make_shared<Connection::Data>(s)) {}
+Connection::Connection(
+    const network::Socket& s,
+    const network::Address& _localAddress,
+    const network::Address& _peerAddress)
+  : localAddress(_localAddress), peerAddress(_peerAddress),
+    data(std::make_shared<Connection::Data>(s)) {}
 
 
 Future<Response> Connection::send(
@@ -1344,15 +1439,22 @@ Future<Connection> connect(const network::Address& address, Scheme scheme)
   }
 
   Try<network::Socket> socket = network::Socket::create(
-      address.family(), kind);
+      address.family(),
+      kind);
 
   if (socket.isError()) {
     return Failure("Failed to create socket: " + socket.error());
   }
 
   return socket->connect(address)
-    .then([socket]() {
-      return Connection(socket.get());
+    .then([socket, address]() -> Future<Connection> {
+      Try<network::Address> localAddress = socket->address();
+      if (localAddress.isError()) {
+        return Failure("Failed to get socket's local address: " +
+            localAddress.error());
+      }
+
+      return Connection(socket.get(), localAddress.get(), address);
     });
 }
 
@@ -1360,7 +1462,7 @@ Future<Connection> connect(const network::Address& address, Scheme scheme)
 Future<Connection> connect(const URL& url)
 {
   // TODO(bmahler): Move address resolution into the URL class?
-  Address address = Address::ANY_ANY();
+  Address address = inet4::Address::ANY_ANY();
 
   if (url.ip.isNone() && url.domain.isNone()) {
     return Failure("Expected URL.ip or URL.domain to be set");
@@ -1417,7 +1519,7 @@ Future<Nothing> send(network::Socket socket, Encoder* encoder)
           }
           case Encoder::FILE: {
             off_t offset = 0;
-            int fd = static_cast<FileEncoder*>(encoder)->next(&offset, size);
+            int_fd fd = static_cast<FileEncoder*>(encoder)->next(&offset, size);
             return socket.sendfile(fd, offset, *size);
           }
         }
@@ -1468,7 +1570,7 @@ Future<Nothing> sendfile(
   // should be reported and no response sent.
   response.body.clear();
 
-  Try<int> fd = os::open(response.path, O_CLOEXEC | O_NONBLOCK | O_RDONLY);
+  Try<int_fd> fd = os::open(response.path, O_CLOEXEC | O_NONBLOCK | O_RDONLY);
 
   if (fd.isError()) {
     const string body = "Failed to open '" + response.path + "': " + fd.error();
@@ -1478,16 +1580,16 @@ Future<Nothing> sendfile(
     return send(socket, InternalServerError(body), request);
   }
 
-  struct stat s; // Need 'struct' because of function named 'stat'.
-  if (fstat(fd.get(), &s) != 0) {
+  const Try<Bytes> size = os::stat::size(fd.get());
+  if (size.isError()) {
     const string body =
-      "Failed to fstat '" + response.path + "': " + os::strerror(errno);
+      "Failed to fstat '" + response.path + "': " + size.error();
     // TODO(benh): VLOG(1)?
     // TODO(benh): Don't send error back as part of InternalServiceError?
     // TODO(benh): Copy headers from `response`?
     os::close(fd.get());
     return send(socket, InternalServerError(body), request);
-  } else if (S_ISDIR(s.st_mode)) {
+  } else if (os::stat::isdir(fd.get())) {
     const string body = "'" + response.path + "' is a directory";
     // TODO(benh): VLOG(1)?
     // TODO(benh): Don't send error back as part of InternalServiceError?
@@ -1498,7 +1600,7 @@ Future<Nothing> sendfile(
 
   // While the user is expected to properly set a 'Content-Type'
   // header, we'll fill in (or overwrite) 'Content-Length' header.
-  response.headers["Content-Length"] = stringify(s.st_size);
+  response.headers["Content-Length"] = stringify(size->bytes());
 
   // TODO(benh): If this is a TCP socket consider turning on TCP_CORK
   // for both sends and then turning it off.
@@ -1515,7 +1617,7 @@ Future<Nothing> sendfile(
     })
     .then([=]() mutable -> Future<Nothing> {
       // NOTE: the file descriptor gets closed by FileEncoder.
-      Encoder* encoder = new FileEncoder(fd.get(), s.st_size);
+      Encoder* encoder = new FileEncoder(fd.get(), size->bytes());
       return send(socket, encoder)
         .onAny([=]() {
           delete encoder;
@@ -1601,7 +1703,7 @@ Future<Nothing> stream(
     .then([=]() {
       return stream(socket, response.reader.get());
     })
-    // Regardless of whether `send` or `stream` completed succesfully
+    // Regardless of whether `send` or `stream` completed successfully
     // or failed we close the reader so any writers will be notified.
     .onAny([=]() mutable {
       response.reader->close();
@@ -1632,15 +1734,29 @@ Future<Nothing> send(
         Request* request = item->request;
         Future<Response> response = item->response;
 
-        return response
-          // TODO(benh):
-          // .recover([]() {
-          //   return InternalServerError("Discarded response");
-          // })
-          .repair([](const Future<Response>& response) {
-            // TODO(benh): Is this severe enough that we should close
-            // the connection?
-            return InternalServerError(response.failure());
+        // We do an `await` here so that we won't wait forever in the
+        // event that we've discarded the loop but `response` is
+        // abandoned or taking too long.
+        return await(response)
+          .recover([](const Future<Future<Response>>& future)
+              -> Future<Response> {
+            if (future.isFailed()) {
+              return InternalServerError(
+                  "Failed to wait for response: " + future.failure());
+            }
+
+            // Either `response` was abandoned or the loop has been
+            // discarded so we return `ServiceUnavailable` so we can
+            // continue the loop or break out if we've been discarded.
+            return ServiceUnavailable();
+          })
+          .then([](const Future<Response>& future) -> Response {
+            if (future.isFailed()) {
+              return InternalServerError(future.failure());
+            } else if (future.isDiscarded()) {
+              return ServiceUnavailable();
+            }
+            return future.get();
           })
           .then([=](const Response& response) {
             // TODO(benh): Should any generated InternalServerError
@@ -1757,7 +1873,7 @@ Future<Nothing> serve(
         // Either:
         //
         //   (1) An EOF was received.
-        //   (2) A failure occured while receiving.
+        //   (2) A failure occurred while receiving.
         //   (3) Receiving was discarded (likely because serving was
         //       discarded).
         //
@@ -1781,7 +1897,7 @@ Future<Nothing> serve(
         //
         //   (1) HTTP connection is not meant to be persistent or
         //       there are no more items expected in the pipeline.
-        //   (2) A failure occured while sending.
+        //   (2) A failure occurred while sending.
         //   (3) Sending was discarded (likely because serving was
         //       discarded).
         //
@@ -1846,6 +1962,315 @@ Future<Nothing> serve(
 }
 
 } // namespace internal {
+
+
+class ServerProcess : public Process<ServerProcess>
+{
+public:
+  ServerProcess(
+      network::Socket&& socket,
+      std::function<Future<Response>(
+          const network::Socket&,
+          const Request&)>&& f)
+    : socket(std::move(socket)),
+      f(std::move(f)),
+      state(State::INITIALIZED) {}
+
+  // `Server` implementation.
+  Future<Nothing> run()
+  {
+    return state.transition<State::INITIALIZED, State::RUNNING>([=]() {
+        // Start the accept loop and store the future so we can later
+        // discard it when we need to stop the server.
+        accepting = loop(
+          self(),
+          [=]() {
+            return socket.accept();
+          },
+          [=](const network::Socket& socket) -> ControlFlow<Nothing> {
+            // If we've transitioned to STOPPING we should break. It
+            // may seem like we should never get here because we
+            // discard the accept loop before we transition to
+            // STOPPING but it's possible that we've already
+            // dispatched this lambda and it is only now getting
+            // invoked. It's critical that we break because after we
+            // transition to STOPPING we assume that `clients` will
+            // not be modified by the accept loop.
+            if (state.is<State::STOPPING>()) {
+              return Break();
+            }
+
+            Client client = {
+              /* .socket = */ socket,
+              /* .serving = */ http::serve(
+                  socket,
+                  [=](const Request& request) {
+                    return f(socket, request);
+                  })
+            };
+
+            clients.put(socket, client);
+
+            client.serving
+              .onAny(defer(self(), [=](const Future<Nothing>&) {
+                clients.erase(socket);
+              }));
+
+            return Continue();
+          });
+
+      // We return a _discardable_ `accepting` so the caller can stop
+      // running a server by "discarding the run", for example:
+      //
+      //   Future<Nothing> run = server.run();
+      //   run.discard();
+      //
+      // Even if we returned an _undiscardable_ `accepting` we still
+      // need to do a `recover()` on it in the event that the accept
+      // loop fails (or is abandoned) so we can stop the server (if it
+      // isn't already being stopped). If `accepting` completes
+      // successfully then we must be stopping so just wait until
+      // we've stopped!
+      return accepting
+        .then(defer(self(), [=]() {
+          return state.when<State::STOPPED>();
+        }))
+        .recover(defer(self(), [=](const Future<Nothing>& future) {
+          // If the accept loop completes because it is abandoned,
+          // discarded, or failed we want to stop the server if it
+          // isn't already being stopped. In fact, someone stopping
+          // the server might be the reason we're executing this
+          // callback because `stop()` discards `accepting`.
+          //
+          // If we're not already stopping, i.e., the state is
+          // RUNNING, then it's safe to assume that the accept loop
+          // has (1) failed or (2) been discarded because someone did
+          // a discard on the future returned from `run()`. In either
+          // of these cases we initiate a `stop()` ourselves and after
+          // that completes return a failure capturing the reason we
+          // had to initiate the stop.
+          if (state.is<State::RUNNING>()) {
+            return stop(Server::DEFAULT_STOP_OPTIONS())
+              .then([=]() -> Future<Nothing> {
+                return Failure(stringify(future));
+              });
+          }
+
+          // Otherwise we must already be stopping so just wait till
+          // we're stopped.
+          return state.when<State::STOPPED>();
+        }));
+    });
+  }
+
+  Future<Nothing> stop(const Server::StopOptions& options)
+  {
+    return state.transition<State::RUNNING, State::STOPPING>([=]() {
+      // We make stopping be undiscardable to ensure that we properly
+      // cleanup. This has the added benefit of simplifying having to
+      // reason about how discards may propagate here when someone
+      // discards the future returned from `run()` after they've
+      // already called `stop()`.
+      return undiscardable([=]() {
+        accepting.discard();
+
+        // In addition to discarding the accept loop we also attempt
+        // to stop accepting new clients via shutting down the
+        // socket. Shutting down the socket on Linux will keep further
+        // connections from being established even though we haven't
+        // closed the socket but on OS X connections will keep queuing
+        // (in fact, calling `shutdown()` is an error, hence we don't
+        // check the return value).
+        socket.shutdown(network::Socket::Shutdown::READ_WRITE);
+
+        // TODO(benh): ideally we also try and shut down the read end
+        // of existing clients to signal that we won't handle any new
+        // requests. Note that doing this is expected by the
+        // specification, see section 8.1.4 in
+        // https://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html. Something
+        // like:
+        //
+        // foreachvalue (Client& client, clients) {
+        //   client.socket.shutdown(network::Socket::Shutdown::READ);
+        // }
+        //
+        // Doing this is non-trivial, however, because in practice
+        // what most servers do is continue to read any partial
+        // requests until some point at which no more requests appear
+        // to be coming in. This will require significant changes in
+        // `http::serve()`, hence it's left as a TODO.
+
+        // Wait for the current clients to finish (we know no more
+        // clients will get added because we set `stopping` and the
+        // accept loop will respect that (see `run()`).
+        return await(lambda::map(
+            [](Client&& client) {
+              return client.serving;
+            },
+            clients.values()))
+          // After the grace period expires discard all the clients
+          // and then keep waiting.
+          .after(options.grace_period,
+                 defer(self(), [=](Future<vector<Future<Nothing>>> f) {
+                   f.discard();
+                   return await(lambda::map(
+                       [](Client&& client) {
+                         client.serving.discard();
+                         return client.serving;
+                       },
+                       clients.values()));
+                 }))
+          .then(defer(self(), [=]() {
+            clients.clear();
+
+            // We `await()` the accept loop because we don't care how
+            // it completes, we just want it to complete.
+            return await(accepting)
+              .then(defer(self(), [=]() -> Future<Nothing> {
+                return state.transition<State::STOPPING, State::STOPPED>();
+              }));
+          }));
+      }());
+    },
+    "Server must be started in order to be stopped");
+  }
+
+protected:
+  void finalize() override
+  {
+    // If we started the accept loop then discard it and any clients
+    // we are already serving.
+    accepting.discard();
+
+    // NOTE: we know that no more sockets will be accepted because
+    // the accept loop is on `self()` and we're in `finalize()`.
+    foreachvalue (Client& client, clients) {
+      client.serving.discard();
+    }
+
+    clients.clear();
+  }
+
+private:
+  network::Socket socket;
+  std::function<Future<Response>(const network::Socket&, const Request&)> f;
+
+  enum class State
+  {
+    INITIALIZED,
+    RUNNING,
+    STOPPING,
+    STOPPED,
+  };
+
+  StateMachine<State> state;
+
+  Future<Nothing> accepting;
+
+  struct Client
+  {
+    network::Socket socket;
+    Future<Nothing> serving;
+  };
+
+  hashmap<int_fd, Client> clients;
+};
+
+
+Try<Server> Server::create(
+    network::Socket socket,
+    std::function<Future<Response>(const network::Socket&, const Request&)>&& f,
+    const CreateOptions& options)
+{
+  // NOTE: we start listening on the socket here so that a client can
+  // attempt to connect to the server even before `Server::run` has
+  // been called. If we postpone calling `Socket::listen` until we
+  // invoke `Server::run` there is a race between when `Server::run`
+  // returns and when `Socket::listen` actually gets called because
+  // `Server::run` dispatches to `ServerProcess::run`. This is likely
+  // not a problem in practice but is definitely problematic with
+  // tests that try and start making connections immediately after
+  // `Server::run` has returned but potentially before
+  // `Socket::listen` has been invoked.
+  Try<Nothing> listen = socket.listen(static_cast<int>(options.backlog));
+  if (listen.isError()) {
+    return Error("Failed to listen on socket: " + listen.error());
+  }
+
+  return Server(std::move(socket), std::move(f));
+}
+
+
+Try<Server> Server::create(
+    const network::Address& address,
+    std::function<Future<Response>(const network::Socket&, const Request&)>&& f,
+    const Server::CreateOptions& options)
+{
+  SocketImpl::Kind kind = [&]() {
+    switch (options.scheme) {
+      case Scheme::HTTP: return SocketImpl::Kind::POLL;
+#ifdef USE_SSL_SOCKET
+      case Scheme::HTTPS: return SocketImpl::Kind::SSL;
+#endif
+    }
+    UNREACHABLE();
+  }();
+
+  Try<network::Socket> socket = network::Socket::create(
+      address.family(),
+      kind);
+
+  if (socket.isError()) {
+    return Error("Failed to create socket: " + socket.error());
+  }
+
+  Try<network::Address> bind = socket->bind(address);
+  if (bind.isError()) {
+    return Error(
+        "Failed to bind to address '" + stringify(address) + "': "
+        + bind.error());
+  }
+
+  return create(socket.get(), std::move(f), options);
+}
+
+
+Server::Server(
+    network::Socket&& socket,
+    std::function<Future<Response>(const network::Socket&, const Request&)>&& f)
+  : socket(socket),
+    process(new ServerProcess(std::move(socket), std::move(f)))
+{
+  spawn(*process);
+}
+
+
+Server::~Server()
+{
+  // `process` may be a `nullptr` if we've moved `this`.
+  if (process.get() != nullptr) {
+    terminate(*process);
+    wait(*process);
+  }
+}
+
+
+Future<Nothing> Server::run()
+{
+  return dispatch(*process, &ServerProcess::run);
+}
+
+
+Future<Nothing> Server::stop(const Server::StopOptions& options)
+{
+  return dispatch(*process, &ServerProcess::stop, options);
+}
+
+
+Try<network::Address> Server::address() const
+{
+  return socket.address();
+}
 
 
 Request createRequest(

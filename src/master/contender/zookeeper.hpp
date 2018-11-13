@@ -44,14 +44,17 @@ class ZooKeeperMasterContender : public MasterContender
 public:
   // Creates a contender that uses ZooKeeper to determine (i.e.,
   // elect) a leading master.
-  explicit ZooKeeperMasterContender(const zookeeper::URL& url);
+  explicit ZooKeeperMasterContender(
+      const zookeeper::URL& url,
+      const Duration& sessionTimeout = MASTER_CONTENDER_ZK_SESSION_TIMEOUT);
+
   explicit ZooKeeperMasterContender(process::Owned<zookeeper::Group> group);
 
-  virtual ~ZooKeeperMasterContender();
+  ~ZooKeeperMasterContender() override;
 
   // MasterContender implementation.
-  virtual void initialize(const MasterInfo& masterInfo);
-  virtual process::Future<process::Future<Nothing>> contend();
+  void initialize(const MasterInfo& masterInfo) override;
+  process::Future<process::Future<Nothing>> contend() override;
 
 private:
   ZooKeeperMasterContenderProcess* process;

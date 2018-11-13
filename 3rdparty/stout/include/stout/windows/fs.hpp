@@ -19,7 +19,11 @@
 #include <stout/error.hpp>
 #include <stout/nothing.hpp>
 #include <stout/try.hpp>
+#include <stout/windows.hpp>
 
+#include <stout/os/realpath.hpp>
+
+#include <stout/internal/windows/longpath.hpp>
 #include <stout/internal/windows/symlink.hpp>
 
 namespace fs {
@@ -35,8 +39,8 @@ inline Try<Bytes> size(const std::string& path = "/")
   }
 
   ULARGE_INTEGER free_bytes, total_bytes, total_free_bytes;
-  if (::GetDiskFreeSpaceEx(
-          real_path.get().c_str(),
+  if (::GetDiskFreeSpaceExW(
+          internal::windows::longpath(real_path.get()).data(),
           &free_bytes,
           &total_bytes,
           &total_free_bytes) == 0) {
@@ -60,8 +64,8 @@ inline Try<double> usage(const std::string& path = "/")
   }
 
   ULARGE_INTEGER free_bytes, total_bytes, total_free_bytes;
-  if (::GetDiskFreeSpaceEx(
-          real_path.get().c_str(),
+  if (::GetDiskFreeSpaceExW(
+          internal::windows::longpath(real_path.get()).data(),
           &free_bytes,
           &total_bytes,
           &total_free_bytes) == 0) {
@@ -88,41 +92,36 @@ inline Try<Nothing> symlink(
 // `/root/dir/subdir/*.txt` or `/root/dir/subdir/file?.txt`.
 inline Try<std::list<std::string>> list(const std::string& pattern)
 {
+  const std::string dirname(Path(pattern).dirname());
   std::list<std::string> found_files;
-  WIN32_FIND_DATA find_data;
-  const HANDLE search_handle = ::FindFirstFile(pattern.c_str(), &find_data);
+  WIN32_FIND_DATAW found;
+  const SharedHandle search_handle(
+    ::FindFirstFileW(wide_stringify(pattern).data(), &found),
+    ::FindClose);
 
-  if (search_handle == INVALID_HANDLE_VALUE) {
+  if (search_handle.get() == INVALID_HANDLE_VALUE) {
     // For compliance with the POSIX implementation (which uses `::glob`),
     // return an empty list instead of an error when the path does not exist.
-    int error = ::GetLastError();
+    const DWORD error = ::GetLastError();
     if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
       return found_files;
     }
 
-    return WindowsError(
-        "'fs::list' failed when searching for files with pattern '" +
-        pattern + "'");
+    return WindowsError(error, "FindFirstFile failed");
   }
 
   do {
-    const std::string current_file(find_data.cFileName);
+    const std::wstring current_file(found.cFileName);
 
-    // Ignore `.` and `..` entries
-    if (current_file.compare(".") != 0 && current_file.compare("..") != 0) {
-      found_files.push_back(current_file);
+    // Ignore `.` and `..` entries.
+    if (current_file.compare(L".") != 0 && current_file.compare(L"..") != 0) {
+      found_files.push_back(path::join(dirname, stringify(current_file)));
     }
-  } while (::FindNextFile(search_handle, &find_data));
+  } while (::FindNextFileW(search_handle.get(), &found));
 
-  // Cache `FindNextFile` error, `FindClose` will overwrite it
   const DWORD error = ::GetLastError();
-  ::FindClose(search_handle);
-
   if (error != ERROR_NO_MORE_FILES) {
-    return WindowsError(
-        error,
-        "'fs::list': 'FindNextFile' failed when searching for files with "
-        "'pattern '" + pattern + "'");
+    return WindowsError(error, "FindNextFile failed");
   }
 
   return found_files;

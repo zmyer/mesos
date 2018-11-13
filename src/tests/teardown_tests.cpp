@@ -214,50 +214,6 @@ TEST_F(TeardownTest, GoodACLs)
 }
 
 
-// Testing route with deprecated (but still good) ACLs.
-// This ACL/test will be removed at the end of the deprecation cycle on 0.27.
-TEST_F(TeardownTest, GoodDeprecatedACLs)
-{
-  // Setup ACLs so that the default principal can teardown the
-  // framework.
-  ACLs acls;
-  mesos::ACL::ShutdownFramework* acl = acls.add_shutdown_frameworks();
-  acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
-  acl->mutable_framework_principals()->add_values(
-      DEFAULT_CREDENTIAL.principal());
-
-  master::Flags flags = CreateMasterFlags();
-  flags.acls = acls;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
-  ASSERT_SOME(master);
-
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
-
-  Future<FrameworkID> frameworkId;
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureArg<1>(&frameworkId));
-
-  ASSERT_EQ(DRIVER_RUNNING, driver.start());
-
-  AWAIT_READY(frameworkId);
-
-  Future<Response> response = process::http::post(
-      master.get()->pid,
-      "teardown",
-      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-      "frameworkId=" + frameworkId->value());
-
-  AWAIT_READY(response);
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
-
-  driver.stop();
-  driver.join();
-}
-
-
 // Testing route with bad ACLs.
 TEST_F(TeardownTest, BadACLs)
 {
@@ -365,7 +321,7 @@ TEST_F(TeardownTest, NoHeader)
 
 
 // This test checks that the teardown operation can be used on a
-// framework that has not re-registered after master failover.
+// framework that has not reregistered after master failover.
 TEST_F(TeardownTest, RecoveredFrameworkAfterMasterFailover)
 {
   master::Flags masterFlags = CreateMasterFlags();
@@ -393,27 +349,38 @@ TEST_F(TeardownTest, RecoveredFrameworkAfterMasterFailover)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 100");
 
+  Future<TaskStatus> startingStatus;
   Future<TaskStatus> runningStatus;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&startingStatus))
     .WillOnce(FutureArg<1>(&runningStatus));
 
-  Future<Nothing> statusUpdateAck = FUTURE_DISPATCH(
+  Future<Nothing> statusUpdateAck1 = FUTURE_DISPATCH(
+      slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> statusUpdateAck2 = FUTURE_DISPATCH(
       slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(startingStatus);
+  EXPECT_EQ(TASK_STARTING, startingStatus->state());
+  EXPECT_EQ(task.task_id(), startingStatus->task_id());
+
+  AWAIT_READY(statusUpdateAck1);
 
   AWAIT_READY(runningStatus);
   EXPECT_EQ(TASK_RUNNING, runningStatus->state());
   EXPECT_EQ(task.task_id(), runningStatus->task_id());
 
-  AWAIT_READY(statusUpdateAck);
+  AWAIT_READY(statusUpdateAck2);
 
   // Simulate master failover. We leave the scheduler without a master
-  // so it does not attempt to re-register.
+  // so it does not attempt to reregister.
   EXPECT_CALL(sched, disconnected(&driver));
 
   schedDetector.appoint(None());
@@ -430,7 +397,7 @@ TEST_F(TeardownTest, RecoveredFrameworkAfterMasterFailover)
 
   AWAIT_READY(slaveReregisteredMessage);
 
-  // Teardown the framework, which has not yet re-registered with the
+  // Teardown the framework, which has not yet reregistered with the
   // new master.
   {
     Future<Response> response = process::http::post(

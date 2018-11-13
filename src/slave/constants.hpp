@@ -18,6 +18,9 @@
 #define __SLAVE_CONSTANTS_HPP__
 
 #include <stdint.h>
+#include <vector>
+
+#include <mesos/mesos.hpp>
 
 #include <stout/bytes.hpp>
 #include <stout/duration.hpp>
@@ -30,7 +33,16 @@ namespace slave {
 // details in MESOS-1023.
 
 constexpr Duration EXECUTOR_REGISTRATION_TIMEOUT = Minutes(1);
-constexpr Duration EXECUTOR_REREGISTER_TIMEOUT = Seconds(2);
+constexpr Duration EXECUTOR_REREGISTRATION_TIMEOUT = Seconds(2);
+
+// The maximum timeout within which an executor can reregister.
+// Note that this value has to be << 'MIN_AGENT_REREGISTER_TIMEOUT'
+// declared in 'master/constants.hpp'; since agent recovery will only
+// complete after this timeout has elapsed, this ensures that the
+// agent can reregister with the master before it is marked
+// unreachable and its tasks are transitioned to TASK_UNREACHABLE or
+// TASK_LOST.
+constexpr Duration MAX_EXECUTOR_REREGISTRATION_TIMEOUT = Seconds(15);
 
 // The default amount of time to wait for the executor to
 // shut down before destroying the container.
@@ -38,6 +50,8 @@ constexpr Duration DEFAULT_EXECUTOR_SHUTDOWN_GRACE_PERIOD = Seconds(5);
 
 constexpr Duration RECOVERY_TIMEOUT = Minutes(15);
 
+// TODO(gkleiman): Move this to a different file once `TaskStatusUpdateManager`
+// uses `StatusUpdateManagerProcess`. See MESOS-8296.
 constexpr Duration STATUS_UPDATE_RETRY_INTERVAL_MIN = Seconds(10);
 constexpr Duration STATUS_UPDATE_RETRY_INTERVAL_MAX = Minutes(10);
 
@@ -51,12 +65,17 @@ constexpr Duration DEFAULT_REGISTRATION_BACKOFF_FACTOR = Seconds(1);
 // recovery and when it times out slave re-registration.
 constexpr Duration REGISTER_RETRY_INTERVAL_MAX = Minutes(1);
 
-// The maximum interval the slave waits before retrying authentication.
-constexpr Duration AUTHENTICATION_RETRY_INTERVAL_MAX = Minutes(1);
-
-// Default backoff interval used by the slave to wait after failed
-// authentication.
+// Default value for `--authentication_backoff_factor`. The backoff interval
+// factor affects the agent timeout interval after failed authentications.
 constexpr Duration DEFAULT_AUTHENTICATION_BACKOFF_FACTOR = Seconds(1);
+
+// Default value for `--authentication_timeout_min`. The minimum timeout
+// interval the agent waits before retrying authentication.
+constexpr Duration DEFAULT_AUTHENTICATION_TIMEOUT_MIN = Seconds(5);
+
+// Default value for `--authentication_timeout_max`. The maximum timeout
+// interval the agent waits before retrying authentication.
+constexpr Duration DEFAULT_AUTHENTICATION_TIMEOUT_MAX = Minutes(1);
 
 constexpr Duration GC_DELAY = Weeks(1);
 constexpr Duration DISK_WATCH_INTERVAL = Minutes(1);
@@ -71,7 +90,19 @@ constexpr size_t MAX_COMPLETED_FRAMEWORKS = 50;
 // to store in memory.
 constexpr size_t DEFAULT_MAX_COMPLETED_EXECUTORS_PER_FRAMEWORK = 150;
 
+// Maximum number of a container id length, according to the
+// max entry length for directory names on AUFS.
+constexpr size_t MAX_CONTAINER_ID_LENGTH = 242;
+
 // Maximum number of completed tasks per executor to store in memory.
+//
+// NOTE: This should be greater than zero because the agent looks
+// for completed tasks to determine (with false positives) whether
+// an executor ever received tasks. See MESOS-8411.
+//
+// TODO(mzhu): Remove this note once we can determine whether an
+// executor ever received tasks without looking through the
+// completed tasks.
 constexpr size_t MAX_COMPLETED_TASKS_PER_EXECUTOR = 200;
 
 // Default cpus offered by the slave.
@@ -92,11 +123,19 @@ constexpr double DEFAULT_EXECUTOR_CPUS = 0.1;
 // Default memory resource given to a command executor.
 constexpr Bytes DEFAULT_EXECUTOR_MEM = Megabytes(32);
 
-#ifdef WITH_NETWORK_ISOLATOR
+#ifdef ENABLE_PORT_MAPPING_ISOLATOR
 // Default number of ephemeral ports allocated to a container by the
 // network isolator.
 constexpr uint16_t DEFAULT_EPHEMERAL_PORTS_PER_CONTAINER = 1024;
 #endif
+
+// Default UNIX socket (Linux) or Named Pipe (Windows) resource that provides
+// CLI access to the Docker daemon.
+#ifdef __WINDOWS__
+constexpr char DEFAULT_DOCKER_HOST_RESOURCE[] = "//./pipe/docker_engine";
+#else
+constexpr char DEFAULT_DOCKER_HOST_RESOURCE[] = "/var/run/docker.sock";
+#endif // __WINDOWS__
 
 // Default duration that docker containers will be removed after exit.
 constexpr Duration DOCKER_REMOVE_DELAY = Hours(6);
@@ -104,6 +143,9 @@ constexpr Duration DOCKER_REMOVE_DELAY = Hours(6);
 // Default duration to wait before retry inspecting a docker
 // container.
 constexpr Duration DOCKER_INSPECT_DELAY = Seconds(1);
+
+// Default duration to wait for `inspect` command completion.
+constexpr Duration DOCKER_INSPECT_TIMEOUT = Seconds(5);
 
 // Default maximum number of docker inspect calls docker ps will invoke
 // in parallel to prevent hitting system's open file descriptor limit.
@@ -131,15 +173,34 @@ constexpr char READONLY_HTTP_AUTHENTICATION_REALM[] = "mesos-agent-readonly";
 // Name of the agent HTTP authentication realm for read-write endpoints.
 constexpr char READWRITE_HTTP_AUTHENTICATION_REALM[] = "mesos-agent-readwrite";
 
+// Name of the agent HTTP authentication realm for HTTP executors.
+constexpr char EXECUTOR_HTTP_AUTHENTICATION_REALM[] = "mesos-agent-executor";
+
+// Name of the agent HTTP authentication realm for HTTP resource providers.
+constexpr char RESOURCE_PROVIDER_HTTP_AUTHENTICATION_REALM[] =
+  "mesos-agent-resource-provider";
+
 // Default maximum storage space to be used by the fetcher cache.
 constexpr Bytes DEFAULT_FETCHER_CACHE_SIZE = Gigabytes(2);
+
+// Default timeout for the fetcher to wait when a net download stalls.
+constexpr Duration DEFAULT_FETCHER_STALL_TIMEOUT = Minutes(1);
 
 // If no pings received within this timeout, then the slave will
 // trigger a re-detection of the master to cause a re-registration.
 Duration DEFAULT_MASTER_PING_TIMEOUT();
 
 // Name of the executable for default executor.
+#ifdef __WINDOWS__
+constexpr char MESOS_DEFAULT_EXECUTOR[] = "mesos-default-executor.exe";
+#else
 constexpr char MESOS_DEFAULT_EXECUTOR[] = "mesos-default-executor";
+#endif // __WINDOWS__
+
+// Virtual path on which agent logs are mounted in `/files/` endpoint.
+constexpr char AGENT_LOG_VIRTUAL_PATH[] = "/slave/log";
+
+std::vector<SlaveInfo::Capability> AGENT_CAPABILITIES();
 
 } // namespace slave {
 } // namespace internal {

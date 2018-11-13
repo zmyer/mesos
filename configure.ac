@@ -18,7 +18,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [1.2.0])
+AC_INIT([mesos], [1.8.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
@@ -76,66 +76,125 @@ AC_CONFIG_FILES([3rdparty/stout/Makefile])
 AC_CONFIG_FILES([3rdparty/stout/include/Makefile])
 AC_CONFIG_FILES([3rdparty/gmock_sources.cc])
 
-AC_CONFIG_FILES([bin/mesos.sh], [chmod +x bin/mesos.sh])
-AC_CONFIG_FILES([bin/mesos-agent.sh], [chmod +x bin/mesos-agent.sh])
-AC_CONFIG_FILES([bin/mesos-local.sh], [chmod +x bin/mesos-local.sh])
-AC_CONFIG_FILES([bin/mesos-master.sh], [chmod +x bin/mesos-master.sh])
+AC_CONFIG_FILES(
+  [bin/mesos.sh],
+  [chmod +x bin/mesos.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-agent.sh],
+  [chmod +x bin/mesos-agent.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-local.sh],
+  [chmod +x bin/mesos-local.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-master.sh],
+  [chmod +x bin/mesos-master.sh])
 # TODO(tomxing): Remove this script once the
 # slave->agent rename is complete(MESOS-3782).
-AC_CONFIG_FILES([bin/mesos-slave.sh:bin/mesos-agent.sh.in],
+AC_CONFIG_FILES(
+  [bin/mesos-slave.sh:bin/mesos-agent.sh.in],
   [chmod +x bin/mesos-slave.sh])
-AC_CONFIG_FILES([bin/mesos-tests.sh], [chmod +x bin/mesos-tests.sh])
-AC_CONFIG_FILES([bin/mesos-agent-flags.sh])
-AC_CONFIG_FILES([bin/mesos-local-flags.sh])
-AC_CONFIG_FILES([bin/mesos-master-flags.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-tests.sh],
+  [chmod +x bin/mesos-tests.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-agent-flags.sh],
+  [chmod +x bin/mesos-agent-flags.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-local-flags.sh],
+  [chmod +x bin/mesos-local-flags.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-master-flags.sh],
+  [chmod +x bin/mesos-master-flags.sh])
 # TODO(tomxing): Remove this script once the
 # slave->agent rename is complete(MESOS-3782).
-AC_CONFIG_FILES([bin/mesos-slave-flags.sh:bin/mesos-agent-flags.sh.in])
-AC_CONFIG_FILES([bin/mesos-tests-flags.sh])
-AC_CONFIG_FILES([bin/gdb-mesos-agent.sh], [chmod +x bin/gdb-mesos-agent.sh])
-AC_CONFIG_FILES([bin/gdb-mesos-local.sh], [chmod +x bin/gdb-mesos-local.sh])
-AC_CONFIG_FILES([bin/gdb-mesos-master.sh], [chmod +x bin/gdb-mesos-master.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-slave-flags.sh:bin/mesos-agent-flags.sh.in],
+  [chmod +x bin/mesos-slave-flags.sh])
+AC_CONFIG_FILES(
+  [bin/mesos-tests-flags.sh],
+  [chmod +x bin/mesos-tests-flags.sh])
+AC_CONFIG_FILES(
+  [bin/gdb-mesos-agent.sh],
+  [chmod +x bin/gdb-mesos-agent.sh])
+AC_CONFIG_FILES(
+  [bin/gdb-mesos-local.sh],
+  [chmod +x bin/gdb-mesos-local.sh])
+AC_CONFIG_FILES(
+  [bin/gdb-mesos-master.sh],
+  [chmod +x bin/gdb-mesos-master.sh])
 # TODO(tomxing): Remove this script once the
 # slave->agent rename is complete(MESOS-3782).
-AC_CONFIG_FILES([bin/gdb-mesos-slave.sh:bin/gdb-mesos-agent.sh.in],
+AC_CONFIG_FILES(
+  [bin/gdb-mesos-slave.sh:bin/gdb-mesos-agent.sh.in],
   [chmod +x bin/gdb-mesos-slave.sh])
-AC_CONFIG_FILES([bin/gdb-mesos-tests.sh], [chmod +x bin/gdb-mesos-tests.sh])
-AC_CONFIG_FILES([bin/lldb-mesos-agent.sh], [chmod +x bin/lldb-mesos-agent.sh])
-AC_CONFIG_FILES([bin/lldb-mesos-local.sh], [chmod +x bin/lldb-mesos-local.sh])
-AC_CONFIG_FILES([bin/lldb-mesos-master.sh],
+AC_CONFIG_FILES(
+  [bin/gdb-mesos-tests.sh],
+  [chmod +x bin/gdb-mesos-tests.sh])
+AC_CONFIG_FILES(
+  [bin/lldb-mesos-agent.sh],
+  [chmod +x bin/lldb-mesos-agent.sh])
+AC_CONFIG_FILES(
+  [bin/lldb-mesos-local.sh],
+  [chmod +x bin/lldb-mesos-local.sh])
+AC_CONFIG_FILES(
+  [bin/lldb-mesos-master.sh],
   [chmod +x bin/lldb-mesos-master.sh])
 # TODO(tomxing): Remove this script once the
 # slave->agent rename is complete(MESOS-3782).
-AC_CONFIG_FILES([bin/lldb-mesos-slave.sh:bin/lldb-mesos-agent.sh.in],
+AC_CONFIG_FILES(
+  [bin/lldb-mesos-slave.sh:bin/lldb-mesos-agent.sh.in],
   [chmod +x bin/lldb-mesos-slave.sh])
-AC_CONFIG_FILES([bin/lldb-mesos-tests.sh], [chmod +x bin/lldb-mesos-tests.sh])
-AC_CONFIG_FILES([bin/valgrind-mesos-agent.sh],
+AC_CONFIG_FILES(
+  [bin/lldb-mesos-tests.sh],
+  [chmod +x bin/lldb-mesos-tests.sh])
+AC_CONFIG_FILES(
+  [bin/valgrind-mesos-agent.sh],
   [chmod +x bin/valgrind-mesos-agent.sh])
-AC_CONFIG_FILES([bin/valgrind-mesos-local.sh],
+AC_CONFIG_FILES(
+  [bin/valgrind-mesos-local.sh],
   [chmod +x bin/valgrind-mesos-local.sh])
-AC_CONFIG_FILES([bin/valgrind-mesos-master.sh],
+AC_CONFIG_FILES(
+  [bin/valgrind-mesos-master.sh],
   [chmod +x bin/valgrind-mesos-master.sh])
 # TODO(tomxing): Remove this script once the
 # slave->agent rename is complete(MESOS-3782).
-AC_CONFIG_FILES([bin/valgrind-mesos-slave.sh:bin/valgrind-mesos-agent.sh.in],
+AC_CONFIG_FILES(
+  [bin/valgrind-mesos-slave.sh:bin/valgrind-mesos-agent.sh.in],
   [chmod +x bin/valgrind-mesos-slave.sh])
-AC_CONFIG_FILES([bin/valgrind-mesos-tests.sh],
+AC_CONFIG_FILES(
+  [bin/valgrind-mesos-tests.sh],
   [chmod +x bin/valgrind-mesos-tests.sh])
-AC_CONFIG_FILES([src/deploy/mesos-daemon.sh])
-AC_CONFIG_FILES([src/deploy/mesos-start-agents.sh])
-AC_CONFIG_FILES([src/deploy/mesos-start-cluster.sh])
-AC_CONFIG_FILES([src/deploy/mesos-start-masters.sh])
+AC_CONFIG_FILES(
+  [src/deploy/mesos-daemon.sh],
+  [chmod +x src/deploy/mesos-daemon.sh])
+AC_CONFIG_FILES(
+  [src/deploy/mesos-start-agents.sh],
+  [chmod +x src/deploy/mesos-start-agents.sh])
+AC_CONFIG_FILES(
+  [src/deploy/mesos-start-cluster.sh],
+  [chmod +x src/deploy/mesos-start-cluster.sh])
+AC_CONFIG_FILES(
+  [src/deploy/mesos-start-masters.sh],
+  [chmod +x src/deploy/mesos-start-masters.sh])
 # TODO(tomxing): Remove this script once the
 # slave->agent rename is complete(MESOS-3782).
 AC_CONFIG_FILES(
-  [src/deploy/mesos-start-slaves.sh:src/deploy/mesos-start-agents.sh.in])
-AC_CONFIG_FILES([src/deploy/mesos-stop-agents.sh])
-AC_CONFIG_FILES([src/deploy/mesos-stop-cluster.sh])
-AC_CONFIG_FILES([src/deploy/mesos-stop-masters.sh])
+  [src/deploy/mesos-start-slaves.sh:src/deploy/mesos-start-agents.sh.in],
+  [chmod +x src/deploy/mesos-start-slaves.sh])
+AC_CONFIG_FILES(
+  [src/deploy/mesos-stop-agents.sh],
+  [chmod +x src/deploy/mesos-stop-agents.sh])
+AC_CONFIG_FILES(
+  [src/deploy/mesos-stop-cluster.sh],
+  [chmod +x src/deploy/mesos-stop-cluster.sh])
+AC_CONFIG_FILES(
+  [src/deploy/mesos-stop-masters.sh],
+  [chmod +x src/deploy/mesos-stop-masters.sh])
 # TODO(tomxing): Remove this script once the
 # slave->agent rename is complete(MESOS-3782).
 AC_CONFIG_FILES(
-  [src/deploy/mesos-stop-slaves.sh:src/deploy/mesos-stop-agents.sh.in])
+  [src/deploy/mesos-stop-slaves.sh:src/deploy/mesos-stop-agents.sh.in],
+  [chmod +x src/deploy/mesos-stop-slaves.sh])
 
 AC_CONFIG_FILES([include/mesos/version.hpp])
 
@@ -148,11 +207,6 @@ AC_CONFIG_FILES([mpi/mpiexec-mesos], [chmod +x mpi/mpiexec-mesos])
 # Optional features.
 ###############################################################################
 
-AC_ARG_ENABLE([hardening],
-              AS_HELP_STRING([--disable-hardening],
-                             [disables security measures such as stack
-                             protection and position independent library code]),
-                             [], [enable_hardening=yes])
 
 AC_ARG_ENABLE([bundled],
               AS_HELP_STRING([--disable-bundled],
@@ -184,18 +238,19 @@ AC_ARG_ENABLE([bundled-wheel],
 AC_ARG_ENABLE([debug],
               AS_HELP_STRING([--enable-debug],
                              [enable debugging. If CFLAGS/CXXFLAGS are set, this
-                              option won't change them]),
+                              option will not change them]),
               [], [enable_debug=no])
 
-AC_ARG_ENABLE([java],
-              AS_HELP_STRING([--disable-java],
-                             [don't build Java bindings]),
-              [], [enable_java=yes])
+AC_ARG_ENABLE([gc-unused],
+              AS_HELP_STRING([--enable-gc-unused],
+                             [enable garbage collection of unused program segments]),
+                             [], [enable_gc_unused=no])
 
-AC_ARG_ENABLE([libevent],
-              AS_HELP_STRING([--enable-libevent],
-                             [use libevent instead of libev]),
-              [], [enable_libevent=no])
+AC_ARG_ENABLE([hardening],
+              AS_HELP_STRING([--disable-hardening],
+                             [disables security measures such as stack
+                             protection and position independent library code]),
+                             [], [enable_hardening=yes])
 
 AC_ARG_ENABLE([install-module-dependencies],
               AS_HELP_STRING([--enable-install-module-dependencies],
@@ -203,20 +258,85 @@ AC_ARG_ENABLE([install-module-dependencies],
                               for module development]),
               [], [enable_install_module_dependencies=no])
 
+AC_ARG_ENABLE([network-ports-isolator],
+              AS_HELP_STRING([--enable-network-ports-isolator],
+                             [enable network ports isolator]),
+              [], [enable_network_ports_isolator=no])
+
+AC_ARG_ENABLE([java],
+              AS_HELP_STRING([--disable-java],
+                             [do not build Java bindings]),
+              [], [enable_java=yes])
+
+# TODO(bevers): Eventually make this enabled by default.
+AC_ARG_ENABLE([jemalloc-allocator],
+               AS_HELP_STRING([--enable-jemalloc-allocator],
+                              [Use jemalloc as the default memory allocator for the
+                               mesos-master and mesos-agent binaries.]),
+               [], [enable_jemalloc_allocator=no])
+
+# TODO(benh): Eventually make this enabled by default.
+AC_ARG_ENABLE([last_in_first_out_fixed_size_semaphore],
+              AS_HELP_STRING([--enable-last-in-first-out-fixed-size-semaphore],
+                             [enables the optimized LIFO fixed-size semaphore in libprocess]),
+                             [], [enable_last_in_first_out_fixed_size_semaphore=no])
+
+AC_ARG_ENABLE([libevent],
+              AS_HELP_STRING([--enable-libevent],
+                             [use libevent instead of libev]),
+              [], [enable_libevent=no])
+
+# TODO(benh): Eventually make this enabled by default.
+AC_ARG_ENABLE([lock_free_event_queue],
+              AS_HELP_STRING([--enable-lock-free-event-queue],
+                             [enables the lock-free event queue in libprocess]),
+                             [], [enable_lock_free_event_queue=no])
+
+# TODO(benh): Eventually make this enabled by default.
+AC_ARG_ENABLE([lock_free_run_queue],
+              AS_HELP_STRING([--enable-lock-free-run-queue],
+                             [enables the lock-free run queue in libprocess]),
+                             [], [enable_lock_free_run_queue=no])
+
+AC_ARG_ENABLE([new_cli],
+              AS_HELP_STRING([--enable-new-cli],
+                             [enable building the new CLI instead of the old one]),
+              [], [enable_new_cli=no])
+
+AC_ARG_ENABLE([libtool-wrappers],
+              AS_HELP_STRING([--disable-libtool-wrappers],
+                             [Directly create binaries instead of libtool
+                              wrapper scripts to prevent relinking when first
+                              executing binaries from the build directory. This
+                              flag leads to binaries with the build directory
+                              encoded in the executables' RPATH which makes them
+                              in general unfit for installation.
+                              USE WITH CARE.]))
+
 AC_ARG_ENABLE([optimize],
               AS_HELP_STRING([--enable-optimize],
                              [enable optimizations. If CFLAGS/CXXFLAGS are set,
-                              this option won't change them]),
+                              this option will not change them]),
               [], [enable_optimize=no])
+
+AC_ARG_ENABLE([parallel_test_execution],
+              AS_HELP_STRING([--disable-parallel-test-execution],
+                             [disable the parallel runner used during make check]),
+              [], [enable_parallel_test_execution=yes])
 
 AC_ARG_ENABLE([perftools],
               AS_HELP_STRING([--enable-perftools],
                              [enable Google perftools]),
               [], [enable_perftools=no])
 
+AC_ARG_ENABLE([port-mapping-isolator],
+              AS_HELP_STRING([--enable-port-mapping-isolator],
+                             [enable port mapping network isolator]),
+              [], [enable_port_mapping_isolator=no])
+
 AC_ARG_ENABLE([python],
               AS_HELP_STRING([--disable-python],
-                             [don't build Python bindings]),
+                             [do not build Python bindings]),
               [], [enable_python=yes])
 
 # This is used to make distcheck and python install work together. For more
@@ -245,21 +365,14 @@ AC_ARG_ENABLE([tests-install],
                              [build and install tests and their helper tools]),
               [], [enable_tests_install=no])
 
+AC_ARG_ENABLE([werror],
+              AS_HELP_STRING([--disable-werror],
+                             [do not treat compiler warnings as fatal errors]))
+
 AC_ARG_ENABLE([xfs-disk-isolator],
               AS_HELP_STRING([--enable-xfs-disk-isolator],
                              [builds the XFS disk isolator]),
               [], [enable_xfs_disk_isolator=no])
-
-AC_ARG_ENABLE([zlib],
-            AS_HELP_STRING([--disable-zlib],
-                           [disables zlib compression, which means the webui
-                           will be far less responsive; not recommended]),
-            [], [enable_zlib=yes])
-
-AC_ARG_ENABLE([parallel_test_execution],
-              AS_HELP_STRING([--enable-parallel-test-execution],
-                             [execute tests in parallel where possible]),
-            [], [enable_parallel_test_execution=no])
 
 ###############################################################################
 # Optional packages.
@@ -276,6 +389,13 @@ AC_ARG_WITH([boost],
                            package in lieu of an installed version at a
                            location prefixed by the given path]),
             [without_bundled_boost=yes], [])
+
+AC_ARG_WITH([concurrentqueue],
+            AS_HELP_STRING([--with-concurrentqueue@<:@=DIR@:>@],
+                           [excludes building and using the bundled concurrentqueue
+                           package in lieu of an installed version at a
+                           location prefixed by the given path]),
+            [without_bundled_concurrentqueue=yes], [])
 
 AC_ARG_WITH([curl],
             AS_HELP_STRING([--with-curl=@<:@=DIR@:>@],
@@ -303,12 +423,26 @@ AC_ARG_WITH([gmock],
                             location prefixed by the given path]),
             [without_bundled_gmock=yes], [])
 
+AC_ARG_WITH([grpc],
+            AS_HELP_STRING([--with-grpc@<:@=DIR@:>@],
+                           [excludes building and using the bundled grpc
+                            package in lieu of an installed version at a
+                            location prefixed by the given path]),
+            [without_bundled_grpc=yes], [])
+
 AC_ARG_WITH([http-parser],
             AS_HELP_STRING([--with-http-parser@<:@=DIR@:>@],
                            [excludes building and using the bundled http-parser
                            package in lieu of an installed version at a
                            location prefixed by the given path]),
             [without_bundled_http_parser=yes], [])
+
+AC_ARG_WITH([jemalloc],
+            AS_HELP_STRING([--with-jemalloc@<:@=DIR@:>@],
+                          [excludes building and using the bundled jemalloc
+                          package in lieu of an installed version at a
+                          location prefixed by the given path.]),
+            [without_bundled_jemalloc=yes], [])
 
 AC_ARG_WITH([leveldb],
             AS_HELP_STRING([--with-leveldb@<:@=DIR@:>@],
@@ -327,25 +461,24 @@ AC_ARG_WITH([libev],
 AC_ARG_WITH([libevent],
             AS_HELP_STRING([--with-libevent=@<:@=DIR@:>@],
                            [specify where to locate the libevent library]),
-            [], [])
+            [without_bundled_libevent=yes], [])
+
+AC_ARG_WITH([libarchive],
+            AS_HELP_STRING([--with-libarchive=@<:@=DIR@:>@],
+                           [specify where to locate the libarchive library]),
+            [without_bundled_libarchive=yes], [])
 
 AC_ARG_WITH([libprocess],
             AS_HELP_STRING([--with-libprocess=@<:@=DIR@:>@],
                            [specify where to locate the libprocess library]),
             [], [])
 
-# TODO(MESOS-4991): Since network-isolator is an optional feature, it should
-# be enabled with --enable-network-isolator.
 AC_ARG_WITH([network-isolator],
             AS_HELP_STRING([--with-network-isolator],
                            [builds the network isolator]),
-            [], [with_network_isolator=no])
-
-AC_ARG_WITH([nl],
-            AS_HELP_STRING([--with-nl=@<:@DIR@:>@],
-                           [specify where to locate the libnl3 library
-                            (required for network-isolator). [default: /usr]]),
-            [], [])
+            [AC_MSG_WARN([--with-network-isolator is being deprecated, please use --enable-port-mapping-isolator instead.]);
+             enable_port_mapping_isolator=yes],
+            [])
 
 AC_ARG_WITH([nvml],
             AS_HELP_STRING([--with-nvml@<:@=DIR@:>@],
@@ -360,6 +493,13 @@ AC_ARG_WITH([picojson],
                            package in lieu of an installed version at a
                            location prefixed by the given path]),
             [without_bundled_picojson=yes], [])
+
+AC_ARG_WITH([rapidjson],
+            AS_HELP_STRING([--with-rapidjson@<:@=DIR@:>@],
+                           [excludes building and using the bundled rapidjson
+                           package in lieu of an installed version at a
+                           location prefixed by the given path]),
+            [without_bundled_rapidjson=yes], [])
 
 AC_ARG_WITH([protobuf],
             AS_HELP_STRING([--with-protobuf@<:@=DIR@:>@],
@@ -412,7 +552,7 @@ AM_CONDITIONAL([OPTIMIZE], [test x"$enable_optimize" = "xyes"])
 
 debug_flags="-g1"
 if test "x$enable_debug" = "xyes"; then
-  debug_flags="-g"
+  debug_flags="-g -fno-omit-frame-pointer"
 elif test "x$enable_optimize" = "xyes"; then
   debug_flags=""
 fi
@@ -433,34 +573,73 @@ AS_IF([test "x${ac_cv_env_CXXFLAGS_set}" = "x"],
 # Compiler checks.
 ###############################################################################
 
+# Check if we should use the LIFO fixed-size semaphore.
+AS_IF([test "x$enable_last_in_first_out_fixed_size_semaphore" = "xyes"],
+      [AC_DEFINE([LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE])])
+
+# Check if we should use the lock-free event queue.
+AS_IF([test "x$enable_lock_free_event_queue" = "xyes"],
+      [AC_DEFINE([LOCK_FREE_EVENT_QUEUE])])
+
+# Check if we should use the lock-free run queue.
+AS_IF([test "x$enable_lock_free_run_queue" = "xyes"],
+      [AC_DEFINE([LOCK_FREE_RUN_QUEUE])])
+
+# Check if we should link the mesos binaries against jemalloc.
+AM_CONDITIONAL([ENABLE_JEMALLOC_ALLOCATOR],
+         [test x"$enable_jemalloc_allocator" = "xyes"])
+
 # Check to see if we should harden or not.
 AM_CONDITIONAL([ENABLE_HARDENING], [test x"$enable_hardening" = "xyes"])
 
+AC_MSG_CHECKING([whether to enable GC of unused sections])
+AC_MSG_RESULT([$enable_gc_unused])
+
+AS_IF([test "x$enable_gc_unused" = "xyes"], [
+  AC_LANG_PUSH([C++])
+  saved_CXXFLAGS="$CXXFLAGS"
+  saved_LDFLAGS="$LDFLAGS"
+
+  CXXFLAGS="-ffunction-sections -fdata-sections"
+  LDFLAGS="-Wl,--gc-sections"
+  AC_LINK_IFELSE(
+    [ AC_LANG_PROGRAM([], [return 0;]) ],
+    [],
+    [
+      AC_MSG_ERROR([cannot enable GC of unused sections
+-------------------------------------------------------------------
+The current toolchain does not support the necessary options to
+enable garbage collection of unused sections.
+-------------------------------------------------------------------
+      ])
+    ]
+  )
+
+  CXXFLAGS="$saved_CXXFLAGS"
+  LDFLAGS="$saved_LDFLAGS"
+  AC_LANG_POP()
+])
+
+AS_IF([test "x${enable_gc_unused}" = "xyes"], [
+  CCFLAGS="$CCFLAGS -ffunction-sections -fdata-sections"
+  CXXFLAGS="$CXXFLAGS -ffunction-sections -fdata-sections"
+  LDFLAGS="$LDFLAGS -Wl,--gc-sections"
+])
+
 AS_CASE($ax_cv_cxx_compiler_vendor,
   [clang], [
-    # Check if -Wno-unused-local-typedef is needed by checking a sample
-    # compilation which contains a local unused typedef.
-    # This is needed because Boost 1.53.0 fails to compile with upstream
-    # Clang 3.6 without -Wno-unused-local-typedef. Apple LLVM based on
-    # Clang 3.6 doesn't have the same behavior.
-    AC_LANG_PUSH([C++])
-    AC_COMPILE_IFELSE(
-    [AC_LANG_SOURCE([[
-      #pragma clang diagnostic error "-Wunused-local-typedef"
-
-      int foo()
-      {
-        typedef int return_type;
-        return 5;
-      }
-    ]])],
-    [warn_local_typedefs=no], [warn_local_typedefs=yes])
-    AC_LANG_POP([C++])
-
-    if test "x$warn_local_typedefs" = "xyes"; then
-      AC_MSG_NOTICE([Disabling warnings about unused local typedefs])
-      CXXFLAGS="${CXXFLAGS} -Wno-unused-local-typedef"
-    fi
+    # Upstream Clang 3.6 emits `-Wunused-local-typedef` warnings when compiling
+    # Boost so we suppress them here. Apple LLVM based on Clang 3.6 doesn't have
+    # the same behavior. See: https://reviews.apache.org/r/32749/
+    # NOTE(chhsiao): Clang 3.6.0 from the link below seems to compile Boost
+    # 1.53.0/1.65.0 just fine: http://releases.llvm.org/download.html#3.6.0
+    #
+    # Clang 3.6+ emits `-Winconsistent-missing-override` warnings for most uses
+    # of the Google Mock `MOCK_METHOD` family of macros so we suppress them
+    # here. See: https://github.com/google/googletest/issues/533
+    AX_APPEND_COMPILE_FLAGS([-Wno-unused-local-typedef \
+                             -Wno-inconsistent-missing-override],
+                            [CXXFLAGS], [-Werror])
   ], [gnu], [
     # Check for GCC version >= 4.8.
     AX_COMPARE_VERSION([$ax_cv_cxx_compiler_version], [ge], [4.8],
@@ -471,9 +650,8 @@ AS_CASE($ax_cv_cxx_compiler_vendor,
     fi
 
     AC_MSG_NOTICE([Setting up CXXFLAGS for g++ version >= 4.8])
-    # Boost 1.53.0 fails to compile with GCC 4.8 without
-    # -Wno-unused-local-typedefs, and automake does not recognize the
-    # flag.
+    # Boost fails to compile with GCC 4.8+ without `-Wno-unused-local-typedefs`,
+    # and automake does not recognize the flag.
     # TODO(brenden): Remove this when Boost has a resolution.
     CFLAGS="${CFLAGS} -Wno-unused-local-typedefs"
     CXXFLAGS="${CXXFLAGS} -Wno-unused-local-typedefs"
@@ -542,9 +720,6 @@ case "$host_os" in
     if test "x$ax_cv_cxx_compiler_vendor" = "xclang"; then
       CXXFLAGS="$CXXFLAGS -stdlib=libc++"
     fi
-
-    # GTEST on OSX and FreeBSD needs its own tr1 tuple.
-    CXXFLAGS="$CXXFLAGS -DGTEST_USE_OWN_TR1_TUPLE=1 -DGTEST_LANG_CXX11"
     ;;
   freebsd* )
     # If we're using clang, we need to pass -stdlib=libc++ too.
@@ -577,7 +752,9 @@ AC_ARG_VAR([MAVEN_HOME], [looks for mvn at MAVEN_HOME/bin/mvn])
 
 AC_ARG_VAR([PROTOBUF_JAR], [full path to protobuf jar on prefixed builds])
 
-AC_ARG_VAR([PYTHON], [which Python interpreter to use])
+AC_ARG_VAR([PYTHON], [which Python 2 interpreter to use])
+
+AC_ARG_VAR([PYTHON_3], [which Python 3 interpreter to use])
 
 AC_ARG_VAR([TEST_DRIVER], [executable and arguments of a test driver])
 
@@ -595,7 +772,7 @@ AM_CONDITIONAL([ENABLE_STATIC_LIBPROCESS], [true])
 
 AC_MSG_NOTICE([Setting up build environment for ${target_cpu} ${target_os}])
 # Determine the current OS (TODO(benh): Does autotools do this for us?).
-case "${target_os}" in
+case "${host_os}" in
   linux*)
     OS_NAME=linux
     LIBS="$LIBS -lrt"
@@ -609,6 +786,9 @@ case "${target_os}" in
   *)
     AC_MSG_ERROR("Mesos is currently unsupported on your platform.")
 esac
+
+AM_CONDITIONAL([DISABLE_LIBTOOL_WRAPPERS],
+               [test x"$enable_libtool_wrappers" = "xno"])
 
 # Used for conditionally including source files.
 AM_CONDITIONAL([OS_LINUX], [test "x$OS_NAME" = "xlinux"])
@@ -638,6 +818,12 @@ AS_IF([test "x$enable_parallel_test_execution" = "xyes"],
       [AC_SUBST([TEST_DRIVER],
        '${abs_top_srcdir}/support/mesos-gtest-runner.py'[' --sequential='*ROOT_*'']]))
 
+# Define `WERROR` if the use of `-Werror` was not disabled, leave
+# unset otherwise. An unset variable evaluates to an empty string
+# in autoconf's substitution.
+AS_IF([test "x$enable_werror" != "xno"],
+      [AC_SUBST([WERROR], [-Werror])])
+
 # Check for libunwind, and link it in if present.
 if test "x$OS_NAME" = "xfreebsd"; then
   AC_CHECK_LIB(execinfo, backtrace, LIBS="$LIBS -lexecinfo")
@@ -655,13 +841,6 @@ if test "x$found_gflags" = "xyes"; then
 else
   GFLAGS_LIBS=""
 fi
-
-AC_CHECK_LIB([z], [gzread], [],
-             [AC_MSG_ERROR([cannot find libz
--------------------------------------------------------------------
-libz is required for mesos to build.
--------------------------------------------------------------------
-])])
 
 AC_CHECK_TOOL([PATCHCOMMAND_TEST], [patch], [], [$PATH])
 if test -z "`echo $PATCHCOMMAND_TEST`"; then
@@ -709,10 +888,12 @@ fi
 # suffixes. We include /include/apr-1 because we include <apr*>
 # headers directly.
 if test -n "`echo $with_apr`" ; then
-    CPPFLAGS="-I${with_apr}/include/apr-1 -I${with_apr}/include/apr-1.0 $CPPFLAGS"
+    CPPFLAGS="-I${with_apr}/include/apr-1 \
+              -I${with_apr}/include/apr-1.0 $CPPFLAGS"
     LDFLAGS="-L${with_apr}/lib $LDFLAGS"
 else
-    CPPFLAGS="-I/usr/include/apr-1 -I/usr/include/apr-1.0 $CPPFLAGS"
+    CPPFLAGS="-I/usr/include/apr-1 -I/usr/include/apr-1.0	\
+      $CPPFLAGS"
 fi
 
 AC_CHECK_HEADERS([apr_pools.h],
@@ -727,12 +908,8 @@ libapr-1 is required for mesos to build.
 -------------------------------------------------------------------
 ])])
 
-
-# We use "-isystem" instead of "-I" to add Boost to the include search
-# path. This disables compiler warnings inside Boost headers since we
-# can't easily fix them. See MESOS-3799.
 if test -n "`echo $with_boost`"; then
-  CPPFLAGS="$CPPFLAGS -isystem ${with_boost}/include"
+  CPPFLAGS="$CPPFLAGS -I${with_boost}/include"
 fi
 
 # Check if user has asked us to use a preinstalled Boost, or if they
@@ -762,6 +939,40 @@ else
 fi
 
 AM_CONDITIONAL([WITH_BUNDLED_BOOST], [test "x$with_bundled_boost" = "xyes"])
+
+if test -n "`echo $with_concurrentqueue`"; then
+  CPPFLAGS="-I${with_concurrentqueue} $CPPFLAGS"
+fi
+
+
+# Check if user has asked us to use a preinstalled concurrentqueue,
+# or if they asked us to ignore all bundled libraries while compiling
+# and linking.
+if test "x$without_bundled_concurrentqueue" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([concurrentqueue.h], [found_concurrentqueue=yes])
+
+  if test "x$found_concurrentqueue" = "xyes"; then
+    with_bundled_concurrentqueue=no
+  else
+    AC_MSG_ERROR([cannot find concurrentqueue
+-------------------------------------------------------------------
+You have requested the use of a non-bundled concurrentqueue but no
+suitable concurrentqueue could be found.
+
+You may want specify the location of concurrentqueue by providing a
+prefix path via --with-concurrentqueue=DIR, or check that the path
+you provided is correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_concurrentqueue=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_CONCURRENTQUEUE],
+               [test "x$with_bundled_concurrentqueue" = "xyes"])
 
 
 # Check if Libcurl prefix path was provided, and if so, add it to
@@ -855,8 +1066,8 @@ GTESTSRC="gtest-all.cc"
 
 if test -n "`echo $with_gmock`"; then
   CPPFLAGS="$CPPFLAGS -I${with_gmock} -I${with_gmock}/include \
-    -I${with_gmock}/src -I${with_gmock}/gtest -I${with_gmock}/gtest/include \
-    -I${with_gmock}/gtest/src"
+    -I${with_gmock}/src -I${with_gmock}/gtest \
+    -I${with_gmock}/gtest/include -I${with_gmock}/gtest/src"
 
 elif test "x$enable_bundled" != "xyes"; then
   CPPFLAGS="$CPPFLAGS -I/usr/src/gmock"
@@ -944,6 +1155,64 @@ fi
 AM_CONDITIONAL([WITH_BUNDLED_HTTP_PARSER],
                [test "x$with_bundled_http_parser" = "xyes"])
 
+
+# NB: Since malloc() and free() are declared in stdlib.h, and the
+# jemalloc-specific api is detected at runtime, we dont need any
+# jemalloc headers or modify CPPFLAGS here.
+if test "x$enable_jemalloc_allocator" = "xyes"; then
+  if test "x$OS_NAME" != "xlinux"; then
+    # Building and linking against jemalloc is actually not a problem
+    # on OSX even now, but to make it actually *useful* we would have
+    # have to re-route all existing malloc/free calls through jemalloc.
+    # The recommended way of doing that on Mac seems to be call
+    # `malloc_default_zone()` and to overwrite the hooks in the
+    # returned `malloc_zone_t`.
+    AC_MSG_ERROR([
+--------------------------------------------------------------------
+You have requested the default memory allocator to be replaced by
+jemalloc, but your operating system was detected to be $OS_NAME.
+
+This feature is currently only supported on linux.
+--------------------------------------------------------------------
+    ])
+  fi
+
+  if test -n "`echo $with_jemalloc`"; then
+    WITH_JEMALLOC="${with_jemalloc}"
+  fi
+
+  # Check if the user asked us to use a preinstalled jemalloc, or if
+  # they asked us to ignore all bundled libraries while compiling and
+  # linking.
+  if test "x$without_bundled_jemalloc" = "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+
+    # Avoid AC_SEARCH_LIBS here because it would implicitly add jemalloc
+    # to LIBS, but we dont want to link it against libmesos, only the
+    # individual binaries
+    AC_CHECK_LIB([jemalloc], [malloc_stats_print], [found_jemalloc=yes])
+    if test "x$found_jemalloc" = "xyes"; then
+      with_bundled_jemalloc=no
+    else
+      AC_MSG_ERROR([cannot find jemalloc
+-------------------------------------------------------------------
+You have requested the use of a non-bundled jemalloc but no suitable
+library could be found.
+
+You may want specify the location of jemalloc by providing a prefix
+path via --with-jemalloc=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+  ])
+    fi
+  else
+    with_bundled_jemalloc=yes
+  fi
+fi
+
+AC_SUBST(WITH_JEMALLOC)
+AM_CONDITIONAL([WITH_BUNDLED_JEMALLOC],
+         [test "x$with_bundled_jemalloc" = "xyes"])
 
 # TODO(benh): Consider using AS_IF instead of just shell 'if'
 # statements for better autoconf style (the AS_IF macros also make
@@ -1034,11 +1303,19 @@ __EOF__
   # Determine linker flags for Java if not set.
   if test "$OS_NAME" = "darwin"; then
     dir="$JAVA_HOME/jre/lib/server"
-    JAVA_TEST_LDFLAGS="-framework JavaVM"
-    JAVA_JVM_LIBRARY=$dir/libjvm.dylib
+    for dir in "$JAVA_HOME/lib/server" "$JAVA_HOME/jre/lib/server"; do
+      if test -e "$dir"; then
+	# Note that these are libtool specific flags.
+        JAVA_TEST_LDFLAGS="-framework JavaVM"
+        JAVA_JVM_LIBRARY=$dir/libjvm.dylib
+	break;
+      fi
+    done
   elif test "$OS_NAME" = "linux"; then
-    for arch in amd64 i386 arm aarch64 ppc64 ppc64le s390 s390x; do
-      dir="$JAVA_HOME/jre/lib/$arch/server"
+    for dir in \
+      "$JAVA_HOME/lib/server" \
+      "$JAVA_HOME/jre/lib/"{amd64,i386,arm,aarch64,ppc64,ppc64le,s390,s390x}"/server"
+    do
       if test -e "$dir"; then
 	# Note that these are libtool specific flags.
 	JAVA_TEST_LDFLAGS="-L$dir -R$dir -Wl,-ljvm"
@@ -1147,6 +1424,8 @@ has been correctly installed.
 fi
 
 AM_CONDITIONAL([HAS_JAVA], [test "x$has_java" = "xyes"])
+AC_PATH_PROG([JAVAH], [javah], [$JAVAH], [$JAVA_HOME/bin])
+AM_CONDITIONAL([HAS_JAVAH], [test "x$JAVAH" != "x"])
 
 
 # Check if LevelDB prefix path was supplied and if so, add it to
@@ -1207,38 +1486,56 @@ if test -n "`echo $with_libevent`"; then
 fi
 
 if test "x$enable_libevent" = "xyes"; then
-  AC_CHECK_HEADERS([event2/event.h],
-                   [AC_CHECK_LIB([event],
-                                 [event_base_new],
-                                 [],
-                                 [AC_MSG_ERROR([cannot find libevent
--------------------------------------------------------------------
-libevent version 2+ is required for libprocess to build.
--------------------------------------------------------------------
-                                 ])])],
-                   [AC_MSG_ERROR([cannot find libevent headers
--------------------------------------------------------------------
-libevent version 2+ headers are required for libprocess to build.
--------------------------------------------------------------------
-  ])])
-
-  AC_CHECK_HEADERS([event2/thread.h],
-                   [AC_CHECK_LIB([event_pthreads],
-                                 [evthread_use_pthreads],
-                                 [],
-                                 [AC_MSG_ERROR([cannot find libevent_pthreads
--------------------------------------------------------------------
-libevent_pthreads version 2+ is required for libprocess to build.
--------------------------------------------------------------------
-                                 ])])],
-                   [AC_MSG_ERROR([cannot find libevent_pthreads headers
--------------------------------------------------------------------
-libevent_pthreads version 2+ headers are required for libprocess to build.
--------------------------------------------------------------------
-  ])])
+  # Check if user has asked us to use a preinstalled libevent, or if they
+  # asked us to ignore all bundled libraries while compiling and
+  # linking.
+  if test "x$without_bundled_libevent" = "xyes" || \
+     test "x$enable_bundled" != "xyes"; then
+     MESOS_HAVE_LIBEVENT()
+  else
+    with_bundled_libevent=yes
+  fi
 fi
 
-AM_CONDITIONAL([ENABLE_LIBEVENT], [test x"$enable_libevent" = "xyes"])
+AM_CONDITIONAL([ENABLE_LIBEVENT],
+               [test "x$enable_libevent" = "xyes"])
+AM_CONDITIONAL([WITH_BUNDLED_LIBEVENT],
+               [test "x$with_bundled_libevent" = "xyes"])
+
+
+# Check if user has asked us to use a preinstalled libarchive, or if
+# they asked us to ignore all bundled libraries while compiling and
+# linking.
+if test -n "`echo $with_libarchive`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_libarchive}/include"
+  LDFLAGS="$LDFLAGS -L${with_libarchive}/lib"
+fi
+
+if test "x$without_bundled_libarchive" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([archive.h], [found_libarchive=yes])
+
+  if test "x$found_libarchive" = "xyes"; then
+    with_bundled_libarchive=no
+  else
+    AC_MSG_ERROR([cannot find libarchive
+-------------------------------------------------------------------
+You have requested the use of a non-bundled libarchive but no suitable
+libarchive could be found.
+
+You may want specify the location of libarchive by providing a prefix
+path via --with-libarchive=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+
+else
+  with_bundled_libarchive=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_LIBARCHIVE], [test "x$with_bundled_libarchive" = "xyes"])
 
 
 # Check if user has asked us to use a preinstalled libprocess, or if
@@ -1272,84 +1569,52 @@ fi
 AM_CONDITIONAL([WITH_BUNDLED_LIBPROCESS], [test "x$with_bundled_libprocess" = "xyes"])
 
 
-# Perform necessary configuration for network isolator.
-if test "x$with_network_isolator" = "xyes"; then
-  if test -n "`echo $with_nl`"; then
-    CPPFLAGS="-I${with_nl}/include/libnl3 $CPPFLAGS"
-    LDFLAGS="-L${with_nl}/lib $LDFLAGS"
-  else
-    CPPFLAGS="-I/usr/include/libnl3 $CPPFLAGS"
-  fi
-
+# Perform necessary configuration for port mapping isolator.
+if test "x$enable_port_mapping_isolator" = "xyes"; then
   # Check for OS support.
   AS_IF([test "$OS_NAME" = "linux"],
         [],
-        [AC_MSG_ERROR([cannot build network isolator
+        [AC_MSG_ERROR([cannot build port mapping isolator
 -------------------------------------------------------------------
-Network isolator is only supported on Linux!
--------------------------------------------------------------------
-  ])])
-
-  # Check for libnl (both headers and libraries).
-  AC_CHECK_LIB([nl-3], [nl_has_capability], [],
-               [AC_MSG_ERROR([cannot find libnl-3
--------------------------------------------------------------------
-We need libnl-3 for building network isolator!
-
-Please install libnl3 (version 3.2.26 or higher):
-https://github.com/thom311/libnl/releases
+The port mapping isolator is only supported on Linux
 -------------------------------------------------------------------
   ])])
 
-  AC_CHECK_HEADERS([netlink/netlink.h libnl3/netlink/netlink.h],
-                   [break]
-                   [AC_MSG_ERROR([cannot find libnl-3 headers
--------------------------------------------------------------------
-We need libnl-3 headers for building network isolator!
+  MESOS_HAVE_LIBNL3([], [
+    MESOS_MSG_LIBNL3_ERROR([libnl-3 is required for building the port mapping isolator])
+  ])
 
-Please install libnl3 (version 3.2.26 or higher):
-https://github.com/thom311/libnl/releases
--------------------------------------------------------------------
-  ])])
-
-  # Check for libnl-route (both headers and libraries).
-  AC_CHECK_LIB([nl-route-3], [rtnl_u32_get_classid], [],
-               [AC_MSG_ERROR([cannot find libnl-route-3
--------------------------------------------------------------------
-We need libnl-route-3 for building network isolator!
-
-Please install libnl3 (version 3.2.26 or higher):
-https://github.com/thom311/libnl/releases
--------------------------------------------------------------------
-  ])])
-
-  AC_CHECK_HEADERS([netlink/route/link/veth.h libnl3/netlink/route/link/veth.h],
-                   [break]
-                   [AC_MSG_ERROR([cannot find libnl-route-3 headers
--------------------------------------------------------------------
-We need libnl-route-3 headers for building network isolator!
-
-Please install libnl3 (version 3.2.26 or higher):
-https://github.com/thom311/libnl/releases
--------------------------------------------------------------------
-  ])])
-
-  # Check for libnl-idiag-3 (both headers and libraries).
-  AC_CHECK_LIB([nl-idiag-3], [idiagnl_msg_alloc_cache], [],
-               [AC_MSG_ERROR([cannot find libnl-idiag-3
--------------------------------------------------------------------
-We need libnl-idiag-3 for building network isolator!
-
-Please install libnl3 (version 3.2.26 or higher):
-https://github.com/thom311/libnl/releases
--------------------------------------------------------------------
-  ])])
-
-  AC_DEFINE([WITH_NETWORK_ISOLATOR])
+  AC_DEFINE([ENABLE_PORT_MAPPING_ISOLATOR])
 fi
 
-AM_CONDITIONAL([WITH_NETWORK_ISOLATOR],
-               [test "x$with_network_isolator" = "xyes"])
+AM_CONDITIONAL([ENABLE_PORT_MAPPING_ISOLATOR],
+               [test "x$enable_port_mapping_isolator" = "xyes"])
+
+
+if test "x$enable_network_ports_isolator" = "xyes"; then
+
+  AS_IF([test "$OS_NAME" = "linux"],
+        [],
+        [AC_MSG_ERROR([cannot build network/ports isolator
+-------------------------------------------------------------------
+The network/ports isolator is only supported on Linux
+-------------------------------------------------------------------
+  ])])
+
+  MESOS_HAVE_LIBNL3([], [
+    MESOS_MSG_LIBNL3_ERROR([libnl-3 is required for building the network/ports isolator])
+  ])
+
+  AC_DEFINE([ENABLE_NETWORK_PORTS_ISOLATOR])
+fi
+
+AM_CONDITIONAL([ENABLE_NETWORK_PORTS_ISOLATOR],
+               [test "x$enable_network_ports_isolator" = "xyes"])
+
+
+AM_CONDITIONAL(
+  [ENABLE_LINUX_ROUTING],
+  [test "x$enable_network_ports_isolator" = "xyes" -o "x$enable_port_mapping_isolator" = "xyes"])
 
 
 # If the user has asked not to include the bundled NVML headers for
@@ -1385,8 +1650,11 @@ AM_CONDITIONAL([WITH_BUNDLED_NVML],
 # CPPFLAGS while extending it by /include and to LDFLAGS while
 # extending it by /lib.
 if test -n "`echo $with_protobuf`"; then
-  CPPFLAGS="$CPPFLAGS -I${with_protobuf}/include"
-  LDFLAGS="$LDFLAGS -L${with_protobuf}/lib"
+  PROTOBUF_CPPFLAGS="-I${with_protobuf}/include"
+  PROTOBUF_LINKERFLAGS="-L${with_protobuf}/lib"
+
+  CPPFLAGS="$PROTOBUF_CPPFLAGS $CPPFLAGS"
+  LDFLAGS="$PROTOBUF_LINKERFLAGS $LDFLAGS"
 fi
 
 # Check if user has asked us to use a preinstalled protobuf, or if
@@ -1403,7 +1671,7 @@ if test "x$without_bundled_protobuf" = "xyes" || \
 
   # Check for protobuf.
 
-  AC_CHECK_HEADERS([google/protobuf/message.h], [found_protobuf=yes],
+  AC_CHECK_HEADERS([google/protobuf/map.h], [found_protobuf=yes],
                    [found_protobuf=no])
 
   if test "x$found_protobuf" = "xyes"; then
@@ -1446,7 +1714,7 @@ if test "x$without_bundled_protobuf" = "xyes" || \
     AC_MSG_ERROR([cannot find protobuf
 -------------------------------------------------------------------
 You have requested the use of a non-bundled protobuf but no suitable
-protobuf could be found.
+protobuf (version 3+) could be found.
 
 You may want specify the location of protobuf by providing a prefix
 path via --with-protobuf=DIR, or check that the path you provided is
@@ -1456,15 +1724,17 @@ correct if youre already doing this.
   fi
 else
   with_bundled_protobuf=yes
-  PROTOBUF_JAR="\${MESOS_BUILD_DIR}/src/java/target/protobuf-java-2.6.1.jar"
+  PROTOBUF_JAR="\${MESOS_BUILD_DIR}/src/java/target/protobuf-java-3.5.0.jar"
 fi
-
 
 AM_CONDITIONAL([WITH_BUNDLED_PROTOBUF],
                [test "x$with_bundled_protobuf" = "xyes"])
 
+AC_SUBST([PROTOBUF_CPPFLAGS])
 AC_SUBST([PROTOBUF_JAR])
+AC_SUBST([PROTOBUF_LINKERFLAGS])
 AC_SUBST([PROTOCOMPILER])
+
 
 if test -n "`echo $with_libev`"; then
   CPPFLAGS="$CPPFLAGS -I${with_libev}/include"
@@ -1501,17 +1771,6 @@ fi
 AM_CONDITIONAL([WITH_BUNDLED_LIBEV], [test "x$with_bundled_libev" = "xyes"])
 
 
-# Check if libevent prefix path was provided, and if so, add it to
-# the CPPFLAGS and LDFLAGS with respective /include and /lib path
-# suffixes.
-if test -z "`echo $with_libevent`" &&
-   test "$OS_NAME" = "darwin" &&
-   test -n "`command -v brew`" &&
-   test -n "`brew list --versions libevent`"; then
-  with_libevent=`brew --prefix libevent`
-fi
-
-
 if test -n "`echo $with_picojson`"; then
   CPPFLAGS="$CPPFLAGS -I${with_picojson}/include"
 fi
@@ -1545,13 +1804,39 @@ fi
 AM_CONDITIONAL([WITH_BUNDLED_PICOJSON], [test "x$with_bundled_picojson" = "xyes"])
 
 
-# Check if protobuf prefix path was supplied and if so, add it to
-# CPPFLAGS while extending it by /include and to LDFLAGS while
-# extending it by /lib.
-if test -n "`echo $with_protobuf`"; then
-  CPPFLAGS="$CPPFLAGS -I${with_protobuf}/include"
-  LDFLAGS="$LDFLAGS -L${with_protobuf}/lib"
+if test -n "`echo $with_rapidjson`"; then
+  CPPFLAGS="$CPPFLAGS -I${with_rapidjson}/include"
 fi
+
+# Check if user has asked us to use a preinstalled rapidjson, or if
+# they asked us to ignore all bundled libraries while compiling and
+# linking.
+if test "x$without_bundled_rapidjson" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Check if headers and library were located.
+  AC_CHECK_HEADERS([rapidjson/rapidjson.h], [found_rapidjson=yes])
+
+  if test "x$found_rapidjson" = "xyes"; then
+    with_bundled_rapidjson=no
+  else
+    AC_MSG_ERROR([cannot find rapidjson
+-------------------------------------------------------------------
+You have requested the use of a non-bundled rapidjson but no suitable
+rapidjson could be found.
+
+You may want specify the location of rapidjson by providing a prefix
+path via --with-rapidjson=DIR, or check that the path you provided is
+correct if you're already doing this.
+-------------------------------------------------------------------
+])
+  fi
+else
+  with_bundled_rapidjson=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_RAPIDJSON], [test "x$with_bundled_rapidjson" = "xyes"])
+
+
 # Check if Sasl2 prefix path was provided, and if so, add it to
 # the CPPFLAGS and LDFLAGS with respective /include and /lib path
 # suffixes.
@@ -1622,7 +1907,7 @@ __EOF__
 # distcheck failure on OSX by leaking build artefacts (.dsym).
 AS_IF([test "x${ac_cv_env_CFLAGS_set}" = "x"],
       [SASL_TEST_CFLAGS=""], [SASL_TEST_CFLAGS=$CFLAGS])
-$CC crammd5_installed.c $CPPFLAGS $SASL_TEST_CFLAGS $LDFLAGS -lsasl2 $LIBS \
+$CC crammd5_installed.c $CPPFLAGS $SASL_TEST_CFLAGS $LDFLAGS -lsasl2 \
   -o crammd5_installed 2>&1 >/dev/null
 
 # Run the test binary and get its output.
@@ -1650,54 +1935,56 @@ if test -z "`echo $with_ssl`" &&
 fi
 
 if test -n "`echo $with_ssl`"; then
-  CPPFLAGS="-I${with_ssl}/include $CPPFLAGS"
-  LDFLAGS="-L${with_ssl}/lib $LDFLAGS"
+  SSL_CPPFLAGS="-I${with_ssl}/include"
+  SSL_LINKERFLAGS="-L${with_ssl}/lib"
+
+  CPPFLAGS="$SSL_CPPFLAGS $CPPFLAGS"
+  LDFLAGS="$SSL_LINKERFLAGS $LDFLAGS"
 fi
 
-if test "x$enable_ssl" = "xyes"; then
-  AC_CHECK_HEADERS([openssl/ssl.h],
-                   [AC_CHECK_LIB([ssl],
-                                 [SSL_CTX_new],
-                                 [],
-                                 [AC_MSG_ERROR([cannot find libssl
--------------------------------------------------------------------
-libssl is required for an SSL-enabled build.
--------------------------------------------------------------------
-                                 ])])],
-                   [AC_MSG_ERROR([cannot find libssl headers
--------------------------------------------------------------------
-libssl is required for an SSL-enabled build.
--------------------------------------------------------------------
-  ])])
+AC_CHECK_LIB([crypto], [RAND_poll], [found_crypto=yes])
 
-  AC_CHECK_LIB([crypto], [RAND_poll], [], [AC_MSG_ERROR([cannot find libcrypto
+AC_CHECK_HEADERS([openssl/ssl.h],
+                 [AC_CHECK_LIB([ssl],
+                               [SSL_CTX_new],
+                               [found_ssl=yes],
+                               [],
+                               [-lcrypto])])
+
+if test "x$enable_ssl" = "xyes"; then
+  if test "x$found_ssl" != "xyes"; then
+    AC_MSG_ERROR([cannot find libssl
+-------------------------------------------------------------------
+libssl is required for an SSL-enabled build.
+-------------------------------------------------------------------
+    ])
+  fi
+
+  if test "x$found_crypto" != "xyes"; then
+    AC_MSG_ERROR([cannot find libcrypto
 -------------------------------------------------------------------
 libcrypto is required for an SSL-enabled build.
 -------------------------------------------------------------------
-  ])])
+    ])
+  fi
+
+  LIBS="-lssl -lcrypto $LIBS"
 
   if test "x$enable_libevent" = "xyes"; then
-    AC_CHECK_HEADERS([event2/bufferevent_ssl.h],
-                     [AC_CHECK_LIB([event_openssl],
-                                   [bufferevent_openssl_get_ssl],
-                                   [],
-                                   [AC_MSG_ERROR([cannot find libevent_openssl
--------------------------------------------------------------------
-libevent_openssl version 2+ is required for an SSL-enabled build.
--------------------------------------------------------------------
-                                   ])])],
-                     [AC_MSG_ERROR([cannot find libevent_openssl headers
--------------------------------------------------------------------
-libevent_openssl version 2+ headers are required for an SSL-enabled build.
--------------------------------------------------------------------
-    ])])
+    if test "x$with_bundled_libevent" != "xyes"; then
+      MESOS_HAVE_LIBEVENT_SSL()
+    fi
   else
     AC_MSG_ERROR([SSL is currently only supported with libevent])
   fi
   AC_DEFINE([USE_SSL_SOCKET], [1])
 fi
 
-AM_CONDITIONAL([ENABLE_SSL], [test x"$enable_ssl" = "xyes"])
+AM_CONDITIONAL([ENABLE_SSL],
+               [test "x$enable_ssl" = "xyes"])
+
+AC_SUBST([SSL_CPPFLAGS])
+AC_SUBST([SSL_LINKERFLAGS])
 
 
 # Check if user has asked us to use a preinstalled stout, or if
@@ -1789,7 +2076,7 @@ The XFS disk isolator is only supported on Linux.
 
   # Check for build dependencies for the XFS disk isolator. We only
   # enable this if all the needed headers and libraries are present.
-  AC_CHECK_HEADERS([xfs/xfs.h xfs/xqm.h linux/quota.h sys/quota.h],
+  AC_CHECK_HEADERS([xfs/xfs.h linux/dqblk_xfs.h linux/quota.h sys/quota.h],
                    [], [AC_MSG_ERROR([missing XFS quota headers
 -------------------------------------------------------------------
 Please install the Linux kernel headers and xfsprogs development
@@ -1822,21 +2109,112 @@ AM_CONDITIONAL([ENABLE_XFS_DISK_ISOLATOR], [test "x$enable_xfs_disk_isolator" = 
 # the CPPFLAGS and LDFLAGS with respective /include and /lib path
 # suffixes.
 if test -n "`echo $with_zlib`" ; then
-    CPPFLAGS="-I${with_zlib}/include $CPPFLAGS"
-    LDFLAGS="-L${with_zlib}/lib $LDFLAGS"
+  ZLIB_CPPFLAGS="-I${with_zlib}/include"
+  ZLIB_LINKERFLAGS="-L${with_zlib}/lib"
+
+  CPPFLAGS="$ZLIB_CPPFLAGS $CPPFLAGS"
+  LDFLAGS="$ZLIB_LINKERFLAGS $LDFLAGS"
 fi
 
-# Check if we should/can build with libz.
-if test "x$enable_zlib" = "xyes"; then
-  AC_CHECK_LIB([z], [deflate, gzread, gzwrite, inflate], [],
-               [AC_MSG_ERROR([cannot find libz
+AC_CHECK_HEADERS([zlib.h],
+                 [AC_CHECK_LIB([z], [deflate, gzread, gzwrite, inflate], [],
+                               [AC_MSG_ERROR([cannot find libz
 -------------------------------------------------------------------
-This means HTTP responses will be slower because we cannot use
-compression; you probably want to download and install zlib, but
-you can get away without it by doing --disable-zlib.
+libz is required for Mesos to build.
 -------------------------------------------------------------------
-  ])])
+                               ])])],
+                 [AC_MSG_ERROR([cannot find libz headers
+-------------------------------------------------------------------
+libz headers are required for Mesos to build.
+-------------------------------------------------------------------
+                 ])])
+
+AC_SUBST([ZLIB_CPPFLAGS])
+AC_SUBST([ZLIB_LINKERFLAGS])
+
+
+# Check if grpc prefix path was supplied and if so, add it to the
+# CPPFLAGS and LDFLAGS with respective /include and /lib path suffixes.
+if test -n "`echo $with_grpc`"; then
+  if test "x$without_bundled_protobuf" != "xyes"; then
+    AC_MSG_ERROR([protobuf not specified
+-------------------------------------------------------------------
+You have requested the use of a non-bundled grpc without specifying
+the protobuf library it uses. This is prohibited to avoid using
+conflicting versions of protobuf libraries. Please specify the
+location of protobuf used by grpc by providing a prefix path via
+--with-protobuf=DIR.
+-------------------------------------------------------------------
+    ])
+  fi
+
+  CPPFLAGS="$CPPFLAGS -I${with_grpc}/include"
+  LDFLAGS="$LDFLAGS -L${with_grpc}/lib"
 fi
+
+# Check if user has asked us to use a preinstalled grpc, or if they
+# asked us to ignore all bundled libraries while compiling and linking.
+if test "x$without_bundled_grpc" = "xyes" || \
+   test "x$enable_bundled" != "xyes"; then
+  # Use the system default prefix if not specified.
+  if test -n "`echo $with_grpc`"; then
+    GRPCPREFIX="${with_grpc}"
+  elif test "x$enable_bundled" != "xyes"; then
+    GRPCPREFIX="/usr"
+  fi
+
+  if test "x$enable_ssl" = "xno"; then
+    GRPC_VARIANT="_unsecure"
+  fi
+
+  # Check if headers and library were located.
+  saved_LIBS="$LIBS"
+  LIBS="-lgrpc++$GRPC_VARIANT -lgrpc$GRPC_VARIANT -lgpr $LIBS"
+  AC_LANG_PUSH([C++])
+  AC_CHECK_HEADERS([grpcpp/grpcpp.h],
+                   [AC_LINK_IFELSE(
+                       [AC_LANG_PROGRAM([#include <grpcpp/grpcpp.h>],
+                                        [grpc::Version();])],
+                       [found_grpc=yes],
+                       [found_grpc=no])],
+                   [found_grpc=no])
+  AC_LANG_POP()
+  LIBS="$saved_LIBS"
+
+  if test "x$found_grpc" = "xyes"; then
+    with_bundled_grpc=no
+
+    AC_CHECK_TOOL([GRPC_CXX_PLUGIN_TEST],
+                  [grpc_cpp_plugin],
+                  [],
+                  [$GRPCPREFIX/bin])
+
+    if test -z "`echo $GRPC_CXX_PLUGIN_TEST`"; then
+      AC_MSG_ERROR([grpc_cpp_plugin not found in PATH])
+    fi
+
+    GRPC_CXX_PLUGIN="$GRPCPREFIX/bin/grpc_cpp_plugin"
+
+  else
+    AC_MSG_ERROR([cannot find grpc
+-------------------------------------------------------------------
+You have requested the use of a non-bundled grpc but no suitable
+grpc could be found.
+
+You may want specify the location of grpc by providing a prefix
+path via --with-grpc=DIR, or check that the path you provided is
+correct if you are already doing this.
+-------------------------------------------------------------------
+    ])
+  fi
+else
+  with_bundled_grpc=yes
+fi
+
+AM_CONDITIONAL([WITH_BUNDLED_GRPC],
+               [test "x$with_bundled_grpc" = "xyes"])
+
+AC_SUBST([GRPC_CXX_PLUGIN])
 
 
 # Check if ZooKeeper prefix path was supplied and if so, add it to
@@ -1885,42 +2263,134 @@ fi
 AM_CONDITIONAL([WITH_BUNDLED_ZOOKEEPER],
                [test "x$with_bundled_zookeeper" = "xyes"])
 
+
+# Once all CXXFLAGS are completely assembled, make sure the we are not
+# affected by libcxx undefined behavior,
+# https://llvm.org/bugs/show_bug.cgi?id=28469.
+AC_MSG_CHECKING([C++ standard library for undefined behaviour with selected optimization level])
+# NOTE: We clear `LIBS` here to prevent linking in libraries unrelated
+# to the test. These libraries might not be in the linker lookup paths.
+saved_LIBS="$LIBS"
+LIBS=""
+AC_LANG_PUSH([C++])
+AC_RUN_IFELSE([
+  AC_LANG_SOURCE([[
+    #include <functional>
+    #include <map>
+
+    struct F {
+      std::map<int, std::function<void()>> m;
+      F() { m[42] = []() {}; }
+    };
+
+    int main() {
+      F f;
+      f = F{};
+    }
+  ]])],
+  [
+    AC_MSG_RESULT([no])
+  ], [
+    AC_MSG_RESULT([yes])
+    AC_MSG_ERROR([Mesos cannot be built with optimizations against this version of libcxx (MESOS-5745).
+                  Consider building without optimizations, or changing the used C++ standard library.])
+  ]
+)
+AC_LANG_POP([C++])
+LIBS="$saved_LIBS"
+
+
 # NOTE: Do not update any compiler or linker settings (e.g. CXXFLAGS,
 # LDFLAGS, ...) beyond this line.
 
 # Perform necessary configuration for building with Python.
-if test "x$enable_python" = "xyes"; then
-  # If the user specified PYTHON_VERSION then assume that is the
-  # Python that they want and construct PYTHON using the canonical
-  # name (failing if PYTHON is also set since we can't easily check
-  # that PYTHON and PYTHON_VERSION are compatible). This bit of
-  # tomfoolery is mostly to match the semantics of AC_PYTHON_DEVEL
-  # (used below). If we don't do this then it's possible that a user
-  # will specify PYTHON_VERSION which will get ignored (and likely
-  # replaced) via AM_PATH_PYTHON.
+if test "x$enable_python" = "xyes" || \
+   test "x$enable_new_cli" = "xyes"; then
+  # Ensure PYTHON and PYTHON_VERSION are both set appropriately. We need
+  # to ensure this either when these variables are passed in the
+  # environment or when set via AM_PATH_PYTHON. If we don't do this,
+  # it's possible that a user will specify PYTHON_VERSION which will get
+  # ignored (and likely replaced) via AM_PATH_PYTHON.
   # TODO(benh): Consolidate AM_PATH_PYTHON and AC_PYTHON_DEVEL into a
   # single macro that both iterates through potential 'python' options
   # looking for an acceptable version (i.e., AM_PATH_PYTHON) and
   # checks for Python.h (i.e., AC_PYTHON_DEVEL).
-  if test -n "$PYTHON_VERSION"; then
-    if test -n "$PYTHON"; then
-      AC_MSG_ERROR([only specify one of PYTHON or PYTHON_VERSION])
-    fi
-    PYTHON=python$PYTHON_VERSION
+  if test -n "$PYTHON" && test -n "$PYTHON_VERSION"; then
+    AC_MSG_ERROR([only specify one of PYTHON or PYTHON_VERSION])
   fi
 
+  if test -n "$PYTHON"; then
+    PYTHON_VERSION=`$PYTHON -c "import sys; sys.stdout.write(sys.version[[:3]])"`
+  fi
+
+  if test -n "$PYTHON_VERSION"; then
+    AC_SUBST([PYTHON], [python$PYTHON_VERSION])
+  fi
+
+  if test -z "$PYTHON" && test -z "$PYTHON_VERSION"; then
+    AM_PATH_PYTHON()
+  fi
+fi
+
+if test "x$enable_python" = "xyes"; then
   # Check if PYTHON is at least 2.6 or try and find one that is if
   # PYTHON is not set (necessary to run our examples).
-  AM_PATH_PYTHON([2.6],,
-                 [AC_MSG_ERROR([mesos requires Python >= 2.6
+  AM_PYTHON_CHECK_VERSION([$PYTHON], [2.6], [],
+                 [AC_MSG_ERROR([Mesos requires Python >= 2.6
 -------------------------------------------------------------------
-If you already have Python 2.6 installed (and it's on the path),
-you might want to check if you have the PYTHON environment variable
-set to an older version of Python.
+The detected Python version is $PYTHON_VERSION.
+
+If you already have Python 2.6+ installed (and it's the default python
+on the path), you might want to check if you have the PYTHON environment
+variable set to an older version of Python.
 -------------------------------------------------------------------
   ])])
 
-  # Next we ensure we have the Python development libraries.
+  AM_PYTHON_CHECK_VERSION([$PYTHON], [3.0],
+                 [AC_MSG_ERROR([Mesos requires Python < 3.0
+-------------------------------------------------------------------
+The detected Python version is $PYTHON_VERSION.
+
+If you already have Python 2.6+ installed (and it's the default python
+on the path), you might want to check if you have the PYTHON environment
+variable set to a version of Python greater than 3.0.
+-------------------------------------------------------------------
+  ])], [])
+
+  if test "x$enable_new_cli" = "xyes" && test -z "$PYTHON_3"; then
+    AC_MSG_ERROR([Missing PYTHON_3 environment variable
+-------------------------------------------------------------------
+The detected Python version is $PYTHON_VERSION. Python 3 not detected.
+
+When building both the Python bindings and the CLI, the detected Python
+version is used to build the bindings and PYTHON_3 must be set
+explicitely in order to build the CLI.
+-------------------------------------------------------------------
+    ])
+  fi
+fi
+
+if test "x$enable_new_cli" = "xyes"; then
+  if test -z "$PYTHON_3"; then
+    AC_SUBST([PYTHON_3], [$PYTHON])
+  fi
+
+  PYTHON_3_VERSION=`$PYTHON_3 -c 'import sys; print(sys.version[[0:3]])'`
+
+  AM_PYTHON_CHECK_VERSION([$PYTHON_3], [3.6], [],
+                 [AC_MSG_ERROR([The Mesos CLI requires Python >= 3.6
+-------------------------------------------------------------------
+The detected Python 3 version is $PYTHON_3_VERSION.
+
+The new CLI requires Python version 3.6 or newer in order to build.
+You may wish to set the PYTHON_3 environment variable to make sure
+that the right Python executable is found.
+-------------------------------------------------------------------
+  ])])
+fi
+
+if test "x$enable_python" = "xyes"; then
+  # Next we ensure we have the Python development libraries for Python 2.
   AX_PYTHON_DEVEL([>= '2.6'])
 
   # Ensure that we can build a native Python egg linking against a
@@ -2029,7 +2499,7 @@ There are two possible workarounds for this issue:
   $PYTHON -c "import mesos; mesos._mesos" &> /dev/null
 
   if test $? = 0; then
-    pymodulelocation=`python -c \
+    pymodulelocation=`$PYTHON -c \
       "import mesos; import os; print os.path.dirname(mesos.__path__[[0]])" \
       2> /dev/null`
   fi
@@ -2193,6 +2663,13 @@ correct if you're already doing this.
   has_python=yes
 fi
 
+AC_MSG_CHECKING([whether to enable new CLI])
+AS_IF([test "x$enable_new_cli" = "xyes"],
+      [AC_MSG_RESULT([yes])],
+      [AC_MSG_RESULT([no])])
+
+AM_CONDITIONAL([ENABLE_NEW_CLI], [test "x$enable_new_cli" = "xyes"])
+
 AM_CONDITIONAL([HAS_PYTHON], [test "x$has_python" = "xyes"])
 
 AM_CONDITIONAL([WITH_BUNDLED_SETUPTOOLS],
@@ -2239,4 +2716,6 @@ AC_MSG_NOTICE([Build option summary:
     CPPFLAGS:   $CPPFLAGS
     LDFLAGS:    $LDFLAGS
     LIBS:       $LIBS
+    JAVA_TEST_LDFLAGS: $JAVA_TEST_LDFLAGS
+    JAVA_JVM_LIBRARY:  $JAVA_JVM_LIBRARY
 ])

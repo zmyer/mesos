@@ -249,13 +249,13 @@ class NvidiaGpuAllocatorProcess
   : public process::Process<NvidiaGpuAllocatorProcess>
 {
 public:
-  NvidiaGpuAllocatorProcess(const std::set<Gpu>& gpus)
+  NvidiaGpuAllocatorProcess(const set<Gpu>& gpus)
     : available(gpus) {}
 
   Future<set<Gpu>> allocate(size_t count)
   {
     if (available.size() < count) {
-      return Failure("Requested " + stringify(count) + " but only"
+      return Failure("Requested " + stringify(count) + " gpus but only"
                      " " + stringify(available.size()) + " available");
     }
 
@@ -314,7 +314,7 @@ struct NvidiaGpuAllocator::Data
     process::terminate(process);
   }
 
-  const std::set<Gpu> gpus;
+  const set<Gpu> gpus;
   PID<NvidiaGpuAllocatorProcess> process;
 };
 

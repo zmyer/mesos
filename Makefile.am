@@ -40,7 +40,8 @@ all-recursive: src/python/setup.py			\
 
 # Standard stuff.
 EXTRA_DIST += bootstrap LICENSE NOTICE README.md	\
-	support/atexit.sh support/colors.sh
+	support/atexit.sh support/colors.sh		\
+	support/mesos-gtest-runner.py
 
 # On install, pip fetches and installs all missing dependencies. When running
 # distcheck, this behavior ends up installing files that we are not able to
@@ -48,6 +49,11 @@ EXTRA_DIST += bootstrap LICENSE NOTICE README.md	\
 # forces us to verify that we can install/uninstall the mesos specific
 # libraries and only those libraries.
 AM_DISTCHECK_CONFIGURE_FLAGS = --disable-python-dependency-install
+
+# In some distributions, rpmbuild(8) will implicitly disable dependency
+# tracking. Make sure we disable it in during distcheck to ensure we do not
+# accidentally depend on the side-effects of automake dependency tracking.
+AM_DISTCHECK_CONFIGURE_FLAGS += --disable-dependency-tracking
 
 
 # MPI framework.

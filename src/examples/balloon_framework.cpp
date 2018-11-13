@@ -14,14 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <glog/logging.h>
-
 #include <iostream>
 #include <string>
 #include <vector>
 
 #include <mesos/resources.hpp>
 #include <mesos/scheduler.hpp>
+
+#include <mesos/authorizer/acls.hpp>
 
 #include <process/clock.hpp>
 #include <process/defer.hpp>
@@ -32,7 +32,7 @@
 #include <process/time.hpp>
 
 #include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/pull_gauge.hpp>
 #include <process/metrics/metrics.hpp>
 
 #include <stout/bytes.hpp>
@@ -40,17 +40,28 @@
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
+#include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
+
+#include <stout/os/realpath.hpp>
+
+#include "common/parse.hpp"
+
+#include "examples/flags.hpp"
+
+#include "logging/logging.hpp"
 
 using namespace mesos;
 using namespace mesos::internal;
 
 using std::string;
 
+using google::protobuf::RepeatedPtrField;
+
 using process::Clock;
 using process::defer;
 
-using process::metrics::Gauge;
+using process::metrics::PullGauge;
 using process::metrics::Counter;
 
 const double CPUS_PER_TASK = 0.1;
@@ -58,14 +69,19 @@ const double CPUS_PER_TASK = 0.1;
 const double CPUS_PER_EXECUTOR = 0.1;
 const int32_t MEM_PER_EXECUTOR = 64;
 
-class Flags : public virtual flags::FlagsBase
+constexpr char EXECUTOR_BINARY[] = "balloon-executor";
+constexpr char FRAMEWORK_METRICS_PREFIX[] = "balloon_framework";
+
+
+class Flags : public virtual mesos::internal::examples::Flags
 {
 public:
   Flags()
   {
-    add(&Flags::master,
-        "master",
-        "Master to connect to.");
+    add(&Flags::name,
+        "name",
+        "Name to be used by the framework.",
+        "Balloon Framework");
 
     add(&Flags::task_memory_usage_limit,
         "task_memory_usage_limit",
@@ -74,7 +90,7 @@ public:
         "The task will attempt to occupy memory up until this limit.",
         static_cast<const Bytes*>(nullptr),
         [](const Bytes& value) -> Option<Error> {
-          if (value.megabytes() < MEM_PER_EXECUTOR) {
+          if (value < Bytes(MEM_PER_EXECUTOR, Bytes::MEGABYTES)) {
             return Error(
                 "Please use a --task_memory_usage_limit greater than " +
                 stringify(MEM_PER_EXECUTOR) + " MB");
@@ -97,17 +113,34 @@ public:
 
     add(&Flags::executor_uri,
         "executor_uri",
-        "URI the fetcher should use to get the executor.");
+        "URI the fetcher should use to get the executor's binary.\n"
+        "NOTE: This flag is deprecated in favor of `--executor_uris`");
+
+    add(&Flags::executor_uris,
+        "executor_uris",
+        "The value could be a JSON-formatted string of `URI`s that\n"
+        "should be fetched before running the executor, or a file\n"
+        "path containing the JSON-formatted `URI`s. Path must be of\n"
+        "the form `file:///path/to/file` or `/path/to/file`.\n"
+        "This flag replaces `--executor_uri`.\n"
+        "See the `CommandInfo::URI` message in `mesos.proto` for the\n"
+        "expected format.\n"
+        "Example:\n"
+        "[\n"
+        "  {\n"
+        "    \"value\":\"mesos.apache.org/balloon_executor\",\n"
+        "    \"executable\":\"true\"\n"
+        "  },\n"
+        "  {\n"
+        "    \"value\":\"mesos.apache.org/bundle_for_executor.tar.gz\",\n"
+        "    \"cache\":\"true\"\n"
+        "  }\n"
+        "]");
 
     add(&Flags::executor_command,
         "executor_command",
         "The command that should be used to start the executor.\n"
         "This will override the value set by `--build_dir`.");
-
-    add(&Flags::checkpoint,
-        "checkpoint",
-        "Whether this framework should be checkpointed.\n",
-        false);
 
     add(&Flags::long_running,
         "long_running",
@@ -116,16 +149,19 @@ public:
         false);
   }
 
-  string master;
+  string name;
   Bytes task_memory_usage_limit;
   Bytes task_memory;
 
-  // Flags for specifying the executor binary.
+  // Flags for specifying the executor binary and other URIs.
+  //
+  // TODO(armand): Remove the `--executor_uri` flag after the
+  // deprecation cycle, started in 1.4.0.
   Option<string> build_dir;
   Option<string> executor_uri;
+  Option<JSON::Array> executor_uris;
   Option<string> executor_command;
 
-  bool checkpoint;
   bool long_running;
 };
 
@@ -136,9 +172,12 @@ class BalloonSchedulerProcess : public process::Process<BalloonSchedulerProcess>
 {
 public:
   BalloonSchedulerProcess(
+      const FrameworkInfo& _frameworkInfo,
       const ExecutorInfo& _executor,
       const Flags& _flags)
-    : executor(_executor),
+    : frameworkInfo(_frameworkInfo),
+      role(_frameworkInfo.roles(0)),
+      executor(_executor),
       flags(_flags),
       taskActive(false),
       tasksLaunched(0),
@@ -162,19 +201,23 @@ public:
       SchedulerDriver* driver,
       const std::vector<Offer>& offers)
   {
-    static const Resources TASK_RESOURCES = Resources::parse(
+    Resources taskResources = Resources::parse(
         "cpus:" + stringify(CPUS_PER_TASK) +
-        ";mem:" + stringify(flags.task_memory.megabytes())).get();
+        ";mem:" + stringify(
+            (double) flags.task_memory.bytes() / Bytes::MEGABYTES)).get();
+    taskResources.allocate(role);
 
-    static const Resources EXECUTOR_RESOURCES = Resources(executor.resources());
+    Resources executorResources = Resources(executor.resources());
+    executorResources.allocate(role);
 
     foreach (const Offer& offer, offers) {
       Resources resources(offer.resources());
 
       // If there is an active task, or if the offer is not
       // big enough, reject the offer.
-      if (taskActive || !resources.flatten().contains(
-            TASK_RESOURCES + EXECUTOR_RESOURCES)) {
+      if (taskActive ||
+          !resources.toUnreserved().contains(
+              taskResources + executorResources)) {
         Filters filters;
         filters.set_refuse_seconds(600);
 
@@ -184,18 +227,18 @@ public:
 
       int taskId = tasksLaunched++;
 
-      LOG(INFO) << "Starting task " << taskId;
+      LOG(INFO) << "Launching task " << taskId;
 
       TaskInfo task;
-      task.set_name("Balloon Task");
+      task.set_name(flags.name + " Task");
       task.mutable_task_id()->set_value(stringify(taskId));
       task.mutable_slave_id()->MergeFrom(offer.slave_id());
-      task.mutable_resources()->CopyFrom(TASK_RESOURCES);
+      task.mutable_resources()->CopyFrom(taskResources);
       task.set_data(stringify(flags.task_memory_usage_limit));
 
       task.mutable_executor()->CopyFrom(executor);
-      task.mutable_executor()->mutable_executor_id()
-        ->set_value(stringify(taskId));
+      task.mutable_executor()->mutable_executor_id()->set_value(
+          stringify(taskId));
 
       driver->launchTasks(offer.id(), {task});
 
@@ -237,7 +280,6 @@ public:
         taskActive = false;
         if (status.reason() == TaskStatus::REASON_CONTAINER_LIMITATION_MEMORY) {
           ++metrics.tasks_oomed;
-          break;
         }
 
         // NOTE: Fetching the executor (e.g. `--executor_uri`) may fail
@@ -245,21 +287,38 @@ public:
         // enough that it makes sense to track this failure metric separately.
         if (status.reason() == TaskStatus::REASON_CONTAINER_LAUNCH_FAILED) {
           ++metrics.launch_failures;
-          break;
         }
+        break;
       case TASK_KILLED:
       case TASK_LOST:
       case TASK_ERROR:
         taskActive = false;
 
-        ++metrics.abnormal_terminations;
+        if (status.reason() != TaskStatus::REASON_INVALID_OFFERS) {
+          ++metrics.abnormal_terminations;
+        }
         break;
-      default:
+      case TASK_RUNNING:
+        ++metrics.tasks_running;
+        break;
+      // We ignore uninteresting transient task status updates.
+      case TASK_KILLING:
+      case TASK_STAGING:
+      case TASK_STARTING:
+        break;
+      // We ignore task status updates related to reconciliation.
+      case TASK_DROPPED:
+      case TASK_GONE:
+      case TASK_GONE_BY_OPERATOR:
+      case TASK_UNKNOWN:
+      case TASK_UNREACHABLE:
         break;
     }
   }
 
 private:
+  const FrameworkInfo frameworkInfo;
+  const string role;
   const ExecutorInfo executor;
   const Flags flags;
   bool taskActive;
@@ -281,20 +340,23 @@ private:
   {
     Metrics(const BalloonSchedulerProcess& _scheduler)
       : uptime_secs(
-            "balloon_framework/uptime_secs",
+            string(FRAMEWORK_METRICS_PREFIX) + "/uptime_secs",
             defer(_scheduler, &BalloonSchedulerProcess::_uptime_secs)),
         registered(
-            "balloon_framework/registered",
+            string(FRAMEWORK_METRICS_PREFIX) + "/registered",
             defer(_scheduler, &BalloonSchedulerProcess::_registered)),
-        tasks_finished("balloon_framework/tasks_finished"),
-        tasks_oomed("balloon_framework/tasks_oomed"),
-        launch_failures("balloon_framework/launch_failures"),
-        abnormal_terminations("balloon_framework/abnormal_terminations")
+        tasks_finished(string(FRAMEWORK_METRICS_PREFIX) + "/tasks_finished"),
+        tasks_oomed(string(FRAMEWORK_METRICS_PREFIX) + "/tasks_oomed"),
+        tasks_running(string(FRAMEWORK_METRICS_PREFIX) + "/tasks_running"),
+        launch_failures(string(FRAMEWORK_METRICS_PREFIX) + "/launch_failures"),
+        abnormal_terminations(
+            string(FRAMEWORK_METRICS_PREFIX) + "/abnormal_terminations")
     {
       process::metrics::add(uptime_secs);
       process::metrics::add(registered);
       process::metrics::add(tasks_finished);
       process::metrics::add(tasks_oomed);
+      process::metrics::add(tasks_running);
       process::metrics::add(launch_failures);
       process::metrics::add(abnormal_terminations);
     }
@@ -309,11 +371,12 @@ private:
       process::metrics::remove(abnormal_terminations);
     }
 
-    process::metrics::Gauge uptime_secs;
-    process::metrics::Gauge registered;
+    process::metrics::PullGauge uptime_secs;
+    process::metrics::PullGauge registered;
 
     process::metrics::Counter tasks_finished;
     process::metrics::Counter tasks_oomed;
+    process::metrics::Counter tasks_running;
     process::metrics::Counter launch_failures;
     process::metrics::Counter abnormal_terminations;
   } metrics;
@@ -328,52 +391,47 @@ class BalloonScheduler : public Scheduler
 {
 public:
   BalloonScheduler(
+      const FrameworkInfo& _frameworkInfo,
       const ExecutorInfo& _executor,
       const Flags& _flags)
-    : process(_executor, _flags)
+    : process(_frameworkInfo, _executor, _flags)
   {
     process::spawn(process);
   }
 
-  virtual ~BalloonScheduler()
+  ~BalloonScheduler() override
   {
     process::terminate(process);
     process::wait(process);
   }
 
-  virtual void registered(
+  void registered(
       SchedulerDriver*,
       const FrameworkID& frameworkId,
-      const MasterInfo&)
+      const MasterInfo&) override
   {
     LOG(INFO) << "Registered with framework ID: " << frameworkId;
 
-    process::dispatch(
-        &process,
-        &BalloonSchedulerProcess::registered);
+    process::dispatch(&process, &BalloonSchedulerProcess::registered);
   }
 
-  virtual void reregistered(SchedulerDriver*, const MasterInfo& masterInfo)
+  void reregistered(SchedulerDriver*, const MasterInfo& masterInfo) override
   {
     LOG(INFO) << "Reregistered";
 
-    process::dispatch(
-        &process,
-        &BalloonSchedulerProcess::registered);
+    process::dispatch(&process, &BalloonSchedulerProcess::registered);
   }
 
-  virtual void disconnected(SchedulerDriver* driver)
+  void disconnected(SchedulerDriver* driver) override
   {
     LOG(INFO) << "Disconnected";
 
-    process::dispatch(
-        &process,
-        &BalloonSchedulerProcess::disconnected);
+    process::dispatch(&process, &BalloonSchedulerProcess::disconnected);
   }
 
-  virtual void resourceOffers(
+  void resourceOffers(
       SchedulerDriver* driver,
-      const std::vector<Offer>& offers)
+      const std::vector<Offer>& offers) override
   {
     LOG(INFO) << "Resource offers received";
 
@@ -384,21 +442,18 @@ public:
         offers);
   }
 
-  virtual void offerRescinded(
-      SchedulerDriver* driver,
-      const OfferID& offerId)
+  void offerRescinded(SchedulerDriver* driver, const OfferID& offerId) override
   {
     LOG(INFO) << "Offer rescinded";
   }
 
-  virtual void statusUpdate(SchedulerDriver* driver, const TaskStatus& status)
+  void statusUpdate(SchedulerDriver* driver, const TaskStatus& status) override
   {
-    LOG(INFO)
-      << "Task " << status.task_id() << " in state "
-      << TaskState_Name(status.state())
-      << ", Source: " << status.source()
-      << ", Reason: " << status.reason()
-      << (status.has_message() ? ", Message: " + status.message() : "");
+    LOG(INFO) << "Task " << status.task_id() << " in state "
+              << TaskState_Name(status.state())
+              << ", Source: " << status.source()
+              << ", Reason: " << status.reason()
+              << (status.has_message() ? ", Message: " + status.message() : "");
 
     process::dispatch(
         &process,
@@ -407,30 +462,30 @@ public:
         status);
   }
 
-  virtual void frameworkMessage(
+  void frameworkMessage(
       SchedulerDriver* driver,
       const ExecutorID& executorId,
       const SlaveID& slaveId,
-      const string& data)
+      const string& data) override
   {
     LOG(INFO) << "Framework message: " << data;
   }
 
-  virtual void slaveLost(SchedulerDriver* driver, const SlaveID& slaveId)
+  void slaveLost(SchedulerDriver* driver, const SlaveID& slaveId) override
   {
     LOG(INFO) << "Agent lost: " << slaveId;
   }
 
-  virtual void executorLost(
+  void executorLost(
       SchedulerDriver* driver,
       const ExecutorID& executorId,
       const SlaveID& slaveId,
-      int status)
+      int status) override
   {
     LOG(INFO) << "Executor '" << executorId << "' lost on agent: " << slaveId;
   }
 
-  virtual void error(SchedulerDriver* driver, const string& message)
+  void error(SchedulerDriver* driver, const string& message) override
   {
     LOG(INFO) << "Error message: " << message;
   }
@@ -443,10 +498,23 @@ private:
 int main(int argc, char** argv)
 {
   Flags flags;
-  Try<flags::Warnings> load = flags.load("MESOS_", argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_EXAMPLE_", argc, argv);
+
+  if (flags.help) {
+    std::cout << flags.usage() << std::endl;
+    return EXIT_SUCCESS;
+  }
 
   if (load.isError()) {
-    EXIT(EXIT_FAILURE) << flags.usage(load.error());
+    std::cerr << flags.usage(load.error()) << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  logging::initialize(argv[0], false);
+
+  // Log any flag warnings.
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
   }
 
   const Resources resources = Resources::parse(
@@ -455,8 +523,7 @@ int main(int argc, char** argv)
 
   ExecutorInfo executor;
   executor.mutable_resources()->CopyFrom(resources);
-  executor.set_name("Balloon Executor");
-  executor.set_source("balloon_test");
+  executor.set_name(flags.name + " Executor");
 
   // Determine the command to run the executor based on three possibilities:
   //   1) `--executor_command` was set, which overrides the below cases.
@@ -470,68 +537,89 @@ int main(int argc, char** argv)
   if (flags.executor_command.isSome()) {
     command = flags.executor_command.get();
   } else if (flags.build_dir.isSome()) {
-    command = path::join(
-        flags.build_dir.get(), "src", "balloon-executor");
+    command = path::join(flags.build_dir.get(), "src", EXECUTOR_BINARY);
   } else {
-    command = path::join(
-        os::realpath(Path(argv[0]).dirname()).get(),
-        "balloon-executor");
+    command =
+      path::join(os::realpath(Path(argv[0]).dirname()).get(), EXECUTOR_BINARY);
   }
 
   executor.mutable_command()->set_value(command);
 
+  if (flags.executor_uris.isSome() && flags.executor_uri.isSome()) {
+    EXIT(EXIT_FAILURE)
+      << "Flag '--executor_uris' shall not be used with '--executor_uri'";
+  }
+
   // Copy `--executor_uri` into the command.
   if (flags.executor_uri.isSome()) {
+    LOG(WARNING)
+      << "Flag '--executor_uri' is deprecated, use '--executor_uris' instead";
+
     mesos::CommandInfo::URI* uri = executor.mutable_command()->add_uris();
     uri->set_value(flags.executor_uri.get());
     uri->set_executable(true);
   }
 
-  BalloonScheduler scheduler(executor, flags);
+  // Copy `--executor_uris` into the command.
+  if (flags.executor_uris.isSome()) {
+    Try<RepeatedPtrField<mesos::CommandInfo::URI>> parse =
+      ::protobuf::parse<RepeatedPtrField<mesos::CommandInfo::URI>>(
+          flags.executor_uris.get());
 
-  // Log any flag warnings (after logging is initialized by the scheduler).
-  foreach (const flags::Warning& warning, load->warnings) {
-    LOG(WARNING) << warning.message;
+    if (parse.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to convert '--executor_uris' to protobuf: " << parse.error();
+    }
+
+    executor.mutable_command()->mutable_uris()->CopyFrom(parse.get());
   }
 
   FrameworkInfo framework;
   framework.set_user(os::user().get());
-  framework.set_name("Balloon Framework (C++)");
+  framework.set_principal(flags.principal);
+  framework.set_name(flags.name);
   framework.set_checkpoint(flags.checkpoint);
+  framework.add_roles(flags.role);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::MULTI_ROLE);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+
+  BalloonScheduler scheduler(framework, executor, flags);
+
+  if (flags.master == "local") {
+    // Configure master.
+    os::setenv("MESOS_ROLES", flags.role);
+    os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", stringify(flags.authenticate));
+
+    ACLs acls;
+    ACL::RegisterFramework* acl = acls.add_register_frameworks();
+    acl->mutable_principals()->set_type(ACL::Entity::ANY);
+    acl->mutable_roles()->add_values(flags.role);
+    os::setenv("MESOS_ACLS", stringify(JSON::protobuf(acls)));
+  }
 
   MesosSchedulerDriver* driver;
 
-  // TODO(josephw): Refactor these into a common set of flags.
-  Option<string> value = os::getenv("MESOS_AUTHENTICATE_FRAMEWORKS");
-  if (value.isSome()) {
+  if (flags.authenticate) {
     LOG(INFO) << "Enabling authentication for the framework";
 
-    value = os::getenv("DEFAULT_PRINCIPAL");
-    if (value.isNone()) {
-      EXIT(EXIT_FAILURE)
-        << "Expecting authentication principal in the environment";
-    }
-
     Credential credential;
-    credential.set_principal(value.get());
-
-    framework.set_principal(value.get());
-
-    value = os::getenv("DEFAULT_SECRET");
-    if (value.isNone()) {
-      EXIT(EXIT_FAILURE)
-        << "Expecting authentication secret in the environment";
+    credential.set_principal(flags.principal);
+    if (flags.secret.isSome()) {
+      credential.set_secret(flags.secret.get());
     }
 
-    credential.set_secret(value.get());
-
     driver = new MesosSchedulerDriver(
-        &scheduler, framework, flags.master, credential);
+        &scheduler,
+        framework,
+        flags.master,
+        credential);
   } else {
-    framework.set_principal("balloon-framework-cpp");
-
     driver = new MesosSchedulerDriver(
-        &scheduler, framework, flags.master);
+        &scheduler,
+        framework,
+        flags.master);
   }
 
   int status = driver->run() == DRIVER_STOPPED ? 0 : 1;

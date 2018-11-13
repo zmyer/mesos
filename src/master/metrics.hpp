@@ -20,8 +20,11 @@
 #include <string>
 #include <vector>
 
+#include <mesos/scheduler/scheduler.hpp>
+
 #include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
+#include <process/metrics/pull_gauge.hpp>
+#include <process/metrics/push_gauge.hpp>
 #include <process/metrics/metrics.hpp>
 
 #include <stout/hashmap.hpp>
@@ -41,28 +44,28 @@ struct Metrics
 
   ~Metrics();
 
-  process::metrics::Gauge uptime_secs;
-  process::metrics::Gauge elected;
+  process::metrics::PullGauge uptime_secs;
+  process::metrics::PullGauge elected;
 
-  process::metrics::Gauge slaves_connected;
-  process::metrics::Gauge slaves_disconnected;
-  process::metrics::Gauge slaves_active;
-  process::metrics::Gauge slaves_inactive;
-  process::metrics::Gauge slaves_unreachable;
+  process::metrics::PullGauge slaves_connected;
+  process::metrics::PullGauge slaves_disconnected;
+  process::metrics::PullGauge slaves_active;
+  process::metrics::PullGauge slaves_inactive;
+  process::metrics::PullGauge slaves_unreachable;
 
-  process::metrics::Gauge frameworks_connected;
-  process::metrics::Gauge frameworks_disconnected;
-  process::metrics::Gauge frameworks_active;
-  process::metrics::Gauge frameworks_inactive;
+  process::metrics::PullGauge frameworks_connected;
+  process::metrics::PullGauge frameworks_disconnected;
+  process::metrics::PullGauge frameworks_active;
+  process::metrics::PullGauge frameworks_inactive;
 
-  process::metrics::Gauge outstanding_offers;
+  process::metrics::PullGauge outstanding_offers;
 
   // Task state metrics.
-  process::metrics::Gauge tasks_staging;
-  process::metrics::Gauge tasks_starting;
-  process::metrics::Gauge tasks_running;
-  process::metrics::Gauge tasks_unreachable;
-  process::metrics::Gauge tasks_killing;
+  process::metrics::PullGauge tasks_staging;
+  process::metrics::PullGauge tasks_starting;
+  process::metrics::PullGauge tasks_running;
+  process::metrics::PullGauge tasks_unreachable;
+  process::metrics::PullGauge tasks_killing;
   process::metrics::Counter tasks_finished;
   process::metrics::Counter tasks_failed;
   process::metrics::Counter tasks_killed;
@@ -135,8 +138,10 @@ struct Metrics
   process::metrics::Counter messages_decline_offers;
   process::metrics::Counter messages_revive_offers;
   process::metrics::Counter messages_suppress_offers;
+  process::metrics::Counter messages_reconcile_operations;
   process::metrics::Counter messages_reconcile_tasks;
   process::metrics::Counter messages_framework_to_executor;
+  process::metrics::Counter messages_operation_status_update_acknowledgement;
 
   // Messages from executors.
   process::metrics::Counter messages_executor_to_framework;
@@ -163,13 +168,16 @@ struct Metrics
   process::metrics::Counter valid_status_update_acknowledgements;
   process::metrics::Counter invalid_status_update_acknowledgements;
 
+  process::metrics::Counter valid_operation_status_update_acknowledgements;
+  process::metrics::Counter invalid_operation_status_update_acknowledgements;
+
   // Recovery counters.
   process::metrics::Counter recovery_slave_removals;
 
   // Process metrics.
-  process::metrics::Gauge event_queue_messages;
-  process::metrics::Gauge event_queue_dispatches;
-  process::metrics::Gauge event_queue_http_requests;
+  process::metrics::PullGauge event_queue_messages;
+  process::metrics::PullGauge event_queue_dispatches;
+  process::metrics::PullGauge event_queue_http_requests;
 
   // Successful registry operations.
   process::metrics::Counter slave_registrations;
@@ -192,20 +200,85 @@ struct Metrics
   process::metrics::Counter slave_unreachable_canceled;
 
   // Non-revocable resources.
-  std::vector<process::metrics::Gauge> resources_total;
-  std::vector<process::metrics::Gauge> resources_used;
-  std::vector<process::metrics::Gauge> resources_percent;
+  std::vector<process::metrics::PullGauge> resources_total;
+  std::vector<process::metrics::PullGauge> resources_used;
+  std::vector<process::metrics::PullGauge> resources_percent;
 
   // Revocable resources.
-  std::vector<process::metrics::Gauge> resources_revocable_total;
-  std::vector<process::metrics::Gauge> resources_revocable_used;
-  std::vector<process::metrics::Gauge> resources_revocable_percent;
+  std::vector<process::metrics::PullGauge> resources_revocable_total;
+  std::vector<process::metrics::PullGauge> resources_revocable_used;
+  std::vector<process::metrics::PullGauge> resources_revocable_percent;
+
+  void incrementInvalidSchedulerCalls(const mesos::scheduler::Call& call);
 
   void incrementTasksStates(
       const TaskState& state,
       const TaskStatus::Source& source,
       const TaskStatus::Reason& reason);
 };
+
+
+struct FrameworkMetrics
+{
+  FrameworkMetrics(
+      const FrameworkInfo& _frameworkInfo,
+      bool publishPerFrameworkMetrics);
+
+  ~FrameworkMetrics();
+
+  void incrementCall(const mesos::scheduler::Call::Type& callType);
+
+  void incrementEvent(const mesos::scheduler::Event& event);
+
+  // Overloads to convert unversioned messages into events.
+  void incrementEvent(const FrameworkErrorMessage& message);
+  void incrementEvent(const ExitedExecutorMessage& message);
+  void incrementEvent(const LostSlaveMessage& message);
+  void incrementEvent(const InverseOffersMessage& message);
+  void incrementEvent(const ExecutorToFrameworkMessage& message);
+  void incrementEvent(const ResourceOffersMessage& message);
+  void incrementEvent(const RescindResourceOfferMessage& message);
+  void incrementEvent(const RescindInverseOfferMessage& message);
+  void incrementEvent(const FrameworkRegisteredMessage& message);
+  void incrementEvent(const FrameworkReregisteredMessage& message);
+  void incrementEvent(const StatusUpdateMessage& message);
+  void incrementEvent(const UpdateOperationStatusMessage& message);
+
+  void incrementTaskState(const TaskState& state);
+  void decrementActiveTaskState(const TaskState& state);
+
+  void incrementOperation(const Offer::Operation& operation);
+
+  template <typename T> void addMetric(const T& metric);
+  template <typename T> void removeMetric(const T& metric);
+
+  const FrameworkInfo frameworkInfo;
+
+  bool publishPerFrameworkMetrics;
+
+  process::metrics::PushGauge subscribed;
+
+  process::metrics::Counter calls;
+  hashmap<mesos::scheduler::Call::Type, process::metrics::Counter> call_types;
+
+  process::metrics::Counter events;
+  hashmap<mesos::scheduler::Event::Type, process::metrics::Counter> event_types;
+
+  process::metrics::Counter offers_sent;
+  process::metrics::Counter offers_accepted;
+  process::metrics::Counter offers_declined;
+  process::metrics::Counter offers_rescinded;
+
+  hashmap<TaskState, process::metrics::Counter> terminal_task_states;
+
+  hashmap<TaskState, process::metrics::PushGauge> active_task_states;
+
+  process::metrics::Counter operations;
+  hashmap<Offer::Operation::Type, process::metrics::Counter> operation_types;
+};
+
+
+std::string getFrameworkMetricPrefix(const FrameworkInfo& frameworkInfo);
 
 } // namespace master {
 } // namespace internal {

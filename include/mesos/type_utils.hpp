@@ -27,7 +27,6 @@
 
 #include <mesos/mesos.hpp>
 
-#include <stout/hashmap.hpp>
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 #include <stout/uuid.hpp>
@@ -49,13 +48,27 @@ bool operator==(const CheckStatusInfo& left, const CheckStatusInfo& right);
 bool operator==(const CommandInfo& left, const CommandInfo& right);
 bool operator==(const CommandInfo::URI& left, const CommandInfo::URI& right);
 bool operator==(const ContainerID& left, const ContainerID& right);
+bool operator==(const ContainerInfo& left, const ContainerInfo& right);
 bool operator==(const Credential& left, const Credential& right);
+bool operator==(const CSIPluginInfo& left, const CSIPluginInfo& right);
+
+bool operator==(
+    const CSIPluginContainerInfo& left,
+    const CSIPluginContainerInfo& right);
+
 bool operator==(const DiscoveryInfo& left, const DiscoveryInfo& right);
 bool operator==(const Environment& left, const Environment& right);
 bool operator==(const ExecutorInfo& left, const ExecutorInfo& right);
 bool operator==(const Label& left, const Label& right);
 bool operator==(const Labels& left, const Labels& right);
 bool operator==(const MasterInfo& left, const MasterInfo& right);
+bool operator==(const Offer::Operation& left, const Offer::Operation& right);
+bool operator==(const Operation& left, const Operation& right);
+bool operator==(const OperationStatus& left, const OperationStatus& right);
+
+bool operator==(
+    const ResourceProviderInfo& left,
+    const ResourceProviderInfo& right);
 
 bool operator==(
     const ResourceStatistics& left,
@@ -67,13 +80,17 @@ bool operator==(const TaskGroupInfo& left, const TaskGroupInfo& right);
 bool operator==(const TaskInfo& left, const TaskInfo& right);
 bool operator==(const TaskStatus& left, const TaskStatus& right);
 bool operator==(const URL& left, const URL& right);
+bool operator==(const UUID& left, const UUID& right);
 bool operator==(const Volume& left, const Volume& right);
 
 bool operator!=(const CheckStatusInfo& left, const CheckStatusInfo& right);
 bool operator!=(const ExecutorInfo& left, const ExecutorInfo& right);
 bool operator!=(const Labels& left, const Labels& right);
-bool operator!=(const TaskStatus& left, const TaskStatus& right);
+bool operator!=(const Offer::Operation& left, const Offer::Operation& right);
+bool operator!=(const Operation& left, const Operation& right);
+bool operator!=(const OperationStatus& left, const OperationStatus& right);
 
+bool operator!=(const TaskStatus& left, const TaskStatus& right);
 
 inline bool operator==(const ExecutorID& left, const ExecutorID& right)
 {
@@ -94,6 +111,20 @@ inline bool operator==(const FrameworkInfo& left, const FrameworkInfo& right)
 
 
 inline bool operator==(const OfferID& left, const OfferID& right)
+{
+  return left.value() == right.value();
+}
+
+
+inline bool operator==(const OperationID& left, const OperationID& right)
+{
+  return left.value() == right.value();
+}
+
+
+inline bool operator==(
+    const ResourceProviderID& left,
+    const ResourceProviderID& right)
 {
   return left.value() == right.value();
 }
@@ -159,6 +190,36 @@ inline bool operator==(const TaskID& left, const std::string& right)
 }
 
 
+inline bool operator==(
+    const DomainInfo::FaultDomain::RegionInfo& left,
+    const DomainInfo::FaultDomain::RegionInfo& right)
+{
+  return left.name() == right.name();
+}
+
+
+inline bool operator==(
+    const DomainInfo::FaultDomain::ZoneInfo& left,
+    const DomainInfo::FaultDomain::ZoneInfo& right)
+{
+  return left.name() == right.name();
+}
+
+
+inline bool operator==(
+    const DomainInfo::FaultDomain& left,
+    const DomainInfo::FaultDomain& right)
+{
+  return left.region() == right.region() && left.zone() == right.zone();
+}
+
+
+inline bool operator==(const DomainInfo& left, const DomainInfo& right)
+{
+  return left.fault_domain() == right.fault_domain();
+}
+
+
 /**
  * For machines to match, both the `hostname` and `ip` must be equivalent.
  * Hostname is not case sensitive, so it is lowercased before comparison.
@@ -180,6 +241,14 @@ inline bool operator!=(const ContainerID& left, const ContainerID& right)
 }
 
 
+inline bool operator!=(
+    const CSIPluginContainerInfo& left,
+    const CSIPluginContainerInfo& right)
+{
+  return !(left == right);
+}
+
+
 inline bool operator!=(const ExecutorID& left, const ExecutorID& right)
 {
   return left.value() != right.value();
@@ -192,9 +261,31 @@ inline bool operator!=(const FrameworkID& left, const FrameworkID& right)
 }
 
 
+inline bool operator!=(const OperationID& left, const OperationID& right)
+{
+  return left.value() != right.value();
+}
+
+
+inline bool operator!=(
+    const ResourceProviderID& left,
+    const ResourceProviderID& right)
+{
+  return left.value() != right.value();
+}
+
+
 inline bool operator!=(const SlaveID& left, const SlaveID& right)
 {
   return left.value() != right.value();
+}
+
+
+inline bool operator!=(
+    const ResourceProviderInfo& left,
+    const ResourceProviderInfo& right)
+{
+  return !(left == right);
 }
 
 
@@ -204,9 +295,23 @@ inline bool operator!=(const TimeInfo& left, const TimeInfo& right)
 }
 
 
+inline bool operator!=(const UUID& left, const UUID& right)
+{
+  return !(left == right);
+}
+
+
 inline bool operator!=(const DurationInfo& left, const DurationInfo& right)
 {
   return !(left == right);
+}
+
+
+inline bool operator!=(
+    const DomainInfo::FaultDomain::RegionInfo& left,
+    const DomainInfo::FaultDomain::RegionInfo& right)
+{
+  return left.name() != right.name();
 }
 
 
@@ -251,6 +356,16 @@ std::ostream& operator<<(
     const CapabilityInfo& capabilityInfo);
 
 
+std::ostream& operator<<(
+    std::ostream& stream,
+    const DeviceWhitelist& deviceWhitelist);
+
+
+std::ostream& operator<<(
+    std::ostream& stream,
+    const CheckStatusInfo& checkStatusInfo);
+
+
 std::ostream& operator<<(std::ostream& stream, const CommandInfo& commandInfo);
 
 
@@ -260,6 +375,12 @@ std::ostream& operator<<(std::ostream& stream, const ContainerID& containerId);
 std::ostream& operator<<(
     std::ostream& stream,
     const ContainerInfo& containerInfo);
+
+
+std::ostream& operator<<(std::ostream& stream, const DomainInfo& domainInfo);
+
+
+std::ostream& operator<<(std::ostream& stream, const Environment& environment);
 
 
 std::ostream& operator<<(std::ostream& stream, const ExecutorID& executorId);
@@ -277,7 +398,26 @@ std::ostream& operator<<(std::ostream& stream, const MasterInfo& master);
 std::ostream& operator<<(std::ostream& stream, const OfferID& offerId);
 
 
+std::ostream& operator<<(std::ostream& stream, const OperationID& operationId);
+
+
+std::ostream& operator<<(std::ostream& stream, const OperationState& state);
+
+
 std::ostream& operator<<(std::ostream& stream, const RateLimits& limits);
+
+
+std::ostream& operator<<(
+    std::ostream& stream,
+    const ResourceProviderID& resourceProviderId);
+
+
+std::ostream& operator<<(
+    std::ostream& stream,
+    const ResourceProviderInfo& resourceProviderInfo);
+
+
+std::ostream& operator<<(std::ostream& stream, const RLimitInfo& rlimitInfo);
 
 
 std::ostream& operator<<(std::ostream& stream, const SlaveID& slaveId);
@@ -300,7 +440,15 @@ std::ostream& operator<<(std::ostream& stream, const TaskState& state);
 
 std::ostream& operator<<(
     std::ostream& stream,
-    const std::vector<TaskID>& taskIds);
+    const UUID& uuid);
+
+
+std::ostream& operator<<(std::ostream& stream, const CheckInfo::Type& type);
+
+
+std::ostream& operator<<(
+    std::ostream& stream,
+    const CSIPluginContainerInfo::Service& service);
 
 
 std::ostream& operator<<(
@@ -311,7 +459,17 @@ std::ostream& operator<<(
 std::ostream& operator<<(std::ostream& stream, const Image::Type& imageType);
 
 
-std::ostream& operator<<(std::ostream& stream, const RLimitInfo& rlimitInfo);
+std::ostream& operator<<(std::ostream& stream, const Secret::Type& secretType);
+
+
+std::ostream& operator<<(
+    std::ostream& stream,
+    const Offer::Operation::Type& operationType);
+
+
+std::ostream& operator<<(
+    std::ostream& stream,
+    const Resource::DiskInfo::Source::Type& sourceType);
 
 
 template <typename T>
@@ -331,20 +489,32 @@ inline std::ostream& operator<<(
 }
 
 
-std::ostream& operator<<(
+template <typename T>
+inline std::ostream& operator<<(
     std::ostream& stream,
-    const hashmap<std::string, std::string>& map);
+    const std::vector<T>& messages)
+{
+  stream << "[ ";
+  for (auto it = messages.begin(); it != messages.end(); ++it) {
+    if (it != messages.begin()) {
+      stream << ", ";
+    }
+    stream << *it;
+  }
+  stream << " ]";
+  return stream;
+}
 
 } // namespace mesos {
 
 namespace std {
 
 template <>
-struct hash<mesos::CommandInfo_URI>
+struct hash<mesos::CommandInfo::URI>
 {
   typedef size_t result_type;
 
-  typedef mesos::CommandInfo_URI argument_type;
+  typedef mesos::CommandInfo::URI argument_type;
 
   result_type operator()(const argument_type& uri) const
   {
@@ -359,6 +529,7 @@ struct hash<mesos::CommandInfo_URI>
     }
 
     boost::hash_combine(seed, uri.value());
+    boost::hash_combine(seed, uri.output_file());
     return seed;
   }
 };
@@ -557,6 +728,54 @@ struct hash<mesos::MachineID>
     size_t seed = 0;
     boost::hash_combine(seed, strings::lower(machineId.hostname()));
     boost::hash_combine(seed, machineId.ip());
+    return seed;
+  }
+};
+
+
+template <>
+struct hash<mesos::OperationID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::OperationID argument_type;
+
+  result_type operator()(const argument_type& operationId) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, operationId.value());
+    return seed;
+  }
+};
+
+
+template <>
+struct hash<mesos::ResourceProviderID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::ResourceProviderID argument_type;
+
+  result_type operator()(const argument_type& resourceProviderId) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, resourceProviderId.value());
+    return seed;
+  }
+};
+
+
+template <>
+struct hash<mesos::UUID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::UUID argument_type;
+
+  result_type operator()(const argument_type& uuid) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, uuid.value());
     return seed;
   }
 };

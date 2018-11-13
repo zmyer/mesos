@@ -56,11 +56,14 @@ class ZooKeeperMasterDetectorProcess
   : public Process<ZooKeeperMasterDetectorProcess>
 {
 public:
-  explicit ZooKeeperMasterDetectorProcess(const zookeeper::URL& url);
-  explicit ZooKeeperMasterDetectorProcess(Owned<Group> group);
-  ~ZooKeeperMasterDetectorProcess();
+  explicit ZooKeeperMasterDetectorProcess(
+      const zookeeper::URL& url,
+      const Duration& sessionTimeout);
 
-  virtual void initialize();
+  explicit ZooKeeperMasterDetectorProcess(Owned<Group> group);
+  ~ZooKeeperMasterDetectorProcess() override;
+
+  void initialize() override;
   Future<Option<MasterInfo>> detect(const Option<MasterInfo>& previous);
 
 private:
@@ -86,12 +89,12 @@ private:
 };
 
 
-// TODO(benh): Get ZooKeeper timeout from configuration.
 ZooKeeperMasterDetectorProcess::ZooKeeperMasterDetectorProcess(
-    const zookeeper::URL& url)
+    const zookeeper::URL& url,
+    const Duration& sessionTimeout)
   : ZooKeeperMasterDetectorProcess(Owned<Group>(
     new Group(url.servers,
-              MASTER_DETECTOR_ZK_SESSION_TIMEOUT,
+              sessionTimeout,
               url.path,
               url.authentication))) {}
 
@@ -131,7 +134,7 @@ Future<Option<MasterInfo>> ZooKeeperMasterDetectorProcess::detect(
   // Return immediately if the detector is no longer operational due
   // to a non-retryable error.
   if (error.isSome()) {
-    return Failure(error.get().message);
+    return Failure(error->message);
   }
 
   if (leader != previous) {
@@ -167,14 +170,14 @@ void ZooKeeperMasterDetectorProcess::detected(
     return;
   }
 
-  if (_leader.get().isNone()) {
+  if (_leader->isNone()) {
     leader = None();
 
     setPromises(&promises, leader);
   } else {
     // Fetch the data associated with the leader.
-    group->data(_leader.get().get())
-      .onAny(defer(self(), &Self::fetched, _leader.get().get(), lambda::_1));
+    group->data(_leader->get())
+      .onAny(defer(self(), &Self::fetched, _leader->get(), lambda::_1));
   }
 
   // Keep trying to detect leadership changes.
@@ -193,7 +196,7 @@ void ZooKeeperMasterDetectorProcess::fetched(
     leader = None();
     failPromises(&promises, data.failure());
     return;
-  } else if (data.get().isNone()) {
+  } else if (data->isNone()) {
     // Membership is gone before we can read its data.
     leader = None();
     setPromises(&promises, leader);
@@ -206,13 +209,13 @@ void ZooKeeperMasterDetectorProcess::fetched(
   if (label.isNone()) {
     // If we are here it means some masters are still creating znodes
     // with the old format.
-    UPID pid = UPID(data.get().get());
+    UPID pid = UPID(data->get());
     LOG(WARNING) << "Leading master " << pid << " has data in old format";
     leader = mesos::internal::protobuf::createMasterInfo(pid);
   } else if (label.isSome() &&
              label.get() == internal::master::MASTER_INFO_LABEL) {
     MasterInfo info;
-    if (!info.ParseFromString(data.get().get())) {
+    if (!info.ParseFromString(data->get())) {
       leader = None();
       failPromises(&promises,
           "Failed to parse data into MasterInfo");
@@ -225,7 +228,7 @@ void ZooKeeperMasterDetectorProcess::fetched(
     leader = info;
   } else if (label.isSome() &&
              label.get() == internal::master::MASTER_INFO_JSON_LABEL) {
-    Try<JSON::Object> object = JSON::parse<JSON::Object>(data.get().get());
+    Try<JSON::Object> object = JSON::parse<JSON::Object>(data->get());
 
     if (object.isError()) {
       leader = None();
@@ -257,15 +260,17 @@ void ZooKeeperMasterDetectorProcess::fetched(
   }
 
   LOG(INFO) << "A new leading master (UPID="
-            << UPID(leader.get().pid()) << ") is detected";
+            << UPID(leader->pid()) << ") is detected";
 
   setPromises(&promises, leader);
 }
 
 
-ZooKeeperMasterDetector::ZooKeeperMasterDetector(const zookeeper::URL& url)
+ZooKeeperMasterDetector::ZooKeeperMasterDetector(
+    const zookeeper::URL& url,
+    const Duration& sessionTimeout)
 {
-  process = new ZooKeeperMasterDetectorProcess(url);
+  process = new ZooKeeperMasterDetectorProcess(url, sessionTimeout);
   spawn(process);
 }
 

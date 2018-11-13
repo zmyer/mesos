@@ -46,9 +46,12 @@ class ZooKeeperMasterContenderProcess
   : public Process<ZooKeeperMasterContenderProcess>
 {
 public:
-  explicit ZooKeeperMasterContenderProcess(const zookeeper::URL& url);
+  explicit ZooKeeperMasterContenderProcess(
+      const zookeeper::URL& url,
+      const Duration& sessionTimeout);
+
   explicit ZooKeeperMasterContenderProcess(Owned<zookeeper::Group> group);
-  virtual ~ZooKeeperMasterContenderProcess();
+  ~ZooKeeperMasterContenderProcess() override;
 
   // Explicitly use 'initialize' since we're overloading below.
   using process::ProcessBase::initialize;
@@ -68,9 +71,11 @@ private:
 };
 
 
-ZooKeeperMasterContender::ZooKeeperMasterContender(const zookeeper::URL& url)
+ZooKeeperMasterContender::ZooKeeperMasterContender(
+    const zookeeper::URL& url,
+    const Duration& sessionTimeout)
 {
-  process = new ZooKeeperMasterContenderProcess(url);
+  process = new ZooKeeperMasterContenderProcess(url, sessionTimeout);
   spawn(process);
 }
 
@@ -103,9 +108,10 @@ Future<Future<Nothing>> ZooKeeperMasterContender::contend()
 
 
 ZooKeeperMasterContenderProcess::ZooKeeperMasterContenderProcess(
-    const zookeeper::URL& url)
+    const zookeeper::URL& url,
+    const Duration& sessionTimeout)
   : ZooKeeperMasterContenderProcess(Owned<Group>(
-    new Group(url, MASTER_CONTENDER_ZK_SESSION_TIMEOUT))) {}
+    new Group(url, sessionTimeout))) {}
 
 
 ZooKeeperMasterContenderProcess::ZooKeeperMasterContenderProcess(
@@ -120,6 +126,7 @@ ZooKeeperMasterContenderProcess::~ZooKeeperMasterContenderProcess()
   delete contender;
 }
 
+
 void ZooKeeperMasterContenderProcess::initialize(const MasterInfo& _masterInfo)
 {
   masterInfo = _masterInfo;
@@ -133,7 +140,7 @@ Future<Future<Nothing>> ZooKeeperMasterContenderProcess::contend()
   }
 
   // Should not recontend if the last election is still ongoing.
-  if (candidacy.isSome() && candidacy.get().isPending()) {
+  if (candidacy.isSome() && candidacy->isPending()) {
     return candidacy.get();
   }
 

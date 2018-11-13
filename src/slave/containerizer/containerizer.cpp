@@ -18,6 +18,8 @@
 #include <set>
 #include <vector>
 
+#include <mesos/secret/resolver.hpp>
+
 #include <process/dispatch.hpp>
 #include <process/owned.hpp>
 
@@ -32,6 +34,7 @@
 #include "hook/manager.hpp"
 
 #include "slave/flags.hpp"
+#include "slave/gc.hpp"
 #include "slave/slave.hpp"
 
 #include "slave/containerizer/composing.hpp"
@@ -89,14 +92,15 @@ Try<Resources> Containerizer::resources(const Flags& flags)
   bool hasPorts = false;
 
   foreach (const Resource& resource, resourceList) {
-    if (resource.name() == "cpus")
+    if (resource.name() == "cpus") {
       hasCpus = true;
-    else if (resource.name() == "mem")
+    } else if (resource.name() == "mem") {
       hasMem = true;
-    else if (resource.name() == "disk")
+    } else if (resource.name() == "disk") {
       hasDisk = true;
-    else if (resource.name() == "ports")
+    } else if (resource.name() == "ports") {
       hasPorts = true;
+    }
   }
 
   if (!hasCpus) {
@@ -145,7 +149,7 @@ Try<Resources> Containerizer::resources(const Flags& flags)
                     << "' ; defaulting to DEFAULT_MEM";
       mem = DEFAULT_MEM;
     } else {
-      Bytes total = mem_.get().total;
+      Bytes total = mem_->total;
       if (total >= Gigabytes(2)) {
         mem = total - Gigabytes(1); // Leave 1GB free.
       } else {
@@ -153,9 +157,11 @@ Try<Resources> Containerizer::resources(const Flags& flags)
       }
     }
 
+    // NOTE: The size is truncated here to preserve the existing
+    // behavior for backward compatibility.
     resources += Resources::parse(
         "mem",
-        stringify(mem.megabytes()),
+        stringify(mem.bytes() / Bytes::MEGABYTES),
         flags.default_role).get();
   }
 
@@ -181,9 +187,11 @@ Try<Resources> Containerizer::resources(const Flags& flags)
       }
     }
 
+    // NOTE: The size is truncated here to preserve the existing
+    // behavior for backward compatibility.
     resources += Resources::parse(
         "disk",
-        stringify(disk.megabytes()),
+        stringify(disk.bytes() / Bytes::MEGABYTES),
         flags.default_role).get();
   }
 
@@ -208,7 +216,9 @@ Try<Resources> Containerizer::resources(const Flags& flags)
 Try<Containerizer*> Containerizer::create(
     const Flags& flags,
     bool local,
-    Fetcher* fetcher)
+    Fetcher* fetcher,
+    GarbageCollector* gc,
+    SecretResolver* secretResolver)
 {
   // Get the set of containerizer types.
   const vector<string> _types = strings::split(flags.containerizers, ",");
@@ -277,8 +287,8 @@ Try<Containerizer*> Containerizer::create(
 
   foreach (const string& type, containerizerTypes) {
     if (type == "mesos") {
-      Try<MesosContainerizer*> containerizer =
-        MesosContainerizer::create(flags, local, fetcher, nvidia);
+      Try<MesosContainerizer*> containerizer = MesosContainerizer::create(
+          flags, local, fetcher, gc, secretResolver, nvidia);
       if (containerizer.isError()) {
         return Error("Could not create MesosContainerizer: " +
                      containerizer.error());

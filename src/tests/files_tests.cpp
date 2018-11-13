@@ -40,8 +40,6 @@
 
 #include "tests/mesos.hpp"
 
-namespace authentication = process::http::authentication;
-
 using process::Future;
 using process::Owned;
 
@@ -51,6 +49,10 @@ using process::http::NotFound;
 using process::http::OK;
 using process::http::Response;
 using process::http::Unauthorized;
+
+using process::http::authentication::Principal;
+using process::http::authentication::setAuthenticator;
+using process::http::authentication::unsetAuthenticator;
 
 using std::string;
 
@@ -67,7 +69,7 @@ protected:
       const string& realm,
       const Credentials& credentials)
   {
-    Try<authentication::Authenticator*> authenticator =
+    Try<process::http::authentication::Authenticator*> authenticator =
       BasicAuthenticatorFactory::create(realm, credentials);
 
     ASSERT_SOME(authenticator);
@@ -76,17 +78,18 @@ protected:
     realms.insert(realm);
 
     // Pass ownership of the authenticator to libprocess.
-    AWAIT_READY(authentication::setAuthenticator(
+    AWAIT_READY(setAuthenticator(
         realm,
-        Owned<authentication::Authenticator>(authenticator.get())));
+        Owned<process::http::authentication::Authenticator>(
+            authenticator.get())));
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     foreach (const string& realm, realms) {
       // We need to wait in order to ensure that the operation completes before
       // we leave `TearDown`. Otherwise, we may leak a mock object.
-      AWAIT_READY(authentication::unsetAuthenticator(realm));
+      AWAIT_READY(unsetAuthenticator(realm));
     }
 
     realms.clear();
@@ -110,7 +113,7 @@ TEST_F(FilesTest, AttachTest)
   AWAIT_EXPECT_READY(files.attach("file", "myname"));       // Re-attach.
   AWAIT_EXPECT_FAILED(files.attach("missing", "somename")); // Missing file.
 
-  auto authorization = [](const Option<string>&) { return true; };
+  auto authorization = [](const Option<Principal>&) { return true; };
 
   // Attach with required authorization.
   AWAIT_EXPECT_READY(files.attach("file", "myname", authorization));
@@ -183,7 +186,7 @@ TEST_F(FilesTest, ReadTest)
 
   // Test reads with authorization enabled.
   bool authorized = true;
-  auto authorization = [&authorized](const Option<string>&) {
+  auto authorization = [&authorized](const Option<Principal>&) {
     return authorized;
   };
 
@@ -238,20 +241,20 @@ TEST_F(FilesTest, ReadTest)
 }
 
 
-TEST_F_TEMP_DISABLED_ON_WINDOWS(FilesTest, ResolveTest)
+TEST_F(FilesTest, ResolveTest)
 {
   Files files;
   process::UPID upid("files", process::address());
 
   // Test the directory / file resolution.
-  ASSERT_SOME(os::mkdir("1/2"));
-  ASSERT_SOME(os::write("1/two", "two"));
-  ASSERT_SOME(os::write("1/2/three", "three"));
+  ASSERT_SOME(os::mkdir(path::join("1", "2")));
+  ASSERT_SOME(os::write(path::join("1", "two"), "two"));
+  ASSERT_SOME(os::write(path::join(path::join("1", "2"), "three"), "three"));
 
   // Attach some paths.
   AWAIT_EXPECT_READY(files.attach("1", "one"));
   AWAIT_EXPECT_READY(files.attach("1", "/one/"));
-  AWAIT_EXPECT_READY(files.attach("1/2", "two"));
+  AWAIT_EXPECT_READY(files.attach(path::join("1", "2"), "two"));
   AWAIT_EXPECT_READY(files.attach("1/2", "one/two"));
 
   // Resolve 1/2/3 via each attached path.
@@ -317,15 +320,57 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FilesTest, ResolveTest)
 }
 
 
-TEST_F_TEMP_DISABLED_ON_WINDOWS(FilesTest, BrowseTest)
+// Tests paths with percent-encoded sequences in the HTTP request
+// query. Very specifically, this checks that a percent-encoded symbol
+// is not "double decoded." That is to say, say we have a literal path
+// `foo%3Abar` because we couldn't use `:` literally on Windows, and
+// so instead encoded it literally in the file path on Windows. This
+// demonstrated a bug in libprocess where the encoding `%3A` was
+// decoded too many times, and so the query was for `foo:bar` instead
+// of literally `foo%3Abar`.
+TEST_F(FilesTest, QueryWithEncodedSequence)
 {
   Files files;
   process::UPID upid("files", process::address());
 
-  ASSERT_SOME(os::mkdir("1/2"));
-  ASSERT_SOME(os::mkdir("1/3"));
-  ASSERT_SOME(os::write("1/two", "two"));
-  ASSERT_SOME(os::write("1/three", "three"));
+  // This path has the ASCII escape sequence `%3A` literally instead
+  // of `:` because the latter is a reserved character on Windows.
+  //
+  // NOTE: This is not just an arbitrary character such as `+`, it is
+  // explicitly a percent-encoded sequence, but it could be e.g. `+`
+  // percent-encoded as `%2B`. Hence the assertion that this could be
+  // decoded again.
+  const string filename = "foo%3Abar";
+  ASSERT_SOME_EQ("foo:bar", process::http::decode(filename));
+
+  ASSERT_SOME(os::write(filename, "body"));
+  ASSERT_SOME_EQ("body", os::read(filename));
+  AWAIT_EXPECT_READY(files.attach(sandbox.get(), "/"));
+
+  // NOTE: The query here has to be encoded because it is a `string`
+  // and not a `hashmap<string, string>`. The latter is automatically
+  // encoded, but the former is not.
+  Future<Response> response = process::http::get(
+      upid, "read", "path=/" + process::http::encode(filename) + "&offset=0");
+
+  JSON::Object expected;
+  expected.values["offset"] = 0;
+  expected.values["data"] = "body";
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+}
+
+
+TEST_F(FilesTest, BrowseTest)
+{
+  Files files;
+  process::UPID upid("files", process::address());
+
+  ASSERT_SOME(os::mkdir(path::join("1", "2")));
+  ASSERT_SOME(os::mkdir(path::join("1", "3")));
+  ASSERT_SOME(os::write(path::join("1", "two"), "two"));
+  ASSERT_SOME(os::write(path::join("1", "three"), "three"));
   ASSERT_SOME(os::mkdir("2"));
 
   AWAIT_EXPECT_READY(files.attach("1", "one"));
@@ -333,14 +378,20 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FilesTest, BrowseTest)
   // Get the listing.
   struct stat s;
   JSON::Array expected;
-  ASSERT_EQ(0, stat("1/2", &s));
-  expected.values.push_back(model(protobuf::createFileInfo("one/2", s)));
-  ASSERT_EQ(0, stat("1/3", &s));
-  expected.values.push_back(model(protobuf::createFileInfo("one/3", s)));
-  ASSERT_EQ(0, stat("1/three", &s));
-  expected.values.push_back(model(protobuf::createFileInfo("one/three", s)));
-  ASSERT_EQ(0, stat("1/two", &s));
-  expected.values.push_back(model(protobuf::createFileInfo("one/two", s)));
+
+  // TODO(johnkord): As per MESOS-8275, we don't want to use stat on Windows.
+  ASSERT_EQ(0, ::stat(path::join("1", "2").c_str(), &s));
+  expected.values.push_back(
+      model(protobuf::createFileInfo(path::join("one", "2"), s)));
+  ASSERT_EQ(0, ::stat(path::join("1", "3").c_str(), &s));
+  expected.values.push_back(
+      model(protobuf::createFileInfo(path::join("one", "3"), s)));
+  ASSERT_EQ(0, ::stat(path::join("1", "three").c_str(), &s));
+  expected.values.push_back(
+      model(protobuf::createFileInfo(path::join("one", "three"), s)));
+  ASSERT_EQ(0, ::stat(path::join("1", "two").c_str(), &s));
+  expected.values.push_back(
+      model(protobuf::createFileInfo(path::join("one", "two"), s)));
 
   Future<Response> response =
       process::http::get(upid, "browse", "path=one/");
@@ -373,7 +424,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FilesTest, BrowseTest)
   files.detach("one");
 
   bool authorized = true;
-  auto authorization = [&authorized](const Option<string>&) {
+  auto authorization = [&authorized](const Option<Principal>&) {
     return authorized;
   };
 
@@ -463,7 +514,7 @@ TEST_F(FilesTest, DownloadTest)
 
   // Test downloads with authorization enabled.
   bool authorized = true;
-  auto authorization = [&authorized](const Option<string>&) {
+  auto authorization = [&authorized](const Option<Principal>&) {
     return authorized;
   };
 
@@ -583,22 +634,22 @@ TEST_F(FilesTest, AuthenticationTest)
 
   Future<Response> response = process::http::get(upid, "browse");
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
-  EXPECT_EQ(response.get().headers.at("WWW-Authenticate"),
+  EXPECT_EQ(response->headers.at("WWW-Authenticate"),
             expectedAuthorizationHeader);
 
   response = process::http::get(upid, "read");
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
-  EXPECT_EQ(response.get().headers.at("WWW-Authenticate"),
+  EXPECT_EQ(response->headers.at("WWW-Authenticate"),
             expectedAuthorizationHeader);
 
   response = process::http::get(upid, "download");
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
-  EXPECT_EQ(response.get().headers.at("WWW-Authenticate"),
+  EXPECT_EQ(response->headers.at("WWW-Authenticate"),
             expectedAuthorizationHeader);
 
   response = process::http::get(upid, "debug");
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
-  EXPECT_EQ(response.get().headers.at("WWW-Authenticate"),
+  EXPECT_EQ(response->headers.at("WWW-Authenticate"),
             expectedAuthorizationHeader);
 }
 

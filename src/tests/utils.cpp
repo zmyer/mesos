@@ -34,7 +34,9 @@
 
 namespace http = process::http;
 namespace inet = process::network::inet;
+namespace inet4 = process::network::inet4;
 
+using std::set;
 using std::string;
 
 using process::Future;
@@ -62,7 +64,7 @@ JSON::Object Metrics()
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
 
-  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
   CHECK_SOME(parse);
 
   return parse.get();
@@ -78,7 +80,7 @@ Try<uint16_t> getFreePort()
     return Error(socket.error());
   }
 
-  Try<inet::Address> address = socket->bind(inet::Address::ANY_ANY());
+  Try<inet::Address> address = socket->bind(inet4::Address::ANY_ANY());
 
   if (address.isError()) {
     return Error(address.error());
@@ -102,6 +104,7 @@ string getModulePath(const string& name)
   return path::join(path, os::libraries::expandName(name));
 }
 
+
 string getLibMesosPath()
 {
   string path = path::join(
@@ -117,6 +120,7 @@ string getLibMesosPath()
   return path;
 }
 
+
 string getLauncherDir()
 {
   string path = path::join(tests::flags.build_dir, "src");
@@ -127,6 +131,7 @@ string getLauncherDir()
 
   return path;
 }
+
 
 string getTestHelperPath(const string& name)
 {
@@ -139,6 +144,7 @@ string getTestHelperPath(const string& name)
   return path;
 }
 
+
 string getTestHelperDir()
 {
   string path = path::join(tests::flags.build_dir, "src");
@@ -149,6 +155,7 @@ string getTestHelperDir()
 
   return path;
 }
+
 
 string getTestScriptPath(const string& name)
 {
@@ -161,6 +168,7 @@ string getTestScriptPath(const string& name)
   return path;
 }
 
+
 string getSbinDir()
 {
   string path = path::join(tests::flags.build_dir, "src");
@@ -172,6 +180,7 @@ string getSbinDir()
   return path;
 }
 
+
 string getWebUIDir()
 {
   string path = path::join(flags.source_dir, "src", "webui");
@@ -181,6 +190,35 @@ string getWebUIDir()
   }
 
   return path;
+}
+
+
+Try<net::IP::Network> getNonLoopbackIP()
+{
+  Try<set<string>> links = net::links();
+  if (links.isError()) {
+    return Error(
+        "Unable to retrieve interfaces on this host: " +
+        links.error());
+  }
+
+  foreach (const string& link, links.get()) {
+    Result<net::IP::Network> hostNetwork =
+      net::IP::Network::fromLinkDevice(link, AF_INET);
+
+    if (hostNetwork.isError()) {
+      return Error(
+          "Unable to find a non-loopback address: " +
+          hostNetwork.error());
+    }
+
+    if (hostNetwork.isSome() &&
+        (hostNetwork.get() != net::IP::Network::LOOPBACK_V4())) {
+      return hostNetwork.get();
+    }
+  }
+
+  return Error("No non-loopback addresses available on this host");
 }
 
 } // namespace tests {

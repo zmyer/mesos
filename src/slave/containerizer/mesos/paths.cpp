@@ -19,12 +19,18 @@
 #include <stout/path.hpp>
 #include <stout/protobuf.hpp>
 
+#include "common/protobuf_utils.hpp"
+#include "common/resources_utils.hpp"
+
 #include "slave/containerizer/mesos/paths.hpp"
+#include "slave/state.hpp"
 
 #ifndef __WINDOWS__
 namespace unix = process::network::unix;
 #endif // __WINDOWS__
 
+using mesos::slave::ContainerConfig;
+using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerTermination;
 
 using std::list;
@@ -72,6 +78,16 @@ string getRuntimePath(
 }
 
 
+string getContainerDevicesPath(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  return path::join(
+      getRuntimePath(runtimeDir, containerId),
+      CONTAINER_DEVICES_DIRECTORY);
+}
+
+
 Result<pid_t> getContainerPid(
     const string& runtimeDir,
     const ContainerID& containerId)
@@ -88,7 +104,7 @@ Result<pid_t> getContainerPid(
     return None();
   }
 
-  Try<string> read = os::read(path);
+  Result<string> read = state::read<string>(path);
   if (read.isError()) {
     return Error("Failed to recover pid of container: " + read.error());
   }
@@ -160,7 +176,7 @@ string getContainerIOSwitchboardPidPath(
 
 
 Result<pid_t> getContainerIOSwitchboardPid(
-    const std::string& runtimeDir,
+    const string& runtimeDir,
     const ContainerID& containerId)
 {
   const string path = getContainerIOSwitchboardPidPath(
@@ -174,7 +190,7 @@ Result<pid_t> getContainerIOSwitchboardPid(
     return None();
   }
 
-  Try<string> read = os::read(path);
+  Result<string> read = state::read<string>(path);
   if (read.isError()) {
     return Error("Failed to recover pid of io switchboard: " + read.error());
   }
@@ -200,6 +216,22 @@ string getContainerIOSwitchboardSocketPath(
 }
 
 
+string getContainerIOSwitchboardSocketProvisionalPath(
+    const std::string& socketPath)
+{
+  return socketPath + "_provisional";
+}
+
+
+string getContainerIOSwitchboardSocketProvisionalPath(
+    const std::string& runtimeDir,
+    const ContainerID& containerId)
+{
+  return getContainerIOSwitchboardSocketProvisionalPath(
+      getContainerIOSwitchboardSocketPath(runtimeDir, containerId));
+}
+
+
 Result<unix::Address> getContainerIOSwitchboardAddress(
     const string& runtimeDir,
     const ContainerID& containerId)
@@ -215,7 +247,7 @@ Result<unix::Address> getContainerIOSwitchboardAddress(
     return None();
   }
 
-  Try<string> read = os::read(path);
+  Result<string> read = state::read<string>(path);
   if (read.isError()) {
     return Error("Failed reading '" + path + "': " + read.error());
   }
@@ -230,8 +262,8 @@ Result<unix::Address> getContainerIOSwitchboardAddress(
 #endif // __WINDOWS__
 
 
-std::string getContainerForceDestroyOnRecoveryPath(
-    const std::string& runtimeDir,
+string getContainerForceDestroyOnRecoveryPath(
+    const string& runtimeDir,
     const ContainerID& containerId)
 {
   return path::join(
@@ -241,7 +273,7 @@ std::string getContainerForceDestroyOnRecoveryPath(
 
 
 bool getContainerForceDestroyOnRecovery(
-    const std::string& runtimeDir,
+    const string& runtimeDir,
     const ContainerID& containerId)
 {
   const string path = getContainerForceDestroyOnRecoveryPath(
@@ -271,15 +303,62 @@ Result<ContainerTermination> getContainerTermination(
     return None();
   }
 
-  const Result<ContainerTermination>& termination =
-    ::protobuf::read<ContainerTermination>(path);
+  Result<ContainerTermination> termination =
+    state::read<ContainerTermination>(path);
 
   if (termination.isError()) {
-    return Error("Failed to read termination state of container:"
-                 " " + termination.error());
+    return Error("Failed to read termination state of container: " +
+                 termination.error());
   }
 
   return termination;
+}
+
+
+string getStandaloneContainerMarkerPath(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  return path::join(
+      getRuntimePath(runtimeDir, containerId),
+      STANDALONE_MARKER_FILE);
+}
+
+
+bool isStandaloneContainer(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  const string path = getStandaloneContainerMarkerPath(runtimeDir, containerId);
+
+  return os::exists(path);
+}
+
+
+Result<ContainerConfig> getContainerConfig(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  const string path = path::join(
+      getRuntimePath(runtimeDir, containerId),
+      CONTAINER_CONFIG_FILE);
+
+  if (!os::exists(path)) {
+    // This is possible if we recovered a container launched before we
+    // started to checkpoint `ContainerConfig`.
+    VLOG(1) << "Config path '" << path << "' is missing for container' "
+            << containerId << "'";
+    return None();
+  }
+
+  Result<ContainerConfig> containerConfig = state::read<ContainerConfig>(path);
+
+  if (containerConfig.isError()) {
+    return Error("Failed to read launch config of container: " +
+                 containerConfig.error());
+  }
+
+  return containerConfig;
 }
 
 
@@ -340,6 +419,43 @@ Try<vector<ContainerID>> getContainerIds(const string& runtimeDir)
   };
 
   return helper(None());
+}
+
+
+string getContainerLaunchInfoPath(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  return path::join(
+      getRuntimePath(runtimeDir, containerId),
+      CONTAINER_LAUNCH_INFO_FILE);
+}
+
+
+Result<ContainerLaunchInfo> getContainerLaunchInfo(
+    const string& runtimeDir,
+    const ContainerID& containerId)
+{
+  const string path = getContainerLaunchInfoPath(
+      runtimeDir, containerId);
+
+  if (!os::exists(path)) {
+    // This is possible because we don't atomically create the
+    // directory and write the 'CONTAINER_LAUNCH_INFO_FILE' file
+    // and thus we might terminate/restart after we've created
+    // the directory but before we've written the file.
+    return None();
+  }
+
+  Result<ContainerLaunchInfo> containerLaunchInfo =
+    state::read<ContainerLaunchInfo>(path);
+
+  if (containerLaunchInfo.isError()) {
+    return Error(
+        "Failed to read ContainerLaunchInfo: " + containerLaunchInfo.error());
+  }
+
+  return containerLaunchInfo;
 }
 
 

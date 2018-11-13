@@ -42,6 +42,21 @@ namespace mesos {
 namespace allocator {
 
 /**
+ *  Pass in configuration to the allocator.
+ */
+struct Options
+{
+  Duration allocationInterval = Seconds(1);
+  Option<std::set<std::string>> fairnessExcludeResourceNames = None();
+  bool filterGpuResources = true;
+  Option<DomainInfo> domain = None();
+  Option<std::vector<Resources>> minAllocatableResources = None();
+  size_t maxCompletedFrameworks = 0;
+  bool publishPerFrameworkMetrics = true;
+};
+
+
+/**
  * Basic model of an allocator: resources are allocated to a framework
  * in the form of offers. A framework can refuse some resources in
  * offers and run tasks in others. Allocated resources can have offer
@@ -60,9 +75,15 @@ public:
    * allocator instance from a module using the given name. If `Try`
    * does not report an error, the wrapped `Allocator*` is not null.
    *
+   * TODO(bmahler): Figure out how to pass parameters without
+   * burning in the built-in module arguments.
+   *
    * @param name Name of the allocator.
    */
-  static Try<Allocator*> create(const std::string& name);
+  static Try<Allocator*> create(
+      const std::string& name,
+      const std::string& roleSorter,
+      const std::string& frameworkSorter);
 
   Allocator() {}
 
@@ -81,21 +102,17 @@ public:
    *     to the frameworks.
    * @param inverseOfferCallback A callback the allocator uses to send reclaim
    *     allocations from the frameworks.
-   * @param weights Configured per-role weights. Any roles that do not
-   *     appear in this map will be assigned the default weight of 1.
    */
   virtual void initialize(
-      const Duration& allocationInterval,
+      const Options& options,
       const lambda::function<
           void(const FrameworkID&,
-               const hashmap<SlaveID, Resources>&)>& offerCallback,
+               const hashmap<std::string, hashmap<SlaveID, Resources>>&)>&
+                   offerCallback,
       const lambda::function<
           void(const FrameworkID&,
                const hashmap<SlaveID, UnavailableResources>&)>&
-        inverseOfferCallback,
-      const hashmap<std::string, double>& weights,
-      const Option<std::set<std::string>>&
-        fairnessExcludeResourceNames = None()) = 0;
+        inverseOfferCallback) = 0;
 
   /**
    * Informs the allocator of the recovered state from the master.
@@ -125,12 +142,15 @@ public:
    *     unknown agents are added later in `addSlave()`.
    *
    * @param active Whether the framework is initially activated.
+   *
+   * @param suppressedRoles List of suppressed roles for this framework.
    */
   virtual void addFramework(
       const FrameworkID& frameworkId,
       const FrameworkInfo& frameworkInfo,
       const hashmap<SlaveID, Resources>& used,
-      bool active) = 0;
+      bool active,
+      const std::set<std::string>& suppressedRoles) = 0;
 
   /**
    * Removes a framework from the Mesos cluster. It is up to an allocator to
@@ -166,7 +186,8 @@ public:
    */
   virtual void updateFramework(
       const FrameworkID& frameworkId,
-      const FrameworkInfo& frameworkInfo) = 0;
+      const FrameworkInfo& frameworkInfo,
+      const std::set<std::string>& suppressedRoles) = 0;
 
   /**
    * Adds or re-adds an agent to the Mesos cluster. It is invoked when a
@@ -175,6 +196,7 @@ public:
    * @param slaveId ID of the agent to be added or re-added.
    * @param slaveInfo Detailed info of the agent. The slaveInfo resources
    *     correspond directly to the static --resources flag value on the agent.
+   * @param capabilities Capabilities of the agent.
    * @param total The `total` resources are passed explicitly because it
    *     includes resources that are dynamically "checkpointed" on the agent
    *     (e.g. persistent volumes, dynamic reservations, etc).
@@ -185,6 +207,7 @@ public:
   virtual void addSlave(
       const SlaveID& slaveId,
       const SlaveInfo& slaveInfo,
+      const std::vector<SlaveInfo::Capability>& capabilities,
       const Option<Unavailability>& unavailability,
       const Resources& total,
       const hashmap<FrameworkID, Resources>& used) = 0;
@@ -199,18 +222,31 @@ public:
   /**
    * Updates an agent.
    *
-   * Updates the latest oversubscribed resources for an agent.
-   * TODO(vinod): Instead of just oversubscribed resources have this
-   * method take total resources. We can then reuse this method to
-   * update Agent's total resources in the future.
+   * TODO(bevers): Make `total` and `capabilities` non-optional.
    *
-   * @param oversubscribed The new oversubscribed resources estimate from
-   *     the agent. The oversubscribed resources include the total amount
-   *     of oversubscribed resources that are allocated and available.
+   * @param slaveInfo The current slave info of the agent.
+   * @param total The new total resources on the agent.
+   * @param capabilities The new capabilities of the agent.
    */
   virtual void updateSlave(
       const SlaveID& slave,
-      const Resources& oversubscribed) = 0;
+      const SlaveInfo& slaveInfo,
+      const Option<Resources>& total = None(),
+      const Option<std::vector<SlaveInfo::Capability>>&
+          capabilities = None()) = 0;
+
+  /**
+   * Add resources from a local resource provider to an agent.
+   *
+   * @param slave Id of the agent to modify.
+   * @param total The resources to add to the agent's total resources.
+   * @param used The resources to add to the resources tracked as used
+   *     for this agent.
+   */
+  virtual void addResourceProvider(
+      const SlaveID& slave,
+      const Resources& total,
+      const hashmap<FrameworkID, Resources>& used) = 0;
 
   /**
    * Activates an agent. This is invoked when an agent reregisters. Offers
@@ -259,13 +295,14 @@ public:
    * (dynamic reservation and persistent volumes). The allocator may react
    * differently for certain offer operations. The allocator should use this
    * call to update bookkeeping information related to the framework. The
-   * `offeredResources` are the resources that the operations are applied to.
+   * `offeredResources` are the resources that the operations are applied to
+   * and must be allocated to a single role.
    */
   virtual void updateAllocation(
       const FrameworkID& frameworkId,
       const SlaveID& slaveId,
       const Resources& offeredResources,
-      const std::vector<Offer::Operation>& operations) = 0;
+      const std::vector<ResourceConversion>& conversions) = 0;
 
   /**
    * Updates available resources on an agent based on a sequence of offer
@@ -328,7 +365,13 @@ public:
    *
    * Used to update the set of available resources for a specific agent. This
    * method is invoked to inform the allocator about allocated resources that
-   * have been refused or are no longer in use.
+   * have been refused or are no longer in use. Allocated resources will have
+   * an `allocation_info.role` assigned and callers are expected to only call
+   * this with resources allocated to a single role.
+   *
+   * TODO(bmahler): We could allow resources allocated to multiple roles
+   * within a single call here, but filtering them in the same way does
+   * not seem desirable.
    */
   virtual void recoverResources(
       const FrameworkID& frameworkId,
@@ -339,17 +382,24 @@ public:
   /**
    * Suppresses offers.
    *
-   * Informs the allocator to stop sending offers to the framework.
+   * Informs the allocator to stop sending offers to this framework for the
+   * specified roles. If `roles` is an empty set, we will stop sending offers
+   * to this framework for all of the framework's subscribed roles.
    */
   virtual void suppressOffers(
-      const FrameworkID& frameworkId) = 0;
+      const FrameworkID& frameworkId,
+      const std::set<std::string>& roles) = 0;
 
   /**
-   * Revives offers for a framework. This is invoked by a framework when
-   * it wishes to receive filtered resources or offers immediately.
+   * Revives offers to this framework for the specified roles. This is
+   * invoked by a framework when it wishes to receive filtered resources
+   * immediately or get itself out of a suppressed state. If `roles` is
+   * an empty set, it is treated as being set to all of the framework's
+   * subscribed roles.
    */
   virtual void reviveOffers(
-      const FrameworkID& frameworkId) = 0;
+      const FrameworkID& frameworkId,
+      const std::set<std::string>& roles) = 0;
 
   /**
    * Informs the allocator to set quota for the given role.
@@ -391,11 +441,22 @@ public:
       const std::string& role) = 0;
 
   /**
-   * Updates the weight of each provided role.
-   * Subsequent allocation calculations will use these updated weights.
+   * Updates the weight associated with one or more roles. If a role
+   * was previously configured to have a weight and that role is
+   * omitted from this list, it keeps its old weight.
    */
   virtual void updateWeights(
       const std::vector<WeightInfo>& weightInfos) = 0;
+
+  /**
+   * Idempotent helper to pause allocations.
+   */
+  virtual void pause() = 0;
+
+  /**
+   * Idempotent helper to resume allocations.
+   */
+  virtual void resume() = 0;
 };
 
 } // namespace allocator {

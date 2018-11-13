@@ -35,6 +35,7 @@
 #include <stout/uuid.hpp>
 
 #include "slave/flags.hpp"
+#include "slave/slave.hpp"
 
 #include "slave/containerizer/fetcher.hpp"
 
@@ -47,6 +48,7 @@
 #include "tests/environment.hpp"
 #include "tests/flags.hpp"
 #include "tests/mesos.hpp"
+#include "tests/mock_fetcher.hpp"
 #include "tests/utils.hpp"
 
 #include "tests/containerizer/isolator.hpp"
@@ -56,13 +58,15 @@ using namespace process;
 
 using mesos::internal::master::Master;
 
+using mesos::internal::slave::Containerizer;
+using mesos::internal::slave::executorEnvironment;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::FetcherProcess;
 using mesos::internal::slave::Launcher;
 using mesos::internal::slave::MesosContainerizer;
 using mesos::internal::slave::MesosContainerizerProcess;
 using mesos::internal::slave::MESOS_CONTAINERIZER;
-using mesos::internal::slave::PosixLauncher;
+using mesos::internal::slave::SubprocessLauncher;
 using mesos::internal::slave::Provisioner;
 using mesos::internal::slave::ProvisionInfo;
 using mesos::internal::slave::Slave;
@@ -104,7 +108,7 @@ TEST_F(MesosContainerizerTest, Launch)
   flags.launcher = "posix";
   flags.isolation = "posix/cpu";
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -121,22 +125,66 @@ TEST_F(MesosContainerizerTest, Launch)
   AWAIT_READY(containerizer->recover(state));
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Try<string> directory = environment->mkdtemp();
   ASSERT_SOME(directory);
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      createExecutorInfo("executor", "exit 42", "cpus:1"),
-      directory.get(),
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          None(),
+          createExecutorInfo("executor", "exit 42", "cpus:1"),
+          directory.get()),
       map<string, string>(),
-      true); // TODO(benh): Ever want to test not checkpointing?
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+
+  AWAIT_READY(wait);
+  ASSERT_SOME(wait.get());
+  ASSERT_TRUE(wait.get()->has_status());
+  EXPECT_WEXITSTATUS_EQ(42, wait.get()->status());
+}
+
+
+TEST_F(MesosContainerizerTest, StandaloneLaunch)
+{
+  slave::Flags flags = CreateSlaveFlags();
+  flags.launcher = "posix";
+  flags.isolation = "posix/cpu,posix/mem";
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> create = MesosContainerizer::create(
+      flags,
+      true,
+      &fetcher);
+
+  ASSERT_SOME(create);
+
+  Owned<MesosContainerizer> containerizer(create.get());
+
+  SlaveState state;
+  state.id = SlaveID();
+
+  AWAIT_READY(containerizer->recover(state));
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(
+          createCommandInfo("exit 42"),
+          "cpus:1;mem:64",
+          sandbox.get()),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
 
@@ -153,7 +201,7 @@ TEST_F(MesosContainerizerTest, Destroy)
   flags.launcher = "posix";
   flags.isolation = "posix/cpu";
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -170,31 +218,29 @@ TEST_F(MesosContainerizerTest, Destroy)
   AWAIT_READY(containerizer->recover(state));
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Try<string> directory = environment->mkdtemp();
   ASSERT_SOME(directory);
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      createExecutorInfo("executor", "sleep 1000", "cpus:1"),
-      directory.get(),
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          None(),
+          createExecutorInfo("executor", "sleep 1000", "cpus:1"),
+          directory.get()),
       map<string, string>(),
-      true); // TODO(benh): Ever want to test not checkpointing?
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
-
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-  ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
 }
 
 
@@ -206,7 +252,7 @@ TEST_F(MesosContainerizerTest, StatusWithContainerID)
   flags.launcher = "posix";
   flags.isolation = "posix/cpu";
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -223,36 +269,34 @@ TEST_F(MesosContainerizerTest, StatusWithContainerID)
   AWAIT_READY(containerizer->recover(state));
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Try<string> directory = environment->mkdtemp();
   ASSERT_SOME(directory);
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      createExecutorInfo("executor", "sleep 1000", "cpus:1"),
-      directory.get(),
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          None(),
+          createExecutorInfo("executor", "sleep 1000", "cpus:1"),
+          directory.get()),
       map<string, string>(),
-      true); // TODO(benh): Ever want to test not checkpointing?
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   Future<ContainerStatus> status = containerizer->status(containerId);
   AWAIT_READY(status);
 
   EXPECT_EQ(containerId, status->container_id());
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
-
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-  ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
+  ASSERT_TRUE(termination.get()->has_status());
+  EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
 }
 
 
@@ -262,7 +306,6 @@ public:
   // Construct a MesosContainerizer with MockIsolator(s) which return
   // the provided ContainerLaunchInfo for Isolator::prepare.
   Try<MesosContainerizer*> createContainerizer(
-      Fetcher* fetcher,
       const vector<Option<ContainerLaunchInfo>>& launchInfos)
   {
     vector<Owned<Isolator>> isolators;
@@ -279,7 +322,9 @@ public:
     slave::Flags flags = CreateSlaveFlags();
     flags.launcher = "posix";
 
-    Try<Launcher*> launcher_ = PosixLauncher::create(flags);
+    fetcher.reset(new Fetcher(flags));
+
+    Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
     if (launcher_.isError()) {
       return Error(launcher_.error());
     }
@@ -294,56 +339,52 @@ public:
     return MesosContainerizer::create(
         flags,
         true,
-        fetcher,
+        fetcher.get(),
+        nullptr,
         std::move(launcher),
         provisioner->share(),
         isolators);
   }
 
   Try<MesosContainerizer*> createContainerizer(
-      Fetcher* fetcher,
       const Option<ContainerLaunchInfo>& launchInfo)
   {
     vector<Option<ContainerLaunchInfo>> launchInfos = {launchInfo};
-    return createContainerizer(fetcher, launchInfos);
+    return createContainerizer(launchInfos);
   }
+
+private:
+  Owned<Fetcher> fetcher;
 };
 
 
 // The isolator has a prepare command that succeeds.
 TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptSucceeds)
 {
-  string directory = os::getcwd(); // We're inside a temporary sandbox.
-  string file = path::join(directory, "child.script.executed");
-
-  Fetcher fetcher;
+  string file = path::join(sandbox.get(), "child.script.executed");
 
   ContainerLaunchInfo launchInfo;
   launchInfo.add_pre_exec_commands()->set_value("touch " + file);
 
-  Try<MesosContainerizer*> create = createContainerizer(
-      &fetcher,
-      launchInfo);
-
+  Try<MesosContainerizer*> create = createContainerizer(launchInfo);
   ASSERT_SOME(create);
 
   Owned<MesosContainerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      createExecutorInfo("executor", "exit 0"),
-      directory,
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          None(),
+          createExecutorInfo("executor", "exit 0"),
+          sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   // Wait until the launch completes.
-  AWAIT_READY(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   // Wait for the child (preparation script + executor) to complete.
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
@@ -357,47 +398,37 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptSucceeds)
 
   // Check the preparation script actually ran.
   EXPECT_TRUE(os::exists(file));
-
-  // Destroy the container.
-  containerizer->destroy(containerId);
 }
 
 
 // The isolator has a prepare command that fails.
 TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptFails)
 {
-  string directory = os::getcwd(); // We're inside a temporary sandbox.
-  string file = path::join(directory, "child.script.executed");
-
-  Fetcher fetcher;
+  string file = path::join(sandbox.get(), "child.script.executed");
 
   ContainerLaunchInfo launchInfo;
   launchInfo.add_pre_exec_commands()->set_value(
       "touch " + file + " && exit 1");
 
-  Try<MesosContainerizer*> create = createContainerizer(
-      &fetcher,
-      launchInfo);
-
+  Try<MesosContainerizer*> create = createContainerizer(launchInfo);
   ASSERT_SOME(create);
 
   Owned<MesosContainerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      createExecutorInfo("executor", "exit 0"),
-      directory,
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          None(),
+          createExecutorInfo("executor", "exit 0"),
+          sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   // Wait until the launch completes.
-  AWAIT_READY(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   // Wait for the child (preparation script + executor) to complete.
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
@@ -411,9 +442,6 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptFails)
 
   // Check the preparation script actually ran.
   EXPECT_TRUE(os::exists(file));
-
-  // Destroy the container.
-  containerizer->destroy(containerId);
 }
 
 
@@ -422,9 +450,8 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ScriptFails)
 // launch should fail from the failing prepare command.
 TEST_F(MesosContainerizerIsolatorPreparationTest, MultipleScripts)
 {
-  string directory = os::getcwd(); // We're inside a temporary sandbox.
-  string file1 = path::join(directory, "child.script.executed.1");
-  string file2 = path::join(directory, "child.script.executed.2");
+  string file1 = path::join(sandbox.get(), "child.script.executed.1");
+  string file2 = path::join(sandbox.get(), "child.script.executed.2");
 
   vector<Option<ContainerLaunchInfo>> launchInfos;
 
@@ -439,31 +466,25 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, MultipleScripts)
   launch2.add_pre_exec_commands()->set_value("touch " + file2 + " && exit 1");
   launchInfos.push_back(launch2);
 
-  Fetcher fetcher;
-
-  Try<MesosContainerizer*> create = createContainerizer(
-      &fetcher,
-      launchInfos);
-
+  Try<MesosContainerizer*> create = createContainerizer(launchInfos);
   ASSERT_SOME(create);
 
   Owned<MesosContainerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      createExecutorInfo("executor", "exit 0"),
-      directory,
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          None(),
+          createExecutorInfo("executor", "exit 0"),
+          sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   // Wait until the launch completes.
-  AWAIT_READY(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   // Wait for the child (preparation script(s) + executor) to complete.
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
@@ -477,9 +498,6 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, MultipleScripts)
 
   // Check the failing preparation script has actually ran.
   EXPECT_TRUE(os::exists(file2));
-
-  // Destroy the container.
-  containerizer->destroy(containerId);
 }
 
 
@@ -494,10 +512,7 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ExecutorEnvironmentVariable)
   net::IP ip = net::IP(INADDR_LOOPBACK);
   os::setenv("LIBPROCESS_IP", stringify(ip));
 
-  string directory = os::getcwd(); // We're inside a temporary sandbox.
-  string file = path::join(directory, "child.script.executed");
-
-  Fetcher fetcher;
+  string file = path::join(sandbox.get(), "child.script.executed");
 
   ContainerLaunchInfo launchInfo;
 
@@ -507,16 +522,13 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ExecutorEnvironmentVariable)
   variable->set_name("TEST_ENVIRONMENT");
   variable->set_value(file);
 
-  Try<MesosContainerizer*> create = createContainerizer(
-      &fetcher,
-      launchInfo);
-
+  Try<MesosContainerizer*> create = createContainerizer(launchInfo);
   ASSERT_SOME(create);
 
   Owned<MesosContainerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   // Ensure that LIBPROCESS_IP has been passed despite the explicit
   // specification of the environment. If so, then touch the test file.
@@ -532,23 +544,20 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ExecutorEnvironmentVariable)
   map<string, string> environment = executorEnvironment(
       flags,
       executorInfo,
-      directory,
+      sandbox.get(),
       slaveId,
       PID<Slave>(),
+      None(),
       false);
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      executorInfo,
-      directory,
-      None(),
-      slaveId,
+      createContainerConfig(None(), executorInfo, sandbox.get()),
       environment,
-      false);
+      None());
 
   // Wait until the launch completes.
-  AWAIT_READY(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   // Wait for the child (preparation script + executor) to complete.
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
@@ -562,9 +571,6 @@ TEST_F(MesosContainerizerIsolatorPreparationTest, ExecutorEnvironmentVariable)
 
   // Check the preparation script actually ran.
   EXPECT_TRUE(os::exists(file));
-
-  // Destroy the container.
-  containerizer->destroy(containerId);
 
   // Reset LIBPROCESS_IP if necessary.
   if (libprocessIP.isSome()) {
@@ -580,11 +586,9 @@ class MesosContainerizerExecuteTest : public MesosTest {};
 
 TEST_F(MesosContainerizerExecuteTest, IoRedirection)
 {
-  string directory = os::getcwd(); // We're inside a temporary sandbox.
-
   slave::Flags flags = CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   // Use local=false so std{err,out} are redirected to files.
   Try<MesosContainerizer*> create = MesosContainerizer::create(
@@ -597,25 +601,24 @@ TEST_F(MesosContainerizerExecuteTest, IoRedirection)
   Owned<MesosContainerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   string errMsg = "this is stderr";
   string outMsg = "this is stdout";
   string command =
     "(echo '" + errMsg + "' 1>&2) && echo '" + outMsg + "'";
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      createExecutorInfo("executor", command),
-      directory,
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          None(),
+          createExecutorInfo("executor", command),
+          sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   // Wait for the launch to complete.
-  AWAIT_READY(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   // Wait on the container.
   Future<Option<ContainerTermination>> wait =
@@ -631,24 +634,23 @@ TEST_F(MesosContainerizerExecuteTest, IoRedirection)
   // Check that std{err, out} was redirected.
   // NOTE: Fetcher uses GLOG, which outputs extra information to
   // stderr.
-  Try<string> stderr = os::read(path::join(directory, "stderr"));
+  Try<string> stderr = os::read(path::join(sandbox.get(), "stderr"));
   ASSERT_SOME(stderr);
   EXPECT_TRUE(strings::contains(stderr.get(), errMsg));
 
-  EXPECT_SOME_EQ(outMsg + "\n", os::read(path::join(directory, "stdout")));
+  EXPECT_SOME_EQ(outMsg + "\n", os::read(path::join(sandbox.get(), "stdout")));
 }
 
 
 // This test verified that the stdout and stderr files in the task's sandbox
 // are owned by the task user.
-TEST_F(MesosContainerizerExecuteTest, ROOT_SandboxFileOwnership)
+TEST_F(MesosContainerizerExecuteTest,
+       ROOT_UNPRIVILEGED_USER_SandboxFileOwnership)
 {
-  string sandbox = os::getcwd(); // We're inside a temporary sandbox.
-
   slave::Flags flags;
   flags.launcher_dir = getLauncherDir();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, false, &fetcher);
@@ -657,37 +659,34 @@ TEST_F(MesosContainerizerExecuteTest, ROOT_SandboxFileOwnership)
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  const string user = "nobody";
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
 
   ExecutorInfo executor = createExecutorInfo("executor", "exit 0");
-  executor.mutable_command()->set_user(user);
+  executor.mutable_command()->set_user(user.get());
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      executor,
-      sandbox,
-      None(),
-      SlaveID(),
+      createContainerConfig(None(), executor, sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   // Wait for the launch to complete.
-  AWAIT_READY(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
-  Result<uid_t> uid = os::getuid(user);
+  Result<uid_t> uid = os::getuid(user.get());
   ASSERT_SOME(uid);
 
   // Verify that stdout is owned by the task user.
   struct stat s;
-  std::string stdoutPath = path::join(sandbox, "stdout");
+  string stdoutPath = path::join(sandbox.get(), "stdout");
   EXPECT_EQ(0, ::stat(stdoutPath.c_str(), &s));
   EXPECT_EQ(uid.get(), s.st_uid);
 
   // Verify that stderr is owned by the task user.
-  std::string stderrPath = path::join(sandbox, "stderr");
+  string stderrPath = path::join(sandbox.get(), "stderr");
   EXPECT_EQ(0, ::stat(stderrPath.c_str(), &s));
   EXPECT_EQ(uid.get(), s.st_uid);
 
@@ -712,12 +711,12 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhileFetching)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
 
-  Try<Launcher*> launcher_ = PosixLauncher::create(flags);
+  Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
   ASSERT_SOME(launcher_);
 
   Owned<Launcher> launcher(launcher_.get());
 
-  MockFetcherProcess* mockFetcherProcess = new MockFetcherProcess();
+  MockFetcherProcess* mockFetcherProcess = new MockFetcherProcess(flags);
   Owned<FetcherProcess> fetcherProcess(mockFetcherProcess);
   Fetcher fetcher(fetcherProcess);
 
@@ -728,6 +727,7 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhileFetching)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       provisioner->share(),
       vector<Owned<Isolator>>());
@@ -740,26 +740,26 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhileFetching)
   Promise<Nothing> promise;
 
   // Letting exec hang to simulate a long fetch.
-  EXPECT_CALL(*mockFetcherProcess, _fetch(_, _, _, _, _, _))
+  EXPECT_CALL(*mockFetcherProcess, _fetch(_, _, _, _, _))
     .WillOnce(DoAll(FutureSatisfy(&fetch),
                     Return(promise.future())));
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  TaskInfo taskInfo;
-  CommandInfo commandInfo;
-  taskInfo.mutable_command()->MergeFrom(commandInfo);
+  SlaveID slaveId = SlaveID();
+  slaveId.set_value("slave_id");
+
+  TaskInfo taskInfo = createTask(slaveId, Resources(), CommandInfo());
 
   containerizer->launch(
       containerId,
-      taskInfo,
-      createExecutorInfo("executor", "exit 0"),
-      os::getcwd(),
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          taskInfo,
+          createExecutorInfo("executor", "exit 0"),
+          sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   Future<Option<ContainerTermination>> wait =
     containerizer->wait(containerId);
@@ -781,7 +781,7 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhilePreparing)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
 
-  Try<Launcher*> launcher_ = PosixLauncher::create(flags);
+  Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
   ASSERT_SOME(launcher_);
 
   Owned<Launcher> launcher(launcher_.get());
@@ -796,7 +796,7 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhilePreparing)
     .WillOnce(DoAll(FutureSatisfy(&prepare),
                     Return(promise.future())));
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<Owned<Provisioner>> provisioner = Provisioner::create(flags);
   ASSERT_SOME(provisioner);
@@ -805,6 +805,7 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhilePreparing)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       provisioner->share(),
       {Owned<Isolator>(isolator)});
@@ -814,21 +815,21 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhilePreparing)
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  TaskInfo taskInfo;
-  CommandInfo commandInfo;
-  taskInfo.mutable_command()->MergeFrom(commandInfo);
+  SlaveID slaveId = SlaveID();
+  slaveId.set_value("slave_id");
+
+  TaskInfo taskInfo = createTask(slaveId, Resources(), CommandInfo());
 
   containerizer->launch(
       containerId,
-      taskInfo,
-      createExecutorInfo("executor", "exit 0"),
-      os::getcwd(),
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          taskInfo,
+          createExecutorInfo("executor", "exit 0"),
+          sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   Future<Option<ContainerTermination>> wait =
     containerizer->wait(containerId);
@@ -842,7 +843,7 @@ TEST_F(MesosContainerizerDestroyTest, DestroyWhilePreparing)
 
   // Need to help the compiler to disambiguate between overloads.
   ContainerLaunchInfo launchInfo;
-  launchInfo.add_pre_exec_commands()->CopyFrom(commandInfo);
+  launchInfo.add_pre_exec_commands()->CopyFrom(taskInfo.command());
   Option<ContainerLaunchInfo> option = launchInfo;
   promise.set(option);
 
@@ -861,7 +862,7 @@ TEST_F(MesosContainerizerDestroyTest, DestroyUnknownContainer)
 {
   slave::Flags flags = CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -873,9 +874,13 @@ TEST_F(MesosContainerizerDestroyTest, DestroyUnknownContainer)
   Owned<MesosContainerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  AWAIT_EXPECT_FALSE(containerizer->destroy(containerId));
+  Future<Option<ContainerTermination>> destroyed =
+    containerizer->destroy(containerId);
+
+  AWAIT_READY(destroyed);
+  EXPECT_NONE(destroyed.get());
 }
 
 
@@ -905,7 +910,7 @@ TEST_F(MesosContainerizerProvisionerTest, ProvisionFailed)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
 
-  Try<Launcher*> launcher_ = PosixLauncher::create(flags);
+  Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
   ASSERT_SOME(launcher_);
 
   Owned<Launcher> launcher(new TestLauncher(Owned<Launcher>(launcher_.get())));
@@ -922,12 +927,13 @@ TEST_F(MesosContainerizerProvisionerTest, ProvisionFailed)
   EXPECT_CALL(*provisioner, destroy(_))
     .WillOnce(Return(true));
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer = MesosContainerizer::create(
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       Shared<Provisioner>(provisioner),
       vector<Owned<Isolator>>());
@@ -935,12 +941,12 @@ TEST_F(MesosContainerizerProvisionerTest, ProvisionFailed)
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Image image;
   image.set_type(Image::DOCKER);
   Image::Docker dockerImage;
-  dockerImage.set_name(UUID::random().toString());
+  dockerImage.set_name(id::UUID::random().toString());
   image.mutable_docker()->CopyFrom(dockerImage);
 
   ContainerInfo::MesosInfo mesosInfo;
@@ -950,38 +956,33 @@ TEST_F(MesosContainerizerProvisionerTest, ProvisionFailed)
   containerInfo.set_type(ContainerInfo::MESOS);
   containerInfo.mutable_mesos()->CopyFrom(mesosInfo);
 
-  TaskInfo taskInfo;
-  CommandInfo commandInfo;
-  taskInfo.mutable_command()->MergeFrom(commandInfo);
+  SlaveID slaveId = SlaveID();
+  slaveId.set_value("slave_id");
+
+  TaskInfo taskInfo = createTask(slaveId, Resources(), CommandInfo());
+
   taskInfo.mutable_container()->CopyFrom(containerInfo);
 
   ExecutorInfo executorInfo = createExecutorInfo("executor", "exit 0");
   executorInfo.mutable_container()->CopyFrom(containerInfo);
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      taskInfo,
-      executorInfo,
-      os::getcwd(),
-      None(),
-      SlaveID(),
+      createContainerConfig(taskInfo, executorInfo, sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   AWAIT_READY(provision);
 
   AWAIT_FAILED(launch);
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
+  AWAIT_READY(termination);
+  ASSERT_SOME(termination.get());
 
-  AWAIT_READY(wait);
-  ASSERT_SOME(wait.get());
-
-  ContainerTermination termination = wait->get();
-
-  EXPECT_FALSE(termination.has_status());
+  EXPECT_FALSE(termination->get().has_status());
 }
 
 
@@ -993,7 +994,7 @@ TEST_F(MesosContainerizerProvisionerTest, DestroyWhileProvisioning)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
 
-  Try<Launcher*> launcher_ = PosixLauncher::create(flags);
+  Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
   ASSERT_SOME(launcher_);
 
   Owned<Launcher> launcher(new TestLauncher(Owned<Launcher>(launcher_.get())));
@@ -1010,12 +1011,13 @@ TEST_F(MesosContainerizerProvisionerTest, DestroyWhileProvisioning)
   EXPECT_CALL(*provisioner, destroy(_))
     .WillOnce(Return(true));
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer = MesosContainerizer::create(
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       Shared<Provisioner>(provisioner),
       vector<Owned<Isolator>>());
@@ -1023,12 +1025,12 @@ TEST_F(MesosContainerizerProvisionerTest, DestroyWhileProvisioning)
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Image image;
   image.set_type(Image::DOCKER);
   Image::Docker dockerImage;
-  dockerImage.set_name(UUID::random().toString());
+  dockerImage.set_name(id::UUID::random().toString());
   image.mutable_docker()->CopyFrom(dockerImage);
 
   ContainerInfo::MesosInfo mesosInfo;
@@ -1038,23 +1040,20 @@ TEST_F(MesosContainerizerProvisionerTest, DestroyWhileProvisioning)
   containerInfo.set_type(ContainerInfo::MESOS);
   containerInfo.mutable_mesos()->CopyFrom(mesosInfo);
 
-  TaskInfo taskInfo;
-  CommandInfo commandInfo;
-  taskInfo.mutable_command()->MergeFrom(commandInfo);
+  SlaveID slaveId = SlaveID();
+  slaveId.set_value("slave_id");
+
+  TaskInfo taskInfo = createTask(slaveId, Resources(), CommandInfo());
   taskInfo.mutable_container()->CopyFrom(containerInfo);
 
   ExecutorInfo executorInfo = createExecutorInfo("executor", "exit 0");
   executorInfo.mutable_container()->CopyFrom(containerInfo);
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      taskInfo,
-      executorInfo,
-      os::getcwd(),
-      None(),
-      SlaveID(),
+      createContainerConfig(taskInfo, executorInfo, sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
 
@@ -1083,7 +1082,7 @@ TEST_F(MesosContainerizerProvisionerTest, IsolatorCleanupBeforePrepare)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
 
-  Try<Launcher*> launcher_ = PosixLauncher::create(flags);
+  Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
   ASSERT_SOME(launcher_);
 
   Owned<Launcher> launcher(new TestLauncher(Owned<Launcher>(launcher_.get())));
@@ -1105,12 +1104,13 @@ TEST_F(MesosContainerizerProvisionerTest, IsolatorCleanupBeforePrepare)
   EXPECT_CALL(*isolator, cleanup(_))
     .Times(0);
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer = MesosContainerizer::create(
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       Shared<Provisioner>(provisioner),
       {Owned<Isolator>(isolator)});
@@ -1118,12 +1118,12 @@ TEST_F(MesosContainerizerProvisionerTest, IsolatorCleanupBeforePrepare)
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Image image;
   image.set_type(Image::DOCKER);
   Image::Docker dockerImage;
-  dockerImage.set_name(UUID::random().toString());
+  dockerImage.set_name(id::UUID::random().toString());
   image.mutable_docker()->CopyFrom(dockerImage);
 
   ContainerInfo::MesosInfo mesosInfo;
@@ -1133,23 +1133,19 @@ TEST_F(MesosContainerizerProvisionerTest, IsolatorCleanupBeforePrepare)
   containerInfo.set_type(ContainerInfo::MESOS);
   containerInfo.mutable_mesos()->CopyFrom(mesosInfo);
 
-  TaskInfo taskInfo;
-  CommandInfo commandInfo;
-  taskInfo.mutable_command()->MergeFrom(commandInfo);
+  SlaveID slaveId = SlaveID();
+  slaveId.set_value("slave_id");
+  TaskInfo taskInfo = createTask(slaveId, Resources(), CommandInfo());
   taskInfo.mutable_container()->CopyFrom(containerInfo);
 
   ExecutorInfo executorInfo = createExecutorInfo("executor", "exit 0");
   executorInfo.mutable_container()->CopyFrom(containerInfo);
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      taskInfo,
-      executorInfo,
-      os::getcwd(),
-      None(),
-      SlaveID(),
+      createContainerConfig(taskInfo, executorInfo, sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
 
@@ -1183,11 +1179,11 @@ ACTION_P(InvokeDestroyAndWait, launcher)
 // 'container_destroy_errors' metric is updated.
 TEST_F(MesosContainerizerDestroyTest, LauncherDestroyFailure)
 {
-  // Create a TestLauncher backed by PosixLauncher.
+  // Create a TestLauncher backed by SubprocessLauncher.
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
 
-  Try<Launcher*> launcher_ = PosixLauncher::create(flags);
+  Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
   ASSERT_SOME(launcher_);
 
   TestLauncher* testLauncher =
@@ -1195,7 +1191,7 @@ TEST_F(MesosContainerizerDestroyTest, LauncherDestroyFailure)
 
   Owned<Launcher> launcher(testLauncher);
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<Owned<Provisioner>> provisioner = Provisioner::create(flags);
   ASSERT_SOME(provisioner);
@@ -1204,6 +1200,7 @@ TEST_F(MesosContainerizerDestroyTest, LauncherDestroyFailure)
       flags,
       true,
       &fetcher,
+      nullptr,
       launcher,
       provisioner->share(),
       vector<Owned<Isolator>>());
@@ -1211,36 +1208,34 @@ TEST_F(MesosContainerizerDestroyTest, LauncherDestroyFailure)
   Owned<MesosContainerizer> containerizer(_containerizer.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  TaskInfo taskInfo;
-  CommandInfo commandInfo;
-  taskInfo.mutable_command()->MergeFrom(commandInfo);
+  SlaveID slaveId = SlaveID();
+  slaveId.set_value("slave_id");
+  TaskInfo taskInfo = createTask(slaveId, Resources(), CommandInfo());
 
-  // Destroy the container using the PosixLauncher but return a failed
+  // Destroy the container using the SubprocessLauncher but return a failed
   // future to the containerizer.
   EXPECT_CALL(*testLauncher, destroy(_))
     .WillOnce(DoAll(InvokeDestroyAndWait(testLauncher),
                     Return(Failure("Destroy failure"))));
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      taskInfo,
-      createExecutorInfo("executor", "sleep 1000"),
-      os::getcwd(),
-      None(),
-      SlaveID(),
+      createContainerConfig(
+          taskInfo,
+          createExecutorInfo("executor", "sleep 1000"),
+          sandbox.get()),
       map<string, string>(),
-      false);
+      None());
 
-  AWAIT_READY(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
-  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
-
-  containerizer->destroy(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
   // The container destroy should fail.
-  AWAIT_FAILED(wait);
+  AWAIT_FAILED(termination);
 
   // We settle the clock here to ensure that the processing of
   // 'MesosContainerizerProcess::__destroy()' is complete and the
@@ -1268,7 +1263,7 @@ class MesosContainerizerRecoverTest : public MesosTest {};
 TEST_F(MesosContainerizerRecoverTest, SkipRecoverNonMesosContainers)
 {
   slave::Flags flags = CreateSlaveFlags();
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -1280,10 +1275,10 @@ TEST_F(MesosContainerizerRecoverTest, SkipRecoverNonMesosContainers)
   Owned<MesosContainerizer> containerizer(create.get());
 
   ExecutorID executorId;
-  executorId.set_value(UUID::random().toString());
+  executorId.set_value(id::UUID::random().toString());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   ExecutorInfo executorInfo;
   executorInfo.mutable_container()->set_type(ContainerInfo::DOCKER);
@@ -1301,15 +1296,15 @@ TEST_F(MesosContainerizerRecoverTest, SkipRecoverNonMesosContainers)
 
   SlaveState slaveState;
   FrameworkID frameworkId;
-  frameworkId.set_value(UUID::random().toString());
+  frameworkId.set_value(id::UUID::random().toString());
   slaveState.frameworks.put(frameworkId, frameworkState);
 
-  Future<Nothing> recover = containerizer.get()->recover(slaveState);
+  Future<Nothing> recover = containerizer->recover(slaveState);
   AWAIT_READY(recover);
 
-  Future<hashset<ContainerID>> containers = containerizer.get()->containers();
+  Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
-  EXPECT_EQ(0u, containers.get().size());
+  EXPECT_TRUE(containers->empty());
 }
 
 
@@ -1323,32 +1318,31 @@ TEST_F(MesosLauncherStatusTest, ExecutorPIDTest)
   slave::Flags flags = CreateSlaveFlags();
   flags.launcher = "posix";
 
-  Try<Launcher*> launcher = PosixLauncher::create(flags);
+  Try<Launcher*> launcher = SubprocessLauncher::create(flags);
   ASSERT_SOME(launcher);
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
   ContainerID invalidContainerId;
-  invalidContainerId.set_value(UUID::random().toString());
+  invalidContainerId.set_value(id::UUID::random().toString());
 
   Try<pid_t> forked = launcher.get()->fork(
       containerId,
       path::join(flags.launcher_dir, MESOS_CONTAINERIZER),
       vector<string>(),
-      Subprocess::FD(STDIN_FILENO),
-      Subprocess::FD(STDOUT_FILENO),
-      Subprocess::FD(STDERR_FILENO),
+      mesos::slave::ContainerIO(),
       nullptr,
       None(),
       None(),
-      None());
+      None(),
+      vector<int_fd>());
 
   ASSERT_SOME(forked);
 
   Future<ContainerStatus> validStatus = launcher.get()->status(containerId);
 
   AWAIT_READY(validStatus);
-  EXPECT_EQ(validStatus->executor_pid(), forked.get());
+  EXPECT_EQ(static_cast<pid_t>(validStatus->executor_pid()), forked.get());
 
   Future<ContainerStatus> invalidStatus =
     launcher.get()->status(invalidContainerId);
@@ -1368,7 +1362,7 @@ TEST_F(MesosContainerizerWaitTest, WaitUnknownContainer)
 {
   slave::Flags flags = CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> create = MesosContainerizer::create(
       flags,
@@ -1380,7 +1374,7 @@ TEST_F(MesosContainerizerWaitTest, WaitUnknownContainer)
   Owned<MesosContainerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
 

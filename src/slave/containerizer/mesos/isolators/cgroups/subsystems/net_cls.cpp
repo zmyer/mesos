@@ -221,7 +221,7 @@ Try<bool> NetClsHandleManager::isUsed(const NetClsHandle& handle)
 }
 
 
-Try<Owned<Subsystem>> NetClsSubsystem::create(
+Try<Owned<SubsystemProcess>> NetClsSubsystemProcess::create(
     const Flags& flags,
     const string& hierarchy)
 {
@@ -268,7 +268,7 @@ Try<Owned<Subsystem>> NetClsSubsystem::create(
         return Error("The secondary handle has to be a non-zero value.");
       }
 
-      Try<uint16_t> upper =  numify<uint16_t>(range[1]);
+      Try<uint16_t> upper = numify<uint16_t>(range[1]);
       if (upper.isError()) {
         return Error(
             "Failed to parse the upper bound of range of secondary handles '" +
@@ -289,18 +289,18 @@ Try<Owned<Subsystem>> NetClsSubsystem::create(
     }
   }
 
-  return Owned<Subsystem>(
-      new NetClsSubsystem(flags, hierarchy, primaries, secondaries));
+  return Owned<SubsystemProcess>(
+      new NetClsSubsystemProcess(flags, hierarchy, primaries, secondaries));
 }
 
 
-NetClsSubsystem::NetClsSubsystem(
+NetClsSubsystemProcess::NetClsSubsystemProcess(
     const Flags& _flags,
     const string& _hierarchy,
     const IntervalSet<uint32_t>& primaries,
     const IntervalSet<uint32_t>& secondaries)
   : ProcessBase(process::ID::generate("cgroups-net-cls-subsystem")),
-    Subsystem(_flags, _hierarchy)
+    SubsystemProcess(_flags, _hierarchy)
 {
   if (!primaries.empty()) {
     handleManager = NetClsHandleManager(primaries, secondaries);
@@ -308,7 +308,7 @@ NetClsSubsystem::NetClsSubsystem(
 }
 
 
-Future<Nothing> NetClsSubsystem::recover(
+Future<Nothing> NetClsSubsystemProcess::recover(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -334,7 +334,7 @@ Future<Nothing> NetClsSubsystem::recover(
 }
 
 
-Future<Nothing> NetClsSubsystem::prepare(
+Future<Nothing> NetClsSubsystemProcess::prepare(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -361,7 +361,7 @@ Future<Nothing> NetClsSubsystem::prepare(
 }
 
 
-Future<Nothing> NetClsSubsystem::isolate(
+Future<Nothing> NetClsSubsystemProcess::isolate(
     const ContainerID& containerId,
     const string& cgroup,
     pid_t pid)
@@ -393,7 +393,7 @@ Future<Nothing> NetClsSubsystem::isolate(
 }
 
 
-Future<ContainerStatus> NetClsSubsystem::status(
+Future<ContainerStatus> NetClsSubsystemProcess::status(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -421,7 +421,7 @@ Future<ContainerStatus> NetClsSubsystem::status(
 }
 
 
-Future<Nothing> NetClsSubsystem::cleanup(
+Future<Nothing> NetClsSubsystemProcess::cleanup(
     const ContainerID& containerId,
     const string& cgroup)
 {
@@ -447,9 +447,9 @@ Future<Nothing> NetClsSubsystem::cleanup(
 }
 
 
-Result<NetClsHandle> NetClsSubsystem::recoverHandle(
-    const std::string& hierarchy,
-    const std::string& cgroup)
+Result<NetClsHandle> NetClsSubsystemProcess::recoverHandle(
+    const string& hierarchy,
+    const string& cgroup)
 {
   Try<uint32_t> classid = cgroups::net_cls::classid(hierarchy, cgroup);
   if (classid.isError()) {

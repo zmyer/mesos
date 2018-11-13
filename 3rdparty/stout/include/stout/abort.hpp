@@ -19,7 +19,7 @@
 #include <string.h>
 
 #ifdef __WINDOWS__
-#include <stout/windows.hpp>
+#include <stout/windows.hpp> // For `windows.h`.
 #else
 #include <unistd.h>
 #endif // __WINDOWS__
@@ -42,15 +42,21 @@
 
 inline NORETURN void _Abort(const char* prefix, const char* message)
 {
+#ifndef __WINDOWS__
+  const size_t prefix_len = strlen(prefix);
+  const size_t message_len = strlen(message);
+
   // Write the failure message in an async-signal safe manner,
   // assuming strlen is async-signal safe or optimized out.
   // In fact, it is highly unlikely that strlen would be
   // implemented in an unsafe manner:
   // http://austingroupbugs.net/view.php?id=692
-  while (::write(STDERR_FILENO, prefix, strlen(prefix)) == -1 &&
+  // NOTE: we can't use `signal_safe::write`, because it's defined in the header
+  // which can't be included due to circular dependency of headers.
+  while (::write(STDERR_FILENO, prefix, prefix_len) == -1 &&
          errno == EINTR);
   while (message != nullptr &&
-         ::write(STDERR_FILENO, message, strlen(message)) == -1 &&
+         ::write(STDERR_FILENO, message, message_len) == -1 &&
          errno == EINTR);
 
   // NOTE: Since `1` can be interpreted as either an `unsigned int` or a
@@ -59,6 +65,24 @@ inline NORETURN void _Abort(const char* prefix, const char* message)
   // Windows CRT headers.
   while (::write(STDERR_FILENO, "\n", static_cast<size_t>(1)) == -1 &&
          errno == EINTR);
+#else
+  // NOTE: On Windows, `WriteFile` takes an `DWORD`, not `size_t`. We
+  // perform an explicit type conversion here to silence the warning.
+  // `strlen` always returns a positive result, which means it is safe
+  // to cast it to an unsigned value.
+  const DWORD prefix_len = static_cast<DWORD>(strlen(prefix));
+  const DWORD message_len = static_cast<DWORD>(strlen(message));
+
+  const HANDLE fd = ::GetStdHandle(STD_ERROR_HANDLE);
+
+  // NOTE: There is really nothing to do if these fail during an
+  // abort, so we don't check for errors, or care about `bytes`.
+  DWORD bytes;
+  ::WriteFile(fd, prefix, prefix_len, &bytes, nullptr);
+  ::WriteFile(fd, message, message_len, &bytes, nullptr);
+  ::WriteFile(fd, "\n", 1, &bytes, nullptr);
+#endif // __WINDOWS__
+
   abort();
 }
 

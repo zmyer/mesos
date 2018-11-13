@@ -33,41 +33,32 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
-Try<Owned<Subsystem>> CpuSubsystem::create(
+Try<Owned<SubsystemProcess>> CpuSubsystemProcess::create(
     const Flags& flags,
     const string& hierarchy)
 {
   if (flags.cgroups_enable_cfs) {
-    Try<bool> exists = cgroups::exists(
-        hierarchy,
-        flags.cgroups_root,
-        "cpu.cfs_quota_us");
-
-    if (exists.isError()) {
-      return Error(
-          "Failed to check the existence of 'cpu.cfs_quota_us': " +
-          exists.error());
-    } else if (!exists.get()) {
+    if (!cgroups::exists(hierarchy, flags.cgroups_root, "cpu.cfs_quota_us")) {
       return Error(
           "Failed to find 'cpu.cfs_quota_us'. Your kernel might be "
           "too old to use the CFS quota feature");
     }
   }
 
-  return Owned<Subsystem>(new CpuSubsystem(flags, hierarchy));
+  return Owned<SubsystemProcess>(new CpuSubsystemProcess(flags, hierarchy));
 }
 
 
-CpuSubsystem::CpuSubsystem(
+CpuSubsystemProcess::CpuSubsystemProcess(
     const Flags& _flags,
     const string& _hierarchy)
   : ProcessBase(process::ID::generate("cgroups-cpu-subsystem")),
-    Subsystem(_flags, _hierarchy) {}
+    SubsystemProcess(_flags, _hierarchy) {}
 
 
-Future<Nothing> CpuSubsystem::update(
+Future<Nothing> CpuSubsystemProcess::update(
     const ContainerID& containerId,
-    const std::string& cgroup,
+    const string& cgroup,
     const Resources& resources)
 {
   if (resources.cpus().isNone()) {
@@ -128,9 +119,9 @@ Future<Nothing> CpuSubsystem::update(
 }
 
 
-Future<ResourceStatistics> CpuSubsystem::usage(
+Future<ResourceStatistics> CpuSubsystemProcess::usage(
     const ContainerID& containerId,
-    const std::string& cgroup)
+    const string& cgroup)
 {
   ResourceStatistics result;
 
@@ -145,17 +136,17 @@ Future<ResourceStatistics> CpuSubsystem::usage(
       return Failure("Failed to read 'cpu.stat': " + stat.error());
     }
 
-    Option<uint64_t> nr_periods = stat.get().get("nr_periods");
+    Option<uint64_t> nr_periods = stat->get("nr_periods");
     if (nr_periods.isSome()) {
       result.set_cpus_nr_periods(nr_periods.get());
     }
 
-    Option<uint64_t> nr_throttled = stat.get().get("nr_throttled");
+    Option<uint64_t> nr_throttled = stat->get("nr_throttled");
     if (nr_throttled.isSome()) {
       result.set_cpus_nr_throttled(nr_throttled.get());
     }
 
-    Option<uint64_t> throttled_time = stat.get().get("throttled_time");
+    Option<uint64_t> throttled_time = stat->get("throttled_time");
     if (throttled_time.isSome()) {
       result.set_cpus_throttled_time_secs(
           Nanoseconds(throttled_time.get()).secs());

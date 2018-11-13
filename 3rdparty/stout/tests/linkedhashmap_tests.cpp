@@ -10,7 +10,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-#include <list>
 #include <string>
 #include <vector>
 
@@ -19,7 +18,6 @@
 #include <stout/gtest.hpp>
 #include <stout/linkedhashmap.hpp>
 
-using std::list;
 using std::string;
 using std::vector;
 
@@ -72,7 +70,7 @@ TEST(LinkedHashmapTest, Keys)
 {
   LinkedHashMap<string, int> map;
 
-  list<string> keys = {"foo", "bar", "food", "rad", "cat"};
+  vector<string> keys = {"foo", "bar", "food", "rad", "cat"};
 
   // Insert keys into the map.
   foreach (const string& key, keys) {
@@ -111,8 +109,8 @@ TEST(LinkedHashMapTest, Foreach)
 
   map["foo"] = 4; // Re-insert a key.
 
-  list<string> keyList = map.keys();
-  list<int> valueList = map.values();
+  vector<string> keyList = map.keys();
+  vector<int> valueList = map.values();
 
   vector<string> keys{keyList.begin(), keyList.end()};
   vector<int> values{valueList.begin(), valueList.end()};
@@ -179,6 +177,63 @@ TEST(LinkedHashMapTest, ForeachMutate)
     }
   }
 
-  list<string> values = {"foo", "qux", "caz"};
+  vector<string> values = {"foo", "qux", "caz"};
   EXPECT_EQ(values, map.values());
+}
+
+
+// TODO(bmahler): Simplify this test once LinkedHashMap
+// has equality operators.
+TEST(LinkedHashMapTest, CopyConstruction)
+{
+  LinkedHashMap<int, string> map;
+
+  map[1] = "1";
+  map[2] = "2";
+  map[3] = "3";
+
+  LinkedHashMap<int, string> copy(map);
+
+  EXPECT_EQ(map.keys(), copy.keys());
+  EXPECT_EQ(map.values(), copy.values());
+
+  EXPECT_EQ(1u, map.erase(1));
+  EXPECT_EQ(1u, copy.erase(1));
+
+  EXPECT_EQ(map.keys(), copy.keys());
+  EXPECT_EQ(map.values(), copy.values());
+
+  copy[4] = "4";
+
+  EXPECT_NE(map.keys(), copy.keys());
+  EXPECT_NE(map.values(), copy.values());
+}
+
+
+// TODO(bmahler): Simplify this test once LinkedHashMap
+// has equality operators.
+TEST(LinkedHashMapTest, Assignment)
+{
+  LinkedHashMap<int, string> map;
+
+  map[1] = "1";
+  map[2] = "2";
+  map[3] = "3";
+
+  LinkedHashMap<int, string> copy;
+  copy = map;
+
+  EXPECT_EQ(map.keys(), copy.keys());
+  EXPECT_EQ(map.values(), copy.values());
+
+  EXPECT_EQ(1u, map.erase(1));
+  EXPECT_EQ(1u, copy.erase(1));
+
+  EXPECT_EQ(map.keys(), copy.keys());
+  EXPECT_EQ(map.values(), copy.values());
+
+  copy[4] = "4";
+
+  EXPECT_NE(map.keys(), copy.keys());
+  EXPECT_NE(map.values(), copy.values());
 }

@@ -14,29 +14,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <unordered_map>
+#include "slave/containerizer/fetcher.hpp"
 
 #include <process/async.hpp>
 #include <process/check.hpp>
 #include <process/collect.hpp>
 #include <process/dispatch.hpp>
+#include <process/id.hpp>
 #include <process/owned.hpp>
+#include <process/subprocess.hpp>
 
+#include <process/metrics/metrics.hpp>
+
+#include <stout/hashmap.hpp>
+#include <stout/hashset.hpp>
 #include <stout/net.hpp>
 #include <stout/path.hpp>
+#include <stout/strings.hpp>
+#include <stout/uri.hpp>
 #ifdef __WINDOWS__
 #include <stout/windows.hpp>
 #endif // __WINDOWS__
 
+#include <stout/os/exists.hpp>
 #include <stout/os/find.hpp>
 #include <stout/os/killtree.hpp>
+#include <stout/os/realpath.hpp>
 #include <stout/os/read.hpp>
+#include <stout/os/rmdir.hpp>
 
 #include "hdfs/hdfs.hpp"
 
-#include "slave/slave.hpp"
+#include "common/status_utils.hpp"
 
-#include "slave/containerizer/fetcher.hpp"
+#include "slave/containerizer/fetcher_process.hpp"
 
 using std::list;
 using std::map;
@@ -44,6 +55,8 @@ using std::shared_ptr;
 using std::string;
 using std::transform;
 using std::vector;
+
+using strings::startsWith;
 
 using mesos::fetcher::FetcherInfo;
 
@@ -58,14 +71,18 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
-static const string FILE_URI_PREFIX = "file://";
-static const string FILE_URI_LOCALHOST = "file://localhost";
-
 static const string CACHE_FILE_NAME_PREFIX = "c";
 
 
-Fetcher::Fetcher() : process(new FetcherProcess())
+Fetcher::Fetcher(const Flags& flags) : process(new FetcherProcess(flags))
 {
+  if (os::exists(flags.fetcher_cache_dir)) {
+    Try<Nothing> rmdir = os::rmdir(flags.fetcher_cache_dir, true);
+    CHECK_SOME(rmdir)
+      << "Could not delete fetcher cache directory '"
+      << flags.fetcher_cache_dir << "': " + rmdir.error();
+  }
+
   spawn(process.get());
 }
 
@@ -81,34 +98,6 @@ Fetcher::~Fetcher()
 {
   terminate(process.get());
   process::wait(process.get());
-}
-
-
-Try<Nothing> Fetcher::recover(const SlaveID& slaveId, const Flags& flags)
-{
-  // Good enough for now, simple, least-effort recovery.
-  VLOG(1) << "Clearing fetcher cache";
-
-  string cacheDirectory = paths::getSlavePath(flags.fetcher_cache_dir, slaveId);
-  Result<string> path = os::realpath(cacheDirectory);
-  if (path.isError()) {
-    LOG(ERROR) << "Malformed fetcher cache directory path '" << cacheDirectory
-               << "', error: " + path.error();
-
-    return Error(path.error());
-  }
-
-  if (path.isSome() && os::exists(path.get())) {
-    Try<Nothing> rmdir = os::rmdir(path.get(), true);
-    if (rmdir.isError()) {
-      LOG(ERROR) << "Could not delete fetcher cache directory '"
-                 << cacheDirectory << "', error: " + rmdir.error();
-
-      return rmdir;
-    }
-  }
-
-  return Nothing();
 }
 
 
@@ -200,31 +189,23 @@ Result<string> Fetcher::uriToLocalPath(
     const string& uri,
     const Option<string>& frameworksHome)
 {
-  if (!strings::startsWith(uri, FILE_URI_PREFIX) &&
-      strings::contains(uri, "://")) {
+  const bool fileUri = strings::startsWith(uri, uri::FILE_PREFIX);
+
+  if (!fileUri && strings::contains(uri, "://")) {
     return None();
   }
 
-  string path = uri;
-  bool fileUri = false;
+  // TODO(andschwa): Fix `path::from_uri` to remove hostname component, which it
+  // currently does not do, so we remove `localhost` manually here.
+  string path =
+    strings::remove(path::from_uri(uri), "localhost", strings::PREFIX);
 
-  if (strings::startsWith(path, FILE_URI_LOCALHOST)) {
-    path = path.substr(FILE_URI_LOCALHOST.size());
-    fileUri = true;
-  } else if (strings::startsWith(path, FILE_URI_PREFIX)) {
-    path = path.substr(FILE_URI_PREFIX.size());
-    fileUri = true;
-  }
-
-#ifndef __WINDOWS__
-  const bool isRelativePath = !strings::startsWith(path, "/");
-
-  if (isRelativePath) {
+  if (!path::absolute(path)) {
     if (fileUri) {
       return Error("File URI only supports absolute paths");
     }
 
-    if (frameworksHome.isNone() || frameworksHome.get().empty()) {
+    if (frameworksHome.isNone() || frameworksHome->empty()) {
       return Error("A relative path was passed for the resource but the "
                    "Mesos framework home was not specified. "
                    "Please either provide this config option "
@@ -235,7 +216,6 @@ Result<string> Fetcher::uriToLocalPath(
                 << "making it: '" << path << "'";
     }
   }
-#endif // __WINDOWS__
 
   return path;
 }
@@ -254,24 +234,65 @@ Future<Nothing> Fetcher::fetch(
     const ContainerID& containerId,
     const CommandInfo& commandInfo,
     const string& sandboxDirectory,
-    const Option<string>& user,
-    const SlaveID& slaveId,
-    const Flags& flags)
+    const Option<string>& user)
 {
   return dispatch(process.get(),
                   &FetcherProcess::fetch,
                   containerId,
                   commandInfo,
                   sandboxDirectory,
-                  user,
-                  slaveId,
-                  flags);
+                  user);
 }
 
 
 void Fetcher::kill(const ContainerID& containerId)
 {
   dispatch(process.get(), &FetcherProcess::kill, containerId);
+}
+
+
+FetcherProcess::Metrics::Metrics(FetcherProcess *fetcher)
+  : task_fetches_succeeded("containerizer/fetcher/task_fetches_succeeded"),
+    task_fetches_failed("containerizer/fetcher/task_fetches_failed"),
+    cache_size_total_bytes(
+        "containerizer/fetcher/cache_size_total_bytes",
+        [=]() {
+          // This value is safe to read while it is concurrently updated.
+          return static_cast<double>(fetcher->cache.totalSpace().bytes());
+        }),
+    cache_size_used_bytes(
+        "containerizer/fetcher/cache_size_used_bytes",
+        [=]() {
+          // This value is safe to read while it is concurrently updated.
+          return static_cast<double>(fetcher->cache.usedSpace().bytes());
+        })
+{
+  process::metrics::add(task_fetches_succeeded);
+  process::metrics::add(task_fetches_failed);
+  process::metrics::add(cache_size_total_bytes);
+  process::metrics::add(cache_size_used_bytes);
+}
+
+
+FetcherProcess::Metrics::~Metrics()
+{
+  process::metrics::remove(task_fetches_succeeded);
+  process::metrics::remove(task_fetches_failed);
+
+  // Wait for the metrics to be removed before we allow the destructor
+  // to complete.
+  await(
+      process::metrics::remove(cache_size_total_bytes),
+      process::metrics::remove(cache_size_used_bytes)).await();
+}
+
+
+FetcherProcess::FetcherProcess(const Flags& _flags)
+    : ProcessBase(process::ID::generate("fetcher")),
+      metrics(this),
+      flags(_flags),
+      cache(_flags.fetcher_cache_size)
+{
 }
 
 
@@ -295,7 +316,8 @@ static Try<Bytes> fetchSize(
     return Error(path.error());
   }
   if (path.isSome()) {
-    Try<Bytes> size = os::stat::size(path.get(), os::stat::FOLLOW_SYMLINK);
+    Try<Bytes> size = os::stat::size(
+        path.get(), os::stat::FollowSymlink::FOLLOW_SYMLINK);
     if (size.isError()) {
       return Error("Could not determine file size for: '" + path.get() +
                      "', error: " + size.error());
@@ -342,20 +364,14 @@ Future<Nothing> FetcherProcess::fetch(
     const ContainerID& containerId,
     const CommandInfo& commandInfo,
     const string& sandboxDirectory,
-    const Option<string>& user,
-    const SlaveID& slaveId,
-    const Flags& flags)
+    const Option<string>& user)
 {
   VLOG(1) << "Starting to fetch URIs for container: " << containerId
           << ", directory: " << sandboxDirectory;
 
-  // TODO(bernd-mesos): This will disappear once we inject flags at
-  // Fetcher/FetcherProcess creation time. For now we trust this is
-  // always the exact same value.
-  cache.setSpace(flags.fetcher_cache_size);
-
   Try<Nothing> validated = validateUris(commandInfo);
   if (validated.isError()) {
+    ++metrics.task_fetches_failed;
     return Failure("Could not fetch: " + validated.error());
   }
 
@@ -364,7 +380,7 @@ Future<Nothing> FetcherProcess::fetch(
     commandUser = commandInfo.user();
   }
 
-  string cacheDirectory = paths::getSlavePath(flags.fetcher_cache_dir, slaveId);
+  string cacheDirectory = flags.fetcher_cache_dir;
   if (commandUser.isSome()) {
     // Segregating per-user cache directories.
     cacheDirectory = path::join(cacheDirectory, commandUser.get());
@@ -390,9 +406,22 @@ Future<Nothing> FetcherProcess::fetch(
   // entry.
   hashmap<CommandInfo::URI, Option<Future<shared_ptr<Cache::Entry>>>> entries;
 
+  // When we create new entries, we need to track whether we already have
+  // a entry for the corresponding URI value. This handles the case where
+  // multiple entries have the same URI value (but hash differently because
+  // they differ in other fields). If we see the same URI value multiple
+  // times, then we simply add references the initial entry.
+  hashmap<string, shared_ptr<Cache::Entry>> newEntries;
+
   foreach (const CommandInfo::URI& uri, commandInfo.uris()) {
     if (!uri.cache()) {
       entries[uri] = None();
+      continue;
+    }
+
+    if (newEntries.contains(uri.value())) {
+      newEntries[uri.value()]->reference();
+      entries[uri] = newEntries.at(uri.value());
       continue;
     }
 
@@ -413,6 +442,7 @@ Future<Nothing> FetcherProcess::fetch(
       shared_ptr<Cache::Entry> newEntry =
         cache.create(cacheDirectory, commandUser, uri);
 
+      newEntries.put(uri.value(), newEntry);
       newEntry->reference();
 
       entries[uri] =
@@ -432,8 +462,7 @@ Future<Nothing> FetcherProcess::fetch(
                 containerId,
                 sandboxDirectory,
                 cacheDirectory,
-                commandUser,
-                flags);
+                commandUser);
 }
 
 
@@ -443,12 +472,11 @@ Future<Nothing> FetcherProcess::_fetch(
     const ContainerID& containerId,
     const string& sandboxDirectory,
     const string& cacheDirectory,
-    const Option<string>& user,
-    const Flags& flags)
+    const Option<string>& user)
 {
   // Get out all of the futures we need to wait for so we can wait on
   // them together via 'await'.
-  list<Future<shared_ptr<Cache::Entry>>> futures;
+  vector<Future<shared_ptr<Cache::Entry>>> futures;
 
   foreachvalue (const Option<Future<shared_ptr<Cache::Entry>>>& entry,
                 entries) {
@@ -469,14 +497,14 @@ Future<Nothing> FetcherProcess::_fetch(
                    const Option<Future<shared_ptr<Cache::Entry>>>& entry,
                    entries) {
         if (entry.isSome()) {
-          if (entry.get().isReady()) {
-            result[uri] = entry.get().get();
+          if (entry->isReady()) {
+            result[uri] = entry->get();
           } else {
             LOG(WARNING)
               << "Reverting to fetching directly into the sandbox for '"
               << uri.value()
               << "', due to failure to fetch through the cache, "
-              << "with error: " << entry.get().failure();
+              << "with error: " << entry->failure();
 
             result[uri] = None();
           }
@@ -494,8 +522,7 @@ Future<Nothing> FetcherProcess::_fetch(
                      containerId,
                      sandboxDirectory,
                      cacheDirectory,
-                     user,
-                     flags);
+                     user);
     }));
 }
 
@@ -505,8 +532,7 @@ Future<Nothing> FetcherProcess::__fetch(
     const ContainerID& containerId,
     const string& sandboxDirectory,
     const string& cacheDirectory,
-    const Option<string>& user,
-    const Flags& flags)
+    const Option<string>& user)
 {
   // Now construct the FetcherInfo based on which URIs we're using
   // the cache for and which ones we are bypassing the cache.
@@ -549,8 +575,13 @@ Future<Nothing> FetcherProcess::__fetch(
     info.set_frameworks_home(flags.frameworks_home);
   }
 
-  return run(containerId, sandboxDirectory, user, info, flags)
+  info.mutable_stall_timeout()
+    ->set_nanoseconds(flags.fetcher_stall_timeout.ns());
+
+  return run(containerId, sandboxDirectory, user, info)
     .repair(defer(self(), [=](const Future<Nothing>& future) {
+      ++metrics.task_fetches_failed;
+
       LOG(ERROR) << "Failed to run mesos-fetcher: " << future.failure();
 
       foreachvalue (const Option<shared_ptr<Cache::Entry>>& entry, entries) {
@@ -568,10 +599,12 @@ Future<Nothing> FetcherProcess::__fetch(
       return future; // Always propagate the failure!
     })
     // Call to `operator` here forces the conversion on MSVC. This is implicit
-    // on clang an gcc.
+    // on clang and gcc.
     .operator std::function<process::Future<Nothing>(
         const process::Future<Nothing> &)>())
     .then(defer(self(), [=]() {
+      ++metrics.task_fetches_succeeded;
+
       foreachvalue (const Option<shared_ptr<Cache::Entry>>& entry, entries) {
         if (entry.isSome()) {
           entry.get()->unreference();
@@ -626,48 +659,40 @@ static off_t delta(
 
 
 // For testing only.
-// TODO(bernd-mesos): After refactoring slave/containerizer,fetcher so
-// that flags and slave ID get injected, replace this with two functions
-// one of which returns a list of cache file paths, the other the number
-// of entries in the cache table.
-Try<list<Path>> FetcherProcess::cacheFiles(
-    const SlaveID& slaveId,
-    const Flags& flags)
+Try<list<Path>> FetcherProcess::cacheFiles() const
 {
   list<Path> result;
 
-  const string cacheDirectory =
-    slave::paths::getSlavePath(flags.fetcher_cache_dir, slaveId);
-
-  if (!os::exists(cacheDirectory)) {
+  if (!os::exists(flags.fetcher_cache_dir)) {
     return result;
   }
 
   const Try<list<string>> find =
-    os::find(cacheDirectory, CACHE_FILE_NAME_PREFIX);
+    os::find(flags.fetcher_cache_dir, CACHE_FILE_NAME_PREFIX);
 
   if (find.isError()) {
     return Error("Could not access cache directory '" +
-                 cacheDirectory + "' with error: " + find.error());
+                 flags.fetcher_cache_dir + "' with error: " + find.error());
   }
 
-  transform(find.get().begin(),
-            find.get().end(),
-            std::back_inserter(result),
-            [](const string& path) { return Path(path); });
+  transform(
+      find->begin(),
+      find->end(),
+      std::back_inserter(result),
+      [](const string& path) { return Path(path); });
 
   return result;
 }
 
 
 // For testing only.
-size_t FetcherProcess::cacheSize()
+size_t FetcherProcess::cacheSize() const
 {
   return cache.size();
 }
 
 
-Bytes FetcherProcess::availableCacheSpace()
+Bytes FetcherProcess::availableCacheSpace() const
 {
   return cache.availableSpace();
 }
@@ -720,8 +745,7 @@ Future<Nothing> FetcherProcess::run(
     const ContainerID& containerId,
     const string& sandboxDirectory,
     const Option<string>& user,
-    const FetcherInfo& info,
-    const Flags& flags)
+    const FetcherInfo& info)
 {
   // Before we fetch let's make sure we create 'stdout' and 'stderr'
   // files into which we can redirect the output of the mesos-fetcher
@@ -734,7 +758,7 @@ Future<Nothing> FetcherProcess::run(
   // chown them.
   const string stdoutPath = path::join(info.sandbox_directory(), "stdout");
 
-  Try<int> out = os::open(
+  Try<int_fd> out = os::open(
       stdoutPath,
       O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -744,7 +768,7 @@ Future<Nothing> FetcherProcess::run(
   }
 
   string stderrPath = path::join(info.sandbox_directory(), "stderr");
-  Try<int> err = os::open(
+  Try<int_fd> err = os::open(
       stderrPath,
       O_WRONLY | O_CREAT | O_TRUNC | O_NONBLOCK | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -758,7 +782,7 @@ Future<Nothing> FetcherProcess::run(
 // here is conditionally compiled out on Windows.
 #ifndef __WINDOWS__
   if (user.isSome()) {
-    // TODO(megha.sharma): Fetcher should not create seperate stdout/stderr
+    // TODO(megha.sharma): Fetcher should not create separate stdout/stderr
     // files but rather use FDs prepared by the container logger.
     // See MESOS-6271 for more details.
     Try<Nothing> chownOut = os::chown(
@@ -800,7 +824,12 @@ Future<Nothing> FetcherProcess::run(
       return Nothing();
   }
 
+#ifdef __WINDOWS__
+  string fetcherPath = path::join(flags.launcher_dir, "mesos-fetcher.exe");
+#else
   string fetcherPath = path::join(flags.launcher_dir, "mesos-fetcher");
+#endif // __WINDOWS__
+
   Result<string> realpath = os::realpath(fetcherPath);
 
   if (!realpath.isSome()) {
@@ -822,18 +851,40 @@ Future<Nothing> FetcherProcess::run(
 
   // We pass arguments to the fetcher program by means of an
   // environment variable.
-  map<string, string> environment = os::environment();
+  // For assuring that we pass on variables that may be consumed by
+  // the mesos-fetcher, we whitelist them before masking out any
+  // unwanted agent->fetcher environment spillover.
+  // TODO(tillt): Consider using the `mesos::internal::logging::Flags`
+  // to determine the whitelist.
+  const hashset<string> whitelist = {
+    "MESOS_EXTERNAL_LOG_FILE",
+    "MESOS_INITIALIZE_DRIVER_LOGGING",
+    "MESOS_LOG_DIR",
+    "MESOS_LOGBUFSECS",
+    "MESOS_LOGGING_LEVEL",
+    "MESOS_QUIET"
+  };
 
-  // The libprocess port is explicitly removed because this will conflict
-  // with the already-running agent.
-  environment.erase("LIBPROCESS_PORT");
-  environment.erase("LIBPROCESS_ADVERTISE_PORT");
+  map<string, string> environment;
+  foreachpair (const string& key, const string& value, os::environment()) {
+    if (whitelist.contains(strings::upper(key)) ||
+        (!startsWith(key, "LIBPROCESS_") && !startsWith(key, "MESOS_"))) {
+      environment.emplace(key, value);
+    }
+  }
 
   environment["MESOS_FETCHER_INFO"] = stringify(JSON::protobuf(info));
 
-  if (!flags.hadoop_home.empty()) {
-    environment["HADOOP_HOME"] = flags.hadoop_home;
+  if (flags.hadoop_home.isSome()) {
+    environment["HADOOP_HOME"] = flags.hadoop_home.get();
   }
+
+  // TODO(jieyu): This is to make sure the libprocess of the fetcher
+  // can properly initialize and find the IP. Since we don't need to
+  // use the TCP socket for communication, it's OK to use a local
+  // address. Consider disable TCP socket in libprocess if libprocess
+  // supports that.
+  environment.emplace("LIBPROCESS_IP", "127.0.0.1");
 
   VLOG(1) << "Fetching URIs using command '" << command << "'";
 
@@ -852,19 +903,18 @@ Future<Nothing> FetcherProcess::run(
   // Remember this PID in case we need to kill the subprocess. See
   // FetcherProcess::kill(). This value gets removed after we wait on
   // the subprocess.
-  subprocessPids[containerId] = fetcherSubprocess.get().pid();
+  subprocessPids[containerId] = fetcherSubprocess->pid();
 
-  return fetcherSubprocess.get().status()
+  return fetcherSubprocess->status()
     .then(defer(self(), [=](const Option<int>& status) -> Future<Nothing> {
       if (status.isNone()) {
         return Failure("No status available from mesos-fetcher");
       }
 
-      if (status.get() != 0) {
+      if (!WSUCCEEDED(status.get())) {
         return Failure("Failed to fetch all URIs for container '" +
-                       stringify(containerId) +
-                       "' with exit status: " +
-                       stringify(status.get()));
+                       stringify(containerId) + "': " +
+                       WSTRINGIFY(status.get()));
       }
 
       return Nothing();
@@ -988,14 +1038,15 @@ FetcherProcess::Cache::get(
 
 bool FetcherProcess::Cache::contains(
     const Option<string>& user,
-    const string& uri)
+    const string& uri) const
 {
   const string key = cacheKey(user, uri);
   return table.get(key).isSome();
 }
 
 
-bool FetcherProcess::Cache::contains(const shared_ptr<Cache::Entry>& entry)
+bool FetcherProcess::Cache::contains(
+    const shared_ptr<Cache::Entry>& entry) const
 {
   Option<shared_ptr<Cache::Entry>> found = table.get(entry->key);
   if (found.isNone()) {
@@ -1131,7 +1182,7 @@ Try<Nothing> FetcherProcess::Cache::adjust(
 
   Try<Bytes> size = os::stat::size(
       entry.get()->path().string(),
-      os::stat::DO_NOT_FOLLOW_SYMLINK);
+      os::stat::FollowSymlink::DO_NOT_FOLLOW_SYMLINK);
 
   if (size.isSome()) {
     off_t d = delta(size.get(), entry);
@@ -1153,20 +1204,9 @@ Try<Nothing> FetcherProcess::Cache::adjust(
 }
 
 
-size_t FetcherProcess::Cache::size()
+size_t FetcherProcess::Cache::size() const
 {
   return table.size();
-}
-
-
-void FetcherProcess::Cache::setSpace(const Bytes& bytes)
-{
-  if (space > 0) {
-    // Dynamic cache size changes not supported.
-    CHECK_EQ(space, bytes);
-  } else {
-    space = bytes;
-  }
 }
 
 
@@ -1199,7 +1239,19 @@ void FetcherProcess::Cache::releaseSpace(const Bytes& bytes)
 }
 
 
-Bytes FetcherProcess::Cache::availableSpace()
+Bytes FetcherProcess::Cache::totalSpace() const
+{
+  return space;
+}
+
+
+Bytes FetcherProcess::Cache::usedSpace() const
+{
+  return tally;
+}
+
+
+Bytes FetcherProcess::Cache::availableSpace() const
 {
   if (tally > space) {
     LOG(WARNING) << "Fetcher cache space overflow - space used: " << tally
@@ -1247,7 +1299,7 @@ void FetcherProcess::Cache::Entry::unreference()
 }
 
 
-bool FetcherProcess::Cache::Entry::isReferenced()
+bool FetcherProcess::Cache::Entry::isReferenced() const
 {
   return referenceCount > 0;
 }

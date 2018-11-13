@@ -33,6 +33,35 @@ public:
   typedef std::list<entry> list;
   typedef hashmap<Key, typename list::iterator> map;
 
+  LinkedHashMap() = default;
+
+  LinkedHashMap(const LinkedHashMap<Key, Value>& other)
+    : entries_(other.entries_)
+  {
+    // Build up the index.
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+      keys_[it->first] = it;
+    }
+  }
+
+  LinkedHashMap& operator=(const LinkedHashMap<Key, Value>& other)
+  {
+    clear();
+
+    entries_ = other.entries_;
+
+    // Build up the index.
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+      keys_[it->first] = it;
+    }
+
+    return *this;
+  }
+
+  // TODO(bmahler): Implement move construction / assignment.
+  LinkedHashMap(LinkedHashMap<Key, Value>&&) = delete;
+  LinkedHashMap& operator=(LinkedHashMap&&) = delete;
+
   Value& operator[] (const Key& key)
   {
     if (!keys_.contains(key)) {
@@ -82,9 +111,10 @@ public:
   }
 
   // Returns the keys in the map in insertion order.
-  std::list<Key> keys() const
+  std::vector<Key> keys() const
   {
-    std::list<Key> result;
+    std::vector<Key> result;
+    result.reserve(entries_.size());
 
     foreach (const entry& entry, entries_) {
       result.push_back(entry.first);
@@ -94,9 +124,10 @@ public:
   }
 
   // Returns the values in the map in insertion order.
-  std::list<Value> values() const
+  std::vector<Value> values() const
   {
-    std::list<Value> result;
+    std::vector<Value> result;
+    result.reserve(entries_.size());
 
     foreach (const entry& entry, entries_) {
       result.push_back(entry.second);

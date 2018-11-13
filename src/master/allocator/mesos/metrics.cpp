@@ -14,19 +14,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <mesos/quota/quota.hpp>
-
-#include <process/metrics/metrics.hpp>
-
-#include <stout/strings.hpp>
-
-#include "master/allocator/mesos/hierarchical.hpp"
 #include "master/allocator/mesos/metrics.hpp"
 
-using std::string;
-using std::vector;
+#include <string>
 
-using process::metrics::Gauge;
+#include <mesos/quota/quota.hpp>
+
+#include <process/metrics/pull_gauge.hpp>
+#include <process/metrics/push_gauge.hpp>
+#include <process/metrics/metrics.hpp>
+
+#include <stout/hashmap.hpp>
+
+#include "common/protobuf_utils.hpp"
+
+#include "master/metrics.hpp"
+
+#include "master/allocator/mesos/hierarchical.hpp"
+
+using std::string;
+
+using process::metrics::PullGauge;
+using process::metrics::PushGauge;
 
 namespace mesos {
 namespace internal {
@@ -45,12 +54,14 @@ Metrics::Metrics(const HierarchicalAllocatorProcess& _allocator)
         process::defer(
             allocator, &HierarchicalAllocatorProcess::_event_queue_dispatches)),
     allocation_runs("allocator/mesos/allocation_runs"),
-    allocation_run("allocator/mesos/allocation_run", Hours(1))
+    allocation_run("allocator/mesos/allocation_run", Hours(1)),
+    allocation_run_latency("allocator/mesos/allocation_run_latency", Hours(1))
 {
   process::metrics::add(event_queue_dispatches);
   process::metrics::add(event_queue_dispatches_);
   process::metrics::add(allocation_runs);
   process::metrics::add(allocation_run);
+  process::metrics::add(allocation_run_latency);
 
   // Create and install gauges for the total and allocated
   // amount of standard scalar resources.
@@ -62,13 +73,13 @@ Metrics::Metrics(const HierarchicalAllocatorProcess& _allocator)
   string resources[] = {"cpus", "mem", "disk"};
 
   foreach (const string& resource, resources) {
-    Gauge total(
+    PullGauge total(
         "allocator/mesos/resources/" + resource + "/total",
         defer(allocator,
               &HierarchicalAllocatorProcess::_resources_total,
               resource));
 
-    Gauge offered_or_allocated(
+    PullGauge offered_or_allocated(
         "allocator/mesos/resources/" + resource + "/offered_or_allocated",
         defer(allocator,
               &HierarchicalAllocatorProcess::_resources_offered_or_allocated,
@@ -89,28 +100,29 @@ Metrics::~Metrics()
   process::metrics::remove(event_queue_dispatches_);
   process::metrics::remove(allocation_runs);
   process::metrics::remove(allocation_run);
+  process::metrics::remove(allocation_run_latency);
 
-  foreach (const Gauge& gauge, resources_total) {
+  foreach (const PullGauge& gauge, resources_total) {
     process::metrics::remove(gauge);
   }
 
-  foreach (const Gauge& gauge, resources_offered_or_allocated) {
+  foreach (const PullGauge& gauge, resources_offered_or_allocated) {
     process::metrics::remove(gauge);
   }
 
   foreachkey (const string& role, quota_allocated) {
-    foreachvalue (const Gauge& gauge, quota_allocated[role]) {
+    foreachvalue (const PullGauge& gauge, quota_allocated[role]) {
       process::metrics::remove(gauge);
     }
   }
 
   foreachkey (const string& role, quota_guarantee) {
-    foreachvalue (const Gauge& gauge, quota_guarantee[role]) {
+    foreachvalue (const PullGauge& gauge, quota_guarantee[role]) {
       process::metrics::remove(gauge);
     }
   }
 
-  foreachvalue (const Gauge& gauge, offer_filters_active) {
+  foreachvalue (const PullGauge& gauge, offer_filters_active) {
     process::metrics::remove(gauge);
   }
 }
@@ -120,21 +132,21 @@ void Metrics::setQuota(const string& role, const Quota& quota)
 {
   CHECK(!quota_allocated.contains(role));
 
-  hashmap<string, Gauge> allocated;
-  hashmap<string, Gauge> guarantees;
+  hashmap<string, PullGauge> allocated;
+  hashmap<string, PullGauge> guarantees;
 
   foreach (const Resource& resource, quota.info.guarantee()) {
     CHECK_EQ(Value::SCALAR, resource.type());
     double value = resource.scalar().value();
 
-    Gauge guarantee = Gauge(
+    PullGauge guarantee = PullGauge(
         "allocator/mesos/quota"
         "/roles/" + role +
         "/resources/" + resource.name() +
         "/guarantee",
         process::defer([value]() { return value; }));
 
-    Gauge offered_or_allocated(
+    PullGauge offered_or_allocated(
         "allocator/mesos/quota"
         "/roles/" + role +
         "/resources/" + resource.name() +
@@ -159,12 +171,18 @@ void Metrics::setQuota(const string& role, const Quota& quota)
 void Metrics::removeQuota(const string& role)
 {
   CHECK(quota_allocated.contains(role));
+  CHECK(quota_guarantee.contains(role));
 
-  foreachvalue (const Gauge& gauge, quota_allocated[role]) {
+  foreachvalue (const PullGauge& gauge, quota_allocated[role]) {
+    process::metrics::remove(gauge);
+  }
+
+  foreachvalue (const PullGauge& gauge, quota_guarantee[role]) {
     process::metrics::remove(gauge);
   }
 
   quota_allocated.erase(role);
+  quota_guarantee.erase(role);
 }
 
 
@@ -172,7 +190,7 @@ void Metrics::addRole(const string& role)
 {
   CHECK(!offer_filters_active.contains(role));
 
-  Gauge gauge(
+  PullGauge gauge(
       "allocator/mesos/offer_filters/roles/" + role + "/active",
       defer(allocator,
             &HierarchicalAllocatorProcess::_offer_filters_active,
@@ -186,7 +204,7 @@ void Metrics::addRole(const string& role)
 
 void Metrics::removeRole(const string& role)
 {
-  Option<Gauge> gauge = offer_filters_active.get(role);
+  Option<PullGauge> gauge = offer_filters_active.get(role);
 
   CHECK_SOME(gauge);
 
@@ -194,6 +212,89 @@ void Metrics::removeRole(const string& role)
 
   process::metrics::remove(gauge.get());
 }
+
+
+FrameworkMetrics::FrameworkMetrics(
+    const FrameworkInfo& _frameworkInfo,
+    const bool _publishPerFrameworkMetrics)
+  : frameworkInfo(_frameworkInfo),
+    publishPerFrameworkMetrics(_publishPerFrameworkMetrics)
+{
+  // TODO(greggomann): Calling `getRoles` below copies the roles from the
+  // framework info, which could become expensive if the number of roles grows
+  // large. Consider optimizing this.
+  foreach (
+      const string& role,
+      protobuf::framework::getRoles(frameworkInfo)) {
+    addSubscribedRole(role);
+  }
+}
+
+
+FrameworkMetrics::~FrameworkMetrics()
+{
+  foreach (const string& role, suppressed.keys()) {
+    removeSubscribedRole(role);
+  }
+
+  CHECK(suppressed.empty());
+}
+
+
+void FrameworkMetrics::reviveRole(const string& role)
+{
+  auto iter = suppressed.find(role);
+  CHECK(iter != suppressed.end());
+  iter->second = 0;
+}
+
+
+void FrameworkMetrics::suppressRole(const string& role)
+{
+  auto iter = suppressed.find(role);
+  CHECK(iter != suppressed.end());
+  iter->second = 1;
+}
+
+
+void FrameworkMetrics::addSubscribedRole(const string& role)
+{
+  auto result = suppressed.emplace(
+      role,
+      PushGauge(
+          getFrameworkMetricPrefix(frameworkInfo) + "roles/" +
+          role + "/suppressed"));
+
+  CHECK(result.second);
+  addMetric(result.first->second);
+}
+
+
+void FrameworkMetrics::removeSubscribedRole(const string& role)
+{
+  auto iter = suppressed.find(role);
+
+  CHECK(iter != suppressed.end());
+  removeMetric(iter->second);
+  suppressed.erase(iter);
+}
+
+
+template <typename T>
+void FrameworkMetrics::addMetric(const T& metric) {
+  if (publishPerFrameworkMetrics) {
+    process::metrics::add(metric);
+  }
+}
+
+
+template <typename T>
+void FrameworkMetrics::removeMetric(const T& metric) {
+  if (publishPerFrameworkMetrics) {
+    process::metrics::remove(metric);
+  }
+}
+
 
 } // namespace internal {
 } // namespace allocator {

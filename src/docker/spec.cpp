@@ -197,6 +197,17 @@ Try<hashmap<string, Config::Auth>> parseAuthConfig(
 }
 
 
+Try<hashmap<string, Config::Auth>> parseAuthConfig(const string& s)
+{
+  Try<JSON::Object> json = JSON::parse<JSON::Object>(s);
+  if (json.isError()) {
+    return Error("JSON parse failed: " + json.error());
+  }
+
+  return parseAuthConfig(json.get());
+}
+
+
 string parseAuthUrl(const string& _url)
 {
   string url = _url;
@@ -228,77 +239,10 @@ Try<ImageManifest> parse(const JSON::Object& json)
     return Error("Protobuf parse failed: " + manifest.error());
   }
 
-  Result<JSON::Object> config = json.find<JSON::Object>("config");
-  if (config.isError()) {
-    return Error(
-        "Failed to parse 'config' as a JSON object: " + config.error());
-  }
-
-  if (config.isSome()) {
-    // Parse `Labels` as JSON value first in case it is JSON null.
-    Result<JSON::Value> value = config->find<JSON::Value>("Labels");
-    if (value.isError()) {
-      return Error(
-          "Failed to parse 'Labels' as a JSON value: " + value.error());
-    }
-
-    if (value.isSome() && !value.get().is<JSON::Null>()) {
-      const JSON::Object labels = value.get().as<JSON::Object>();
-
-      foreachpair (const string& key,
-                   const JSON::Value& value,
-                   labels.values) {
-        if (!value.is<JSON::String>()) {
-          return Error(
-              "The value of label key '" + key + "' is not a JSON string");
-        }
-
-        Label* label = manifest->mutable_config()->add_labels();
-        label->set_key(key);
-        label->set_value(value.as<JSON::String>().value);
-      }
-    }
-  }
-
-  // Parse docker labels in `container_config` in case they are
-  // different from the labels parsed above.
-  config = json.find<JSON::Object>("container_config");
-  if (config.isError()) {
-    return Error(
-        "Failed to parse 'container_config' as a JSON object: " +
-        config.error());
-  }
-
-  if (config.isSome()) {
-    // Parse `Labels` as JSON value first in case it is JSON null.
-    Result<JSON::Value> value = config->find<JSON::Value>("Labels");
-    if (value.isError()) {
-      return Error(
-          "Failed to parse 'Labels' as a JSON value: " + value.error());
-    }
-
-    if (value.isSome() && !value.get().is<JSON::Null>()) {
-      const JSON::Object labels = value.get().as<JSON::Object>();
-
-      foreachpair (const string& key,
-                   const JSON::Value& value,
-                   labels.values) {
-        if (!value.is<JSON::String>()) {
-          return Error(
-              "The value of label key '" + key + "' is not a JSON string");
-        }
-
-        Label* label = manifest->mutable_container_config()->add_labels();
-        label->set_key(key);
-        label->set_value(value.as<JSON::String>().value);
-      }
-    }
-  }
-
   Option<Error> error = validate(manifest.get());
   if (error.isSome()) {
-    return Error("Docker v1 image manifest validation failed: " +
-                 error.get().message);
+    return Error(
+        "Docker v1 image manifest validation failed: " + error->message);
   }
 
   return manifest.get();
@@ -332,10 +276,6 @@ Option<Error> validate(const ImageManifest& manifest)
     return Error("'history' field size must be at least one");
   }
 
-  if (manifest.signatures_size() <= 0) {
-    return Error("'signatures' field size must be at least one");
-  }
-
   // Verify that blobSum and v1Compatibility numbers are equal.
   if (manifest.fslayers_size() != manifest.history_size()) {
     return Error("The size of 'fsLayers' should be equal "
@@ -361,9 +301,9 @@ Try<ImageManifest> parse(const JSON::Object& json)
     return Error("Protobuf parse failed: " + manifest.error());
   }
 
-  for (int i = 0; i < manifest.get().history_size(); i++) {
-    Try<JSON::Object> v1Compatibility = JSON::parse<JSON::Object>(
-        manifest.get().history(i).v1compatibility());
+  for (int i = 0; i < manifest->history_size(); i++) {
+    Try<JSON::Object> v1Compatibility =
+      JSON::parse<JSON::Object>(manifest->history(i).v1compatibility());
 
     if (v1Compatibility.isError()) {
       return Error("Parsing v1Compatibility JSON failed: " +
@@ -375,15 +315,15 @@ Try<ImageManifest> parse(const JSON::Object& json)
       return Error("Parsing v1Compatibility protobuf failed: " + v1.error());
     }
 
-    CHECK(!manifest.get().history(i).has_v1());
+    CHECK(!manifest->history(i).has_v1());
 
     manifest->mutable_history(i)->mutable_v1()->CopyFrom(v1.get());
   }
 
   Option<Error> error = validate(manifest.get());
   if (error.isSome()) {
-    return Error("Docker v2 image manifest validation failed: " +
-                 error.get().message);
+    return Error(
+        "Docker v2 image manifest validation failed: " + error->message);
   }
 
   return manifest.get();
@@ -401,5 +341,71 @@ Try<ImageManifest> parse(const string& s)
 }
 
 } // namespace v2 {
+
+namespace v2_2 {
+
+Option<Error> validate(const ImageManifest& manifest)
+{
+  // Validate required fields are present,
+  // e.g., repeated fields that has to be >= 1.
+  if (manifest.layers_size() <= 0) {
+    return Error("'layers' field size must be at least one");
+  }
+
+  // Verify 'config' field.
+  if (!strings::contains(manifest.config().digest(), ":")) {
+    return Error("Incorrect 'digest' format: " + manifest.config().digest());
+  }
+
+  // Verify 'layers' field.
+  for (int i = 0; i < manifest.layers_size(); ++i) {
+    if (!strings::contains(manifest.layers(i).digest(), ":")) {
+      return Error("Incorrect 'digest' format: " + manifest.layers(i).digest());
+    }
+  }
+
+  if (manifest.schemaversion() != 2) {
+    return Error("'schemaVersion' field must be 2");
+  }
+
+  if (manifest.mediatype() !=
+      "application/vnd.docker.distribution.manifest.v2+json") {
+    return Error(
+        "'mediaType' field must be "
+        "'application/vnd.docker.distribution.manifest.v2+json'");
+  }
+
+  return None();
+}
+
+
+Try<ImageManifest> parse(const JSON::Object& json)
+{
+  Try<ImageManifest> manifest = protobuf::parse<ImageManifest>(json);
+  if (manifest.isError()) {
+    return Error("Protobuf parse failed: " + manifest.error());
+  }
+
+  Option<Error> error = validate(manifest.get());
+  if (error.isSome()) {
+    return Error(
+        "Docker v2 s2 image manifest validation failed: " + error->message);
+  }
+
+  return manifest.get();
+}
+
+
+Try<ImageManifest> parse(const string& s)
+{
+  Try<JSON::Object> json = JSON::parse<JSON::Object>(s);
+  if (json.isError()) {
+    return Error("JSON parse failed: " + json.error());
+  }
+
+  return parse(json.get());
+}
+
+} // namespace v2_2 {
 } // namespace spec {
 } // namespace docker {

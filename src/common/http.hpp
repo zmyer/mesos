@@ -24,6 +24,9 @@
 
 #include <mesos/authorizer/authorizer.hpp>
 
+#include <mesos/quota/quota.hpp>
+
+#include <process/authenticator.hpp>
 #include <process/future.hpp>
 #include <process/http.hpp>
 #include <process/owned.hpp>
@@ -35,6 +38,28 @@
 #include <stout/protobuf.hpp>
 #include <stout/unreachable.hpp>
 
+// TODO(benh): Remove this once we get C++14 as an enum should have a
+// default hash.
+namespace std {
+
+template <>
+struct hash<mesos::authorization::Action>
+{
+  typedef size_t result_type;
+
+  typedef mesos::authorization::Action argument_type;
+
+  result_type operator()(const argument_type& action) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(
+        seed, static_cast<std::underlying_type<argument_type>::type>(action));
+    return seed;
+  }
+};
+
+} // namespace std {
+
 namespace mesos {
 
 class Attributes;
@@ -44,7 +69,13 @@ class Task;
 namespace internal {
 
 // Name of the default, basic authenticator.
-constexpr char DEFAULT_HTTP_AUTHENTICATOR[] = "basic";
+constexpr char DEFAULT_BASIC_HTTP_AUTHENTICATOR[] = "basic";
+
+// Name of the default, basic authenticatee.
+constexpr char DEFAULT_BASIC_HTTP_AUTHENTICATEE[] = "basic";
+
+// Name of the default, JWT authenticator.
+constexpr char DEFAULT_JWT_HTTP_AUTHENTICATOR[] = "jwt";
 
 extern hashset<std::string> AUTHORIZABLE_ENDPOINTS;
 
@@ -115,6 +146,7 @@ JSON::Object model(const ExecutorInfo& executorInfo);
 JSON::Array model(const Labels& labels);
 JSON::Object model(const Task& task);
 JSON::Object model(const FileInfo& fileInfo);
+JSON::Object model(const quota::QuotaInfo& quotaInfo);
 
 void json(JSON::ObjectWriter* writer, const Task& task);
 
@@ -122,12 +154,34 @@ void json(JSON::ObjectWriter* writer, const Task& task);
 
 void json(JSON::ObjectWriter* writer, const Attributes& attributes);
 void json(JSON::ObjectWriter* writer, const CommandInfo& command);
+void json(JSON::ObjectWriter* writer, const DomainInfo& domainInfo);
 void json(JSON::ObjectWriter* writer, const ExecutorInfo& executorInfo);
+void json(
+    JSON::StringWriter* writer, const FrameworkInfo::Capability& capability);
 void json(JSON::ArrayWriter* writer, const Labels& labels);
+void json(JSON::ObjectWriter* writer, const MasterInfo& info);
+void json(
+    JSON::StringWriter* writer, const MasterInfo::Capability& capability);
+void json(JSON::ObjectWriter* writer, const Offer& offer);
 void json(JSON::ObjectWriter* writer, const Resources& resources);
+void json(
+    JSON::ObjectWriter* writer,
+    const google::protobuf::RepeatedPtrField<Resource>& resources);
+void json(JSON::ObjectWriter* writer, const SlaveInfo& slaveInfo);
+void json(
+    JSON::StringWriter* writer, const SlaveInfo::Capability& capability);
 void json(JSON::ObjectWriter* writer, const Task& task);
 void json(JSON::ObjectWriter* writer, const TaskStatus& status);
 
+namespace authorization {
+
+// Creates a subject for authorization purposes when given an authenticated
+// principal. This function accepts and returns an `Option` to make call sites
+// cleaner, since it is possible that `principal` will be `NONE`.
+const Option<authorization::Subject> createSubject(
+    const Option<process::http::authentication::Principal>& principal);
+
+} // namespace authorization {
 
 const process::http::authorization::AuthorizationCallbacks
   createAuthorizationCallbacks(Authorizer* authorizer);
@@ -137,7 +191,7 @@ const process::http::authorization::AuthorizationCallbacks
 class AcceptingObjectApprover : public ObjectApprover
 {
 public:
-  virtual Try<bool> approved(
+  Try<bool> approved(
       const Option<ObjectApprover::Object>& object) const noexcept override
   {
     return true;
@@ -145,30 +199,113 @@ public:
 };
 
 
-bool approveViewFrameworkInfo(
-    const process::Owned<ObjectApprover>& frameworksApprover,
-    const FrameworkInfo& frameworkInfo);
+class ObjectApprovers
+{
+public:
+  static process::Future<process::Owned<ObjectApprovers>> create(
+      const Option<Authorizer*>& authorizer,
+      const Option<process::http::authentication::Principal>& principal,
+      std::initializer_list<authorization::Action> actions);
+
+  template <authorization::Action action, typename... Args>
+  bool approved(const Args&... args)
+  {
+    if (!approvers.contains(action)) {
+      LOG(WARNING) << "Attempted to authorize " << principal
+                   << " for unexpected action " << stringify(action);
+      return false;
+    }
+
+    Try<bool> approved = approvers[action]->approved(
+        ObjectApprover::Object(args...));
+
+    if (approved.isError()) {
+      // TODO(joerg84): Expose these errors back to the caller.
+      LOG(WARNING) << "Failed to authorize principal " << principal
+                   << "for action " << stringify(action) << ": "
+                   << approved.error();
+      return false;
+    }
+
+    return approved.get();
+  }
+
+private:
+  ObjectApprovers(
+      hashmap<
+          authorization::Action,
+          process::Owned<ObjectApprover>>&& _approvers,
+      const Option<process::http::authentication::Principal>& _principal)
+    : approvers(std::move(_approvers)),
+      principal(_principal.isSome()
+          ? "'" + stringify(_principal.get()) + "'"
+          : "")
+    {}
+
+  hashmap<authorization::Action, process::Owned<ObjectApprover>> approvers;
+  const std::string principal; // Only used for logging.
+};
 
 
-bool approveViewExecutorInfo(
-    const process::Owned<ObjectApprover>& executorsApprover,
-    const ExecutorInfo& executorInfo,
-    const FrameworkInfo& frameworkInfo);
+template <>
+inline bool ObjectApprovers::approved<authorization::VIEW_ROLE>(
+    const Resource& resource)
+{
+  // Necessary because recovered agents are presented in old format.
+  if (resource.has_role() && resource.role() != "*" &&
+      !approved<authorization::VIEW_ROLE>(resource.role())) {
+    return false;
+  }
+
+  // Reservations follow a path model where each entry is a child of the
+  // previous one. Therefore, to accept the resource the acceptor has to
+  // accept all entries.
+  foreach (Resource::ReservationInfo reservation, resource.reservations()) {
+    if (!approved<authorization::VIEW_ROLE>(reservation.role())) {
+      return false;
+    }
+  }
+
+  if (resource.has_allocation_info() &&
+      !approved<authorization::VIEW_ROLE>(
+          resource.allocation_info().role())) {
+    return false;
+  }
+
+  return true;
+}
 
 
-bool approveViewTaskInfo(
-    const process::Owned<ObjectApprover>& tasksApprover,
-    const TaskInfo& taskInfo,
-    const FrameworkInfo& frameworkInfo);
+/**
+ * Used to filter results for API handlers. Provides the 'accept()' method to
+ * test whether the supplied ID is equal to a stored target ID. If no target
+ * ID is provided when the acceptor is constructed, it will accept all inputs.
+ */
+template <typename T>
+class IDAcceptor
+{
+public:
+  IDAcceptor(const Option<std::string>& id = None())
+  {
+    if (id.isSome()) {
+      T targetId_;
+      targetId_.set_value(id.get());
+      targetId = targetId_;
+    }
+  }
 
+  bool accept(const T& candidateId) const
+  {
+    if (targetId.isNone()) {
+      return true;
+    }
 
-bool approveViewTask(
-    const process::Owned<ObjectApprover>& tasksApprover,
-    const Task& task,
-    const FrameworkInfo& frameworkInfo);
+    return candidateId.value() == targetId->value();
+  }
 
-
-bool approveViewFlags(const process::Owned<ObjectApprover>& flagsApprover);
+protected:
+  Option<T> targetId;
+};
 
 
 // Authorizes access to an HTTP endpoint. The `method` parameter
@@ -182,12 +319,7 @@ process::Future<bool> authorizeEndpoint(
     const std::string& endpoint,
     const std::string& method,
     const Option<Authorizer*>& authorizer,
-    const Option<std::string>& principal);
-
-
-bool approveViewRole(
-    const process::Owned<ObjectApprover>& rolesApprover,
-    const std::string& role);
+    const Option<process::http::authentication::Principal>& principal);
 
 
 /**
@@ -197,6 +329,7 @@ bool approveViewRole(
  * @param realm name of the realm.
  * @param authenticatorNames a vector of authenticator names.
  * @param credentials optional credentials for BasicAuthenticator only.
+ * @param jwtSecretKey optional secret key for the JWTAuthenticator only.
  * @return nothing if authenticators are initialized and registered to
  *         libprocess successfully, or error if authenticators cannot
  *         be initialized.
@@ -204,7 +337,24 @@ bool approveViewRole(
 Try<Nothing> initializeHttpAuthenticators(
     const std::string& realm,
     const std::vector<std::string>& httpAuthenticatorNames,
-    const Option<Credentials>& credentials);
+    const Option<Credentials>& credentials = None(),
+    const Option<std::string>& jwtSecretKey = None());
+
+
+// Logs the request. Route handlers can compose this with the
+// desired request handler to get consistent request logging.
+void logRequest(const process::http::Request& request);
+
+
+// Log the response for the corresponding request together with the request
+// processing time. Route handlers can compose this with the desired request
+// handler to get consistent request/response logging.
+//
+// TODO(alexr): Consider taking `response` as a future to allow logging for
+// cases when response has not been generated.
+void logResponse(
+    const process::http::Request& request,
+    const process::http::Response& response);
 
 } // namespace mesos {
 

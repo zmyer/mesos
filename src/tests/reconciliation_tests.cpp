@@ -14,9 +14,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <stdint.h>
-#include <unistd.h>
-
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -39,6 +36,7 @@
 
 #include "master/flags.hpp"
 #include "master/master.hpp"
+#include "master/registry_operations.hpp"
 
 #include "master/detector/standalone.hpp"
 
@@ -120,12 +118,12 @@ TEST_F(ReconciliationTest, TaskStateMismatch)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_RUNNING, update.get().state());
+  EXPECT_EQ(TASK_RUNNING, update->state());
 
-  EXPECT_TRUE(update.get().has_slave_id());
+  EXPECT_TRUE(update->has_slave_id());
 
-  const TaskID taskId = update.get().task_id();
-  const SlaveID slaveId = update.get().slave_id();
+  const TaskID taskId = update->task_id();
+  const SlaveID slaveId = update->slave_id();
 
   // If framework has different state, current state should be reported.
   Future<TaskStatus> update2;
@@ -140,8 +138,8 @@ TEST_F(ReconciliationTest, TaskStateMismatch)
   driver.reconcileTasks({status});
 
   AWAIT_READY(update2);
-  EXPECT_EQ(TASK_RUNNING, update2.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2.get().reason());
+  EXPECT_EQ(TASK_RUNNING, update2->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2->reason());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -196,11 +194,11 @@ TEST_F(ReconciliationTest, TaskStateMatch)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_RUNNING, update.get().state());
-  EXPECT_TRUE(update.get().has_slave_id());
+  EXPECT_EQ(TASK_RUNNING, update->state());
+  EXPECT_TRUE(update->has_slave_id());
 
-  const TaskID taskId = update.get().task_id();
-  const SlaveID slaveId = update.get().slave_id();
+  const TaskID taskId = update->task_id();
+  const SlaveID slaveId = update->slave_id();
 
   // Framework should not receive a status update.
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -218,8 +216,8 @@ TEST_F(ReconciliationTest, TaskStateMatch)
   driver.reconcileTasks({status});
 
   AWAIT_READY(update2);
-  EXPECT_EQ(TASK_RUNNING, update2.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2.get().reason());
+  EXPECT_EQ(TASK_RUNNING, update2->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2->reason());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -260,17 +258,17 @@ TEST_F(ReconciliationTest, UnknownSlave)
 
   // Create a task status with a random slave id and task id.
   TaskStatus status;
-  status.mutable_task_id()->set_value(UUID::random().toString());
-  status.mutable_slave_id()->set_value(UUID::random().toString());
+  status.mutable_task_id()->set_value(id::UUID::random().toString());
+  status.mutable_slave_id()->set_value(id::UUID::random().toString());
   status.set_state(TASK_STAGING); // Dummy value.
 
   driver.reconcileTasks({status});
 
   // Framework should receive TASK_UNKNOWN because the slave is unknown.
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_UNKNOWN, update.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update.get().reason());
-  EXPECT_FALSE(update.get().has_unreachable_time());
+  EXPECT_EQ(TASK_UNKNOWN, update->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update->reason());
+  EXPECT_FALSE(update->has_unreachable_time());
 
   driver.stop();
   driver.join();
@@ -294,7 +292,7 @@ TEST_F(ReconciliationTest, UnknownTask)
 
   // Wait for the slave to register and get the slave id.
   AWAIT_READY(slaveRegisteredMessage);
-  const SlaveID slaveId = slaveRegisteredMessage.get().slave_id();
+  const SlaveID slaveId = slaveRegisteredMessage->slave_id();
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -318,7 +316,7 @@ TEST_F(ReconciliationTest, UnknownTask)
 
   // Create a task status with a random task id.
   TaskStatus status;
-  status.mutable_task_id()->set_value(UUID::random().toString());
+  status.mutable_task_id()->set_value(id::UUID::random().toString());
   status.mutable_slave_id()->CopyFrom(slaveId);
   status.set_state(TASK_STAGING); // Dummy value.
 
@@ -326,9 +324,9 @@ TEST_F(ReconciliationTest, UnknownTask)
 
   // Framework should receive TASK_LOST for an unknown task.
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_LOST, update.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update.get().reason());
-  EXPECT_FALSE(update.get().has_unreachable_time());
+  EXPECT_EQ(TASK_LOST, update->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update->reason());
+  EXPECT_FALSE(update->has_unreachable_time());
 
   driver.stop();
   driver.join();
@@ -336,8 +334,8 @@ TEST_F(ReconciliationTest, UnknownTask)
 
 
 // This test verifies that reconciliation of an unknown task that
-// belongs to a known slave results in TASK_UNKNOWN if the framework
-// is partition-aware.
+// belongs to a known slave results in TASK_GONE if the framework is
+// partition-aware.
 TEST_F(ReconciliationTest, UnknownTaskPartitionAware)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -352,7 +350,7 @@ TEST_F(ReconciliationTest, UnknownTaskPartitionAware)
 
   // Wait for the slave to register and get the slave id.
   AWAIT_READY(slaveRegisteredMessage);
-  const SlaveID slaveId = slaveRegisteredMessage.get().slave_id();
+  const SlaveID slaveId = slaveRegisteredMessage->slave_id();
 
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.add_capabilities()->set_type(
@@ -380,17 +378,17 @@ TEST_F(ReconciliationTest, UnknownTaskPartitionAware)
 
   // Create a task status with a random task id.
   TaskStatus status;
-  status.mutable_task_id()->set_value(UUID::random().toString());
+  status.mutable_task_id()->set_value(id::UUID::random().toString());
   status.mutable_slave_id()->CopyFrom(slaveId);
   status.set_state(TASK_STAGING); // Dummy value.
 
   driver.reconcileTasks({status});
 
-  // Framework should receive TASK_UNKNOWN for an unknown task.
+  // Framework should receive TASK_GONE for an unknown task.
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_UNKNOWN, update.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update.get().reason());
-  EXPECT_FALSE(update.get().has_unreachable_time());
+  EXPECT_EQ(TASK_GONE, update->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update->reason());
+  EXPECT_FALSE(update->has_unreachable_time());
 
   driver.stop();
   driver.join();
@@ -424,15 +422,15 @@ TEST_F(ReconciliationTest, UnknownKillTask)
 
   // Create a task status with a random task id.
   TaskID taskId;
-  taskId.set_value(UUID::random().toString());
+  taskId.set_value(id::UUID::random().toString());
 
   driver.killTask(taskId);
 
   // Framework should receive TASK_LOST for unknown task.
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_LOST, update.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update.get().reason());
-  EXPECT_FALSE(update.get().has_unreachable_time());
+  EXPECT_EQ(TASK_LOST, update->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update->reason());
+  EXPECT_FALSE(update->has_unreachable_time());
 
   driver.stop();
   driver.join();
@@ -450,19 +448,16 @@ TEST_F(ReconciliationTest, RecoveredAgent)
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
-  // Reuse slaveFlags so both StartSlave() use the same work_dir.
-  slave::Flags slaveFlags = CreateSlaveFlags();
-
   Future<SlaveRegisteredMessage> slaveRegisteredMessage =
     FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
   ASSERT_SOME(slave);
 
   // Wait for the slave to register and get the slave id.
   AWAIT_READY(slaveRegisteredMessage);
-  const SlaveID slaveId = slaveRegisteredMessage.get().slave_id();
+  const SlaveID slaveId = slaveRegisteredMessage->slave_id();
 
   // Stop the master.
   master->reset();
@@ -498,11 +493,11 @@ TEST_F(ReconciliationTest, RecoveredAgent)
   // Do reconciliation before the agent has attempted to reregister.
   // This should not yield any results.
   Future<mesos::scheduler::Call> reconcileCall = FUTURE_CALL(
-      mesos::scheduler::Call(), mesos::scheduler::Call::RECONCILE, _ , _);
+      mesos::scheduler::Call(), mesos::scheduler::Call::RECONCILE, _, _);
 
   // Reconcile for a random task ID on the slave.
   TaskStatus status;
-  status.mutable_task_id()->set_value(UUID::random().toString());
+  status.mutable_task_id()->set_value(id::UUID::random().toString());
   status.mutable_slave_id()->CopyFrom(slaveId);
   status.set_state(TASK_STAGING); // Dummy value.
 
@@ -548,7 +543,7 @@ TEST_F(ReconciliationTest, RecoveredAgentReregistrationInProgress)
 
   // Wait for the slave to register and get the slave id.
   AWAIT_READY(slaveRegisteredMessage);
-  const SlaveID slaveId = slaveRegisteredMessage.get().slave_id();
+  const SlaveID slaveId = slaveRegisteredMessage->slave_id();
 
   // Stop the master.
   master->reset();
@@ -557,8 +552,9 @@ TEST_F(ReconciliationTest, RecoveredAgentReregistrationInProgress)
   slave.get()->terminate();
   slave->reset();
 
-  // Restart the master.
-  master = StartMaster(masterFlags);
+  // Restart master with a mock authorizer to block agent state transitioning.
+  MockAuthorizer authorizer;
+  master = StartMaster(&authorizer, masterFlags);
   ASSERT_SOME(master);
 
   MockScheduler sched;
@@ -581,12 +577,11 @@ TEST_F(ReconciliationTest, RecoveredAgentReregistrationInProgress)
   // Wait for the framework to register.
   AWAIT_READY(frameworkId);
 
-  // Intercept the first registrar operation that is attempted; this
-  // should be the registry operation that reregisters the slave.
-  Future<Owned<master::Operation>> reregister;
+  // Intercept agent authorization.
+  Future<Nothing> authorize;
   Promise<bool> promise; // Never satisfied.
-  EXPECT_CALL(*master.get()->registrar.get(), apply(_))
-    .WillOnce(DoAll(FutureArg<0>(&reregister),
+  EXPECT_CALL(authorizer, authorized(_))
+    .WillOnce(DoAll(FutureSatisfy(&authorize),
                     Return(promise.future())));
 
   // Restart the slave.
@@ -595,17 +590,14 @@ TEST_F(ReconciliationTest, RecoveredAgentReregistrationInProgress)
   ASSERT_SOME(slave);
 
   // Wait for the slave to start reregistration.
-  AWAIT_READY(reregister);
-  EXPECT_NE(
-      nullptr,
-      dynamic_cast<master::MarkSlaveReachable*>(reregister.get().get()));
+  AWAIT_READY(authorize);
 
   Future<mesos::scheduler::Call> reconcileCall = FUTURE_CALL(
-      mesos::scheduler::Call(), mesos::scheduler::Call::RECONCILE, _ , _);
+      mesos::scheduler::Call(), mesos::scheduler::Call::RECONCILE, _, _);
 
   // Reconcile for a random task ID on the slave.
   TaskStatus status;
-  status.mutable_task_id()->set_value(UUID::random().toString());
+  status.mutable_task_id()->set_value(id::UUID::random().toString());
   status.mutable_slave_id()->CopyFrom(slaveId);
   status.set_state(TASK_STAGING); // Dummy value.
 
@@ -630,7 +622,9 @@ TEST_F(ReconciliationTest, RecoveredAgentReregistrationInProgress)
 // This test ensures that when an agent has started but not finished
 // the unregistration process, explicit reconciliation indicates that
 // the agent is still registered.
-TEST_F(ReconciliationTest, RemovalInProgress)
+//
+// TODO(alexr): Enable after MESOS-8210 is resolved.
+TEST_F(ReconciliationTest, DISABLED_RemovalInProgress)
 {
   master::Flags masterFlags = CreateMasterFlags();
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -645,7 +639,7 @@ TEST_F(ReconciliationTest, RemovalInProgress)
 
   // Wait for the slave to register and get the slave id.
   AWAIT_READY(slaveRegisteredMessage);
-  const SlaveID slaveId = slaveRegisteredMessage.get().slave_id();
+  const SlaveID slaveId = slaveRegisteredMessage->slave_id();
 
   Future<UnregisterSlaveMessage> unregisterSlaveMessage =
     FUTURE_PROTOBUF(
@@ -655,10 +649,10 @@ TEST_F(ReconciliationTest, RemovalInProgress)
 
   // Intercept the next registrar operation; this should be the
   // registry operation that unregisters the slave.
-  Future<Owned<master::Operation>> unregister;
+  Future<Owned<master::RegistryOperation>> unregister;
   Future<Nothing> unregisterStarted;
   Promise<bool> promise; // Never satisfied.
-  EXPECT_CALL(*master.get()->registrar.get(), apply(_))
+  EXPECT_CALL(*master.get()->registrar, apply(_))
     .WillOnce(DoAll(FutureArg<0>(&unregister),
                     Return(promise.future())));
 
@@ -671,7 +665,7 @@ TEST_F(ReconciliationTest, RemovalInProgress)
   AWAIT_READY(unregister);
   EXPECT_NE(
       nullptr,
-      dynamic_cast<master::RemoveSlave*>(unregister.get().get()));
+      dynamic_cast<master::RemoveSlave*>(unregister->get()));
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -695,16 +689,16 @@ TEST_F(ReconciliationTest, RemovalInProgress)
 
   // Reconcile for a random task ID on the slave.
   TaskStatus status;
-  status.mutable_task_id()->set_value(UUID::random().toString());
+  status.mutable_task_id()->set_value(id::UUID::random().toString());
   status.mutable_slave_id()->CopyFrom(slaveId);
   status.set_state(TASK_STAGING); // Dummy value.
 
   driver.reconcileTasks({status});
 
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_LOST, update.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update.get().reason());
-  EXPECT_FALSE(update.get().has_unreachable_time());
+  EXPECT_EQ(TASK_LOST, update->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update->reason());
+  EXPECT_FALSE(update->has_unreachable_time());
 
   driver.stop();
   driver.join();
@@ -753,8 +747,8 @@ TEST_F(ReconciliationTest, ImplicitNonTerminalTask)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_RUNNING, update.get().state());
-  EXPECT_TRUE(update.get().has_slave_id());
+  EXPECT_EQ(TASK_RUNNING, update->state());
+  EXPECT_TRUE(update->has_slave_id());
 
   // When making an implicit reconciliation request, the non-terminal
   // task should be sent back.
@@ -765,8 +759,8 @@ TEST_F(ReconciliationTest, ImplicitNonTerminalTask)
   driver.reconcileTasks({});
 
   AWAIT_READY(update2);
-  EXPECT_EQ(TASK_RUNNING, update2.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2.get().reason());
+  EXPECT_EQ(TASK_RUNNING, update2->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2->reason());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -820,8 +814,8 @@ TEST_F(ReconciliationTest, ImplicitTerminalTask)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_FINISHED, update.get().state());
-  EXPECT_TRUE(update.get().has_slave_id());
+  EXPECT_EQ(TASK_FINISHED, update->state());
+  EXPECT_TRUE(update->has_slave_id());
 
   // Framework should not receive any further updates.
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -831,7 +825,7 @@ TEST_F(ReconciliationTest, ImplicitTerminalTask)
     .Times(AtMost(1));
 
   Future<mesos::scheduler::Call> reconcileCall = FUTURE_CALL(
-      mesos::scheduler::Call(), mesos::scheduler::Call::RECONCILE, _ , _);
+      mesos::scheduler::Call(), mesos::scheduler::Call::RECONCILE, _, _);
 
   Clock::pause();
 
@@ -872,14 +866,13 @@ TEST_F(ReconciliationTest, PendingTask)
 
   // Wait for the slave to register and get the slave id.
   AWAIT_READY(slaveRegisteredMessage);
-  const SlaveID slaveId = slaveRegisteredMessage.get().slave_id();
+  const SlaveID slaveId = slaveRegisteredMessage->slave_id();
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .Times(1);
+  EXPECT_CALL(sched, registered(&driver, _, _));
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -889,7 +882,7 @@ TEST_F(ReconciliationTest, PendingTask)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Return a pending future from authorizer.
   Future<Nothing> authorize;
@@ -913,9 +906,9 @@ TEST_F(ReconciliationTest, PendingTask)
   driver.reconcileTasks({});
 
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_STAGING, update.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update.get().reason());
-  EXPECT_TRUE(update.get().has_slave_id());
+  EXPECT_EQ(TASK_STAGING, update->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update->reason());
+  EXPECT_TRUE(update->has_slave_id());
 
   // Now send an explicit reconciliation request for this task.
   Future<TaskStatus> update2;
@@ -930,9 +923,9 @@ TEST_F(ReconciliationTest, PendingTask)
   driver.reconcileTasks({status});
 
   AWAIT_READY(update2);
-  EXPECT_EQ(TASK_STAGING, update2.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2.get().reason());
-  EXPECT_TRUE(update2.get().has_slave_id());
+  EXPECT_EQ(TASK_STAGING, update2->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2->reason());
+  EXPECT_TRUE(update2->has_slave_id());
 
   driver.stop();
   driver.join();
@@ -994,8 +987,8 @@ TEST_F(ReconciliationTest, UnacknowledgedTerminalTask)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(update1);
-  EXPECT_EQ(TASK_FINISHED, update1.get().state());
-  EXPECT_TRUE(update1.get().has_slave_id());
+  EXPECT_EQ(TASK_FINISHED, update1->state());
+  EXPECT_TRUE(update1->has_slave_id());
 
   // Framework should receive a TASK_FINISHED update, since the
   // master did not receive the acknowledgement.
@@ -1009,9 +1002,9 @@ TEST_F(ReconciliationTest, UnacknowledgedTerminalTask)
   driver.reconcileTasks({});
 
   AWAIT_READY(update2);
-  EXPECT_EQ(TASK_FINISHED, update2.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2.get().reason());
-  EXPECT_TRUE(update2.get().has_slave_id());
+  EXPECT_EQ(TASK_FINISHED, update2->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update2->reason());
+  EXPECT_TRUE(update2->has_slave_id());
 
   driver.stop();
   driver.join();
@@ -1025,6 +1018,8 @@ TEST_F(ReconciliationTest, ReconcileStatusUpdateTaskState)
 {
   // Start a master.
   master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.registry = "replicated_log";
+
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
@@ -1074,7 +1069,7 @@ TEST_F(ReconciliationTest, ReconcileStatusUpdateTaskState)
   // Wait until TASK_RUNNING is sent to the master.
   AWAIT_READY(statusUpdateMessage);
 
-  // Ensure status update manager handles TASK_RUNNING update.
+  // Ensure task status update manager handles TASK_RUNNING update.
   AWAIT_READY(___statusUpdate);
 
   Future<Nothing> ___statusUpdate2 =
@@ -1082,11 +1077,11 @@ TEST_F(ReconciliationTest, ReconcileStatusUpdateTaskState)
 
   // Now send TASK_FINISHED update.
   TaskStatus finishedStatus;
-  finishedStatus = statusUpdateMessage.get().update().status();
+  finishedStatus = statusUpdateMessage->update().status();
   finishedStatus.set_state(TASK_FINISHED);
   execDriver->sendStatusUpdate(finishedStatus);
 
-  // Ensure status update manager handles TASK_FINISHED update.
+  // Ensure task status update manager handles TASK_FINISHED update.
   AWAIT_READY(___statusUpdate2);
 
   EXPECT_CALL(sched, disconnected(&driver))
@@ -1094,7 +1089,7 @@ TEST_F(ReconciliationTest, ReconcileStatusUpdateTaskState)
 
   // Simulate master failover by restarting the master.
   master->reset();
-  master = StartMaster();
+  master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   Clock::resume();
@@ -1132,8 +1127,8 @@ TEST_F(ReconciliationTest, ReconcileStatusUpdateTaskState)
   driver.reconcileTasks({});
 
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_RUNNING, update.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update.get().reason());
+  EXPECT_EQ(TASK_RUNNING, update->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, update->reason());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -1178,29 +1173,40 @@ TEST_F(ReconciliationTest, PartitionedAgentThenMasterFailover)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_FALSE(offers.get().empty());
+  ASSERT_FALSE(offers->empty());
 
   Offer offer = offers.get()[0];
 
   // Launch `task` using `sched`.
   TaskInfo task = createTask(offer, "sleep 60");
 
+  Future<TaskStatus> startingStatus;
   Future<TaskStatus> runningStatus;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&startingStatus))
     .WillOnce(FutureArg<1>(&runningStatus));
 
-  Future<Nothing> statusUpdateAck = FUTURE_DISPATCH(
+  Future<Nothing> statusUpdateAck1 = FUTURE_DISPATCH(
+      slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> statusUpdateAck2 = FUTURE_DISPATCH(
       slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offer.id(), {task});
 
+  AWAIT_READY(startingStatus);
+  EXPECT_EQ(TASK_STARTING, startingStatus->state());
+  EXPECT_EQ(task.task_id(), startingStatus->task_id());
+
+  AWAIT_READY(statusUpdateAck1);
+
   AWAIT_READY(runningStatus);
-  EXPECT_EQ(TASK_RUNNING, runningStatus.get().state());
-  EXPECT_EQ(task.task_id(), runningStatus.get().task_id());
+  EXPECT_EQ(TASK_RUNNING, runningStatus->state());
+  EXPECT_EQ(task.task_id(), runningStatus->task_id());
 
-  const SlaveID slaveId = runningStatus.get().slave_id();
+  const SlaveID slaveId = runningStatus->slave_id();
 
-  AWAIT_READY(statusUpdateAck);
+  AWAIT_READY(statusUpdateAck2);
 
   // Now, induce a partition of the slave by having the master
   // timeout the slave.
@@ -1237,11 +1243,11 @@ TEST_F(ReconciliationTest, PartitionedAgentThenMasterFailover)
   Clock::advance(Milliseconds(100));
 
   AWAIT_READY(lostStatus);
-  EXPECT_EQ(TASK_LOST, lostStatus.get().state());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, lostStatus.get().reason());
-  EXPECT_EQ(task.task_id(), lostStatus.get().task_id());
-  EXPECT_EQ(slaveId, lostStatus.get().slave_id());
-  EXPECT_EQ(partitionTime, lostStatus.get().unreachable_time());
+  EXPECT_EQ(TASK_LOST, lostStatus->state());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, lostStatus->reason());
+  EXPECT_EQ(task.task_id(), lostStatus->task_id());
+  EXPECT_EQ(slaveId, lostStatus->slave_id());
+  EXPECT_EQ(partitionTime, lostStatus->unreachable_time());
 
   AWAIT_READY(slaveLost);
 
@@ -1258,9 +1264,9 @@ TEST_F(ReconciliationTest, PartitionedAgentThenMasterFailover)
   driver.reconcileTasks({status1});
 
   AWAIT_READY(reconcileUpdate1);
-  EXPECT_EQ(TASK_LOST, reconcileUpdate1.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate1.get().reason());
-  EXPECT_EQ(partitionTime, reconcileUpdate1.get().unreachable_time());
+  EXPECT_EQ(TASK_LOST, reconcileUpdate1->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate1->reason());
+  EXPECT_EQ(partitionTime, reconcileUpdate1->unreachable_time());
 
   // Drop all subsequent messages from the slave, since they aren't
   // useful anymore.
@@ -1296,9 +1302,9 @@ TEST_F(ReconciliationTest, PartitionedAgentThenMasterFailover)
   driver.reconcileTasks({status2});
 
   AWAIT_READY(reconcileUpdate2);
-  EXPECT_EQ(TASK_LOST, reconcileUpdate2.get().state());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate2.get().reason());
-  EXPECT_EQ(partitionTime, reconcileUpdate2.get().unreachable_time());
+  EXPECT_EQ(TASK_LOST, reconcileUpdate2->state());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, reconcileUpdate2->reason());
+  EXPECT_EQ(partitionTime, reconcileUpdate2->unreachable_time());
 
   Clock::resume();
 

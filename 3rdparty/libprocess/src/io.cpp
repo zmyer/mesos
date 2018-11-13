@@ -23,147 +23,65 @@
 #include <stout/lambda.hpp>
 #include <stout/nothing.hpp>
 #include <stout/os.hpp>
+#include <stout/try.hpp>
+
+#include <stout/os/constants.hpp>
 #include <stout/os/read.hpp>
 #include <stout/os/strerror.hpp>
 #include <stout/os/write.hpp>
-#include <stout/try.hpp>
+
+#include "io_internal.hpp"
 
 using std::string;
 using std::vector;
 
 namespace process {
 namespace io {
-namespace internal {
 
-Future<size_t> read(int fd, void* data, size_t size)
+Try<Nothing> prepare_async(int_fd fd)
 {
-  // TODO(benh): Let the system calls do what ever they're supposed to
-  // rather than return 0 here?
-  if (size == 0) {
-    return 0;
-  }
-
-  return loop(
-      None(),
-      [=]() -> Future<Option<size_t>> {
-        // Because the file descriptor is non-blocking, we call
-        // read()/recv() immediately. If no data is available than
-        // we'll call `poll` and block. We also observed that for some
-        // combination of libev and Linux kernel versions, the poll
-        // would block for non-deterministically long periods of
-        // time. This may be fixed in a newer version of libev (we use
-        // 3.8 at the time of writing this comment).
-        ssize_t length = os::read(fd, data, size);
-        if (length < 0) {
-#ifdef __WINDOWS__
-          WindowsSocketError error;
-#else
-          ErrnoError error;
-#endif // __WINDOWS__
-
-          if (!net::is_restartable_error(error.code) &&
-              !net::is_retryable_error(error.code)) {
-            return Failure(error.message);
-          }
-
-          return None();
-        }
-
-        return length;
-      },
-      [=](const Option<size_t>& length) -> Future<ControlFlow<size_t>> {
-        // Restart/retry if we don't yet have a result.
-        if (length.isNone()) {
-          return io::poll(fd, io::READ)
-            .then([](short event) -> ControlFlow<size_t> {
-              CHECK_EQ(io::READ, event);
-              return Continue();
-            });
-        }
-        return Break(length.get());
-      });
+  return internal::prepare_async(fd);
 }
 
 
-Future<size_t> write(int fd, const void* data, size_t size)
+Try<bool> is_async(int_fd fd)
 {
-  // TODO(benh): Let the system calls do what ever they're supposed to
-  // rather than return 0 here?
-  if (size == 0) {
-    return 0;
-  }
-
-  return loop(
-      None(),
-      [=]() -> Future<Option<size_t>> {
-        ssize_t length = os::write(fd, data, size);
-
-        if (length < 0) {
-#ifdef __WINDOWS__
-          WindowsSocketError error;
-#else
-          ErrnoError error;
-#endif // __WINDOWS__
-
-          if (!net::is_restartable_error(error.code) &&
-              !net::is_retryable_error(error.code)) {
-            return Failure(error.message);
-          }
-
-          return None();
-        }
-
-        return length;
-      },
-      [=](const Option<size_t>& length) -> Future<ControlFlow<size_t>> {
-        // Restart/retry if we don't yet have a result.
-        if (length.isNone()) {
-          return io::poll(fd, io::WRITE)
-            .then([](short event) -> ControlFlow<size_t> {
-              CHECK_EQ(io::WRITE, event);
-              return Continue();
-            });
-        }
-        return Break(length.get());
-      });
+  return internal::is_async(fd);
 }
 
-} // namespace internal {
 
-
-Future<size_t> read(int fd, void* data, size_t size)
+Future<size_t> read(int_fd fd, void* data, size_t size)
 {
   process::initialize();
 
   // Check the file descriptor.
-  Try<bool> nonblock = os::isNonblock(fd);
-  if (nonblock.isError()) {
+  Try<bool> async = is_async(fd);
+  if (async.isError()) {
     // The file descriptor is not valid (e.g., has been closed).
-    return Failure("Failed to check if file descriptor was non-blocking: " +
-                   nonblock.error());
-  } else if (!nonblock.get()) {
-    // The file descriptor is not non-blocking.
-    return Failure("Expected a non-blocking file descriptor");
+    return Failure(
+        "Failed to check if file descriptor was asynchronous: " +
+        async.error());
+  } else if (!async.get()) {
+    return Failure("Expected an asynchronous file descriptor.");
   }
 
   return internal::read(fd, data, size);
 }
 
 
-Future<size_t> write(int fd, const void* data, size_t size)
+Future<size_t> write(int_fd fd, const void* data, size_t size)
 {
   process::initialize();
 
   // Check the file descriptor.
-  Try<bool> nonblock = os::isNonblock(fd);
-  if (nonblock.isError()) {
+  Try<bool> async = is_async(fd);
+  if (async.isError()) {
     // The file descriptor is not valid (e.g., has been closed).
     return Failure(
-        "Failed to check if file descriptor was non-blocking: " +
-        nonblock.error());
-  } else if (!nonblock.get()) {
-    // The file descriptor is not non-blocking.
-    return Failure("Expected a non-blocking file descriptor");
+        "Failed to check if file descriptor was asynchronous: " +
+        async.error());
+  } else if (!async.get()) {
+    return Failure("Expected an asynchronous file descriptor.");
   }
 
   return internal::write(fd, data, size);
@@ -173,8 +91,8 @@ Future<size_t> write(int fd, const void* data, size_t size)
 namespace internal {
 
 Future<Nothing> splice(
-    int from,
-    int to,
+    int_fd from,
+    int_fd to,
     size_t chunk,
     const vector<lambda::function<void(const string&)>>& hooks)
 {
@@ -206,12 +124,12 @@ Future<Nothing> splice(
 } // namespace internal {
 
 
-Future<string> read(int fd)
+Future<string> read(int_fd fd)
 {
   process::initialize();
 
   // Get our own copy of the file descriptor so that we're in control
-  // of the lifetime and don't crash if/when someone by accidently
+  // of the lifetime and don't crash if/when someone accidentally
   // closes the file descriptor before discarding this future. We can
   // also make sure it's non-blocking and will close-on-exec. Start by
   // checking we've got a "valid" file descriptor before dup'ing.
@@ -219,10 +137,12 @@ Future<string> read(int fd)
     return Failure(os::strerror(EBADF));
   }
 
-  fd = dup(fd);
-  if (fd == -1) {
-    return Failure(ErrnoError("Failed to duplicate file descriptor"));
+  Try<int_fd> dup = os::dup(fd);
+  if (dup.isError()) {
+    return Failure(dup.error());
   }
+
+  fd = dup.get();
 
   // Set the close-on-exec flag.
   Try<Nothing> cloexec = os::cloexec(fd);
@@ -233,13 +153,12 @@ Future<string> read(int fd)
         cloexec.error());
   }
 
-  // Make the file descriptor non-blocking.
-  Try<Nothing> nonblock = os::nonblock(fd);
-  if (nonblock.isError()) {
+  Try<Nothing> async = prepare_async(fd);
+  if (async.isError()) {
     os::close(fd);
     return Failure(
-        "Failed to make duplicated file descriptor non-blocking: " +
-        nonblock.error());
+        "Failed to make duplicated file descriptor asynchronous: " +
+        async.error());
   }
 
   // TODO(benh): Wrap up this data as a struct, use 'Owner'.
@@ -265,22 +184,12 @@ Future<string> read(int fd)
 }
 
 
-#ifdef __WINDOWS__
-// NOTE: Ordinarily this would go in a Windows-specific header; we put it here
-// to avoid complex forward declarations.
-Future<string> read(HANDLE handle)
-{
-  return read(_open_osfhandle(reinterpret_cast<intptr_t>(handle), O_RDONLY));
-}
-#endif // __WINDOWS__
-
-
-Future<Nothing> write(int fd, const string& data)
+Future<Nothing> write(int_fd fd, const string& data)
 {
   process::initialize();
 
   // Get our own copy of the file descriptor so that we're in control
-  // of the lifetime and don't crash if/when someone by accidently
+  // of the lifetime and don't crash if/when someone accidentally
   // closes the file descriptor before discarding this future. We can
   // also make sure it's non-blocking and will close-on-exec. Start by
   // checking we've got a "valid" file descriptor before dup'ing.
@@ -288,10 +197,12 @@ Future<Nothing> write(int fd, const string& data)
     return Failure(os::strerror(EBADF));
   }
 
-  fd = dup(fd);
-  if (fd == -1) {
-    return Failure(ErrnoError("Failed to duplicate file descriptor"));
+  Try<int_fd> dup = os::dup(fd);
+  if (dup.isError()) {
+    return Failure(dup.error());
   }
+
+  fd = dup.get();
 
   // Set the close-on-exec flag.
   Try<Nothing> cloexec = os::cloexec(fd);
@@ -302,13 +213,12 @@ Future<Nothing> write(int fd, const string& data)
         cloexec.error());
   }
 
-  // Make the file descriptor non-blocking.
-  Try<Nothing> nonblock = os::nonblock(fd);
-  if (nonblock.isError()) {
+  Try<Nothing> async = prepare_async(fd);
+  if (async.isError()) {
     os::close(fd);
     return Failure(
-        "Failed to make duplicated file descriptor non-blocking: " +
-        nonblock.error());
+        "Failed to make duplicated file descriptor asynchronous: " +
+        async.error());
   }
 
   // We store `data.size()` so that we can just use `size` in the
@@ -338,8 +248,8 @@ Future<Nothing> write(int fd, const string& data)
 
 
 Future<Nothing> redirect(
-    int from,
-    Option<int> to,
+    int_fd from,
+    Option<int_fd> to,
     size_t chunk,
     const vector<lambda::function<void(const string&)>>& hooks)
 {
@@ -350,7 +260,7 @@ Future<Nothing> redirect(
 
   if (to.isNone()) {
     // Open up /dev/null that we can splice into.
-    Try<int> open = os::open("/dev/null", O_WRONLY | O_CLOEXEC);
+    Try<int_fd> open = os::open(os::DEV_NULL, O_WRONLY | O_CLOEXEC);
 
     if (open.isError()) {
       return Failure("Failed to open /dev/null for writing: " + open.error());
@@ -359,22 +269,24 @@ Future<Nothing> redirect(
     to = open.get();
   } else {
     // Duplicate 'to' so that we're in control of its lifetime.
-    int fd = dup(to.get());
-    if (fd == -1) {
-      return Failure(ErrnoError("Failed to duplicate 'to' file descriptor"));
+    Try<int_fd> dup = os::dup(to.get());
+    if (dup.isError()) {
+      return Failure(dup.error());
     }
 
-    to = fd;
+    to = dup.get();
   }
 
   CHECK_SOME(to);
 
   // Duplicate 'from' so that we're in control of its lifetime.
-  from = dup(from);
-  if (from == -1) {
+  Try<int_fd> dup = os::dup(from);
+  if (dup.isError()) {
     os::close(to.get());
     return Failure(ErrnoError("Failed to duplicate 'from' file descriptor"));
   }
+
+  from = dup.get();
 
   // Set the close-on-exec flag (no-op if already set).
   Try<Nothing> cloexec = os::cloexec(from);
@@ -391,19 +303,18 @@ Future<Nothing> redirect(
     return Failure("Failed to set close-on-exec on 'to': " + cloexec.error());
   }
 
-  // Make the file descriptors non-blocking (no-op if already set).
-  Try<Nothing> nonblock = os::nonblock(from);
-  if (nonblock.isError()) {
+  Try<Nothing> async = prepare_async(from);
+  if (async.isError()) {
     os::close(from);
     os::close(to.get());
-    return Failure("Failed to make 'from' non-blocking: " + nonblock.error());
+    return Failure("Failed to make 'from' asynchronous: " + async.error());
   }
 
-  nonblock = os::nonblock(to.get());
-  if (nonblock.isError()) {
+  async = prepare_async(to.get());
+  if (async.isError()) {
     os::close(from);
     os::close(to.get());
-    return Failure("Failed to make 'to' non-blocking: " + nonblock.error());
+    return Failure("Failed to make 'to' asynchronous: " + async.error());
   }
 
   // NOTE: We wrap `os::close` in a lambda to disambiguate on Windows.
@@ -411,24 +322,6 @@ Future<Nothing> redirect(
     .onAny([from]() { os::close(from); })
     .onAny([to]() { os::close(to.get()); });
 }
-
-
-#ifdef __WINDOWS__
-// NOTE: Ordinarily this would go in a Windows-specific header; we put it here
-// to avoid complex forward declarations.
-Future<Nothing> redirect(
-    HANDLE from,
-    Option<int> to,
-    size_t chunk,
-    const vector<lambda::function<void(const string&)>>& hooks)
-{
-  return redirect(
-      _open_osfhandle(reinterpret_cast<intptr_t>(from), O_RDWR),
-      to,
-      chunk,
-      hooks);
-}
-#endif // __WINDOWS__
 
 } // namespace io {
 } // namespace process {

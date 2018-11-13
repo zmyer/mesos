@@ -40,11 +40,9 @@ public:
     Flags();
 
     Option<JSON::Object> launch_info;
-    Option<int> pipe_read;
-    Option<int> pipe_write;
-#ifndef __WINDOWS__
+    Option<int_fd> pipe_read;
+    Option<int_fd> pipe_write;
     Option<std::string> runtime_directory;
-#endif // __WINDOWS__
 #ifdef __linux__
     Option<pid_t> namespace_mnt_target;
     bool unshare_namespace_mnt;
@@ -56,8 +54,8 @@ public:
   Flags flags;
 
 protected:
-  virtual int execute();
-  virtual flags::FlagsBase* getFlags() { return &flags; }
+  int execute() override;
+  flags::FlagsBase* getFlags() override { return &flags; }
 };
 
 } // namespace slave {

@@ -17,9 +17,8 @@
 #ifndef __STOUT_WINDOWS_ERROR_HPP__
 #define __STOUT_WINDOWS_ERROR_HPP__
 
-#include <stout/error.hpp>
+#include <stout/errorbase.hpp>
 #include <stout/windows.hpp>
-
 
 // A useful type that can be used to represent a Try that has failed. This is a
 // lot like `ErrnoError`, except instead of wrapping an error coming from the C
@@ -37,31 +36,32 @@ protected:
     : Error(message + ": " + get_last_error_as_string(_code)), code(_code) {}
 
 private:
-  static std::string get_last_error_as_string(DWORD errorCode)
+  static std::string get_last_error_as_string(const DWORD error_code)
   {
-    // Default if no error.
-    if (errorCode == 0) {
+    // NOTE: While Windows does have a corresponding message string
+    // for an error code of zero, we want the default construction to
+    // have as low a cost as possible, so we short circuit here.
+    if (error_code == 0) {
       return std::string();
     }
 
-    DWORD allocate_message_buffer =
-      FORMAT_MESSAGE_ALLOCATE_BUFFER |
-      FORMAT_MESSAGE_FROM_SYSTEM |
-      FORMAT_MESSAGE_IGNORE_INSERTS;
+    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                        FORMAT_MESSAGE_FROM_SYSTEM |
+                        FORMAT_MESSAGE_IGNORE_INSERTS;
 
-    DWORD default_language = MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT);
+    const DWORD default_language = MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT);
 
     // This following function `FormatMessage` is a lot like `strerror`, except
     // it pretty-prints errors from the Windows API instead of from the C
-    // standard library. Basically, the semantics are: we pass in `errorCode`,
+    // standard library. Basically, the semantics are: we pass in `error_code`,
     // and it allocates room for a pretty-printed error message at
     // `message_buffer`, and then dumps said pretty-printed error message at
     // that address, in our `default_language`.
     //
-    // The 5th actual parameter (namely `(LPSTR)&message_buffer`), may look
-    // strange to readers of this code. It is copied directly out of the
-    // documentation[1], and is unfortunately required to get the
-    // pretty-printed error message. The short story is:
+    // The parameter `reinterpret_cast<char*>(&message_buffer)` may
+    // look strange to readers of this code. It is copied directly out
+    // of the documentation[1], and is unfortunately required to get
+    // the pretty-printed error message. The short story is:
     //
     //   * The flag `FORMAT_MESSAGE_ALLOCATE_BUFFER` tells `FormatMessage` to
     //     point `message_buffer` (which is an `LPSTR` a.k.a. `char*`) at a
@@ -69,7 +69,7 @@ private:
     //     different place, `FormatMessage` would need the address
     //     `&message_buffer` so that it could change where it is pointing.
     //   * So, to solve this problem, the API writers decided that when you
-    //     pass that flag in, `FormatMessage` will treat the 5th parameter not
+    //     pass that flag in, `FormatMessage` will treat the fifth parameter not
     //     as `LPSTR` (which is what the type is in the function signagure),
     //     but as `LPSTR*` a.k.a. `char**`, which (assuming you've casted the
     //     parameter correctly) allows it to allocate the message on your
@@ -82,27 +82,31 @@ private:
     // the documentation as well.
     //
     // [1] https://msdn.microsoft.com/en-us/library/windows/desktop/ms679351(v=vs.85).aspx
-    LPSTR message_buffer;
-    size_t size = FormatMessage(
-        allocate_message_buffer,
-        nullptr,                 // Ignored.
-        errorCode,
-        default_language,
-        (LPSTR) &message_buffer, // See comment above about quirky cast.
-        0,                       // Ignored.
-        nullptr);                // Ignored.
+    char* message_buffer = nullptr;
+    // NOTE: This explicitly uses the non-Unicode version of the API
+    // so we can avoid needing Unicode conversion logic in the
+    // `WindowsErrorBase` class.
+    size_t size = ::FormatMessageA(
+      flags,
+      nullptr,  // Ignored.
+      error_code,
+      default_language,
+      reinterpret_cast<char*>(&message_buffer),
+      0,        // Ignored.
+      nullptr); // Ignored.
 
     std::string message(message_buffer, size);
 
     // Required per documentation above.
-    LocalFree(message_buffer);
+    ::LocalFree(message_buffer);
 
     return message;
   }
 };
 
 
-class WindowsError : public WindowsErrorBase {
+class WindowsError : public WindowsErrorBase
+{
 public:
   WindowsError() : WindowsErrorBase(::GetLastError()) {}
 
@@ -116,7 +120,8 @@ public:
 };
 
 
-class WindowsSocketError : public WindowsErrorBase {
+class WindowsSocketError : public WindowsErrorBase
+{
 public:
   WindowsSocketError() : WindowsErrorBase(::WSAGetLastError()) {}
 

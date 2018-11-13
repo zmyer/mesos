@@ -23,6 +23,8 @@
 #include <stout/fs.hpp>
 #include <stout/os.hpp>
 
+#include <stout/os/realpath.hpp>
+
 #include "linux/fs.hpp"
 
 #include "slave/containerizer/mesos/provisioner/backends/overlay.hpp"
@@ -99,6 +101,7 @@ Future<Nothing> OverlayBackend::provision(
       backendDir);
 }
 
+
 Future<bool> OverlayBackend::destroy(
     const string& rootfs,
     const string& backendDir)
@@ -150,7 +153,7 @@ Future<Nothing> OverlayBackendProcess::provision(
   Try<string> mktemp = os::mkdtemp();
   if (mktemp.isError()) {
     return Failure(
-      "Failued to create temporary directory for symlinks to layers: " +
+      "Failed to create temporary directory for symlinks to layers: " +
       mktemp.error());
   }
 
@@ -249,8 +252,11 @@ Future<bool> OverlayBackendProcess::destroy(
 
   foreach (const fs::MountInfoTable::Entry& entry, mountTable->entries) {
     if (entry.target == rootfs) {
-      // NOTE: This would fail if the rootfs is still in use.
-      Try<Nothing> unmount = fs::unmount(entry.target);
+      // NOTE: Use MNT_DETACH here so that if there are still
+      // processes holding files or directories in the rootfs, the
+      // unmount will still be successful. The kernel will cleanup the
+      // mount when the number of references reach zero.
+      Try<Nothing> unmount = fs::unmount(entry.target, MNT_DETACH);
       if (unmount.isError()) {
         return Failure(
             "Failed to destroy overlay-mounted rootfs '" + rootfs + "': " +
@@ -259,9 +265,16 @@ Future<bool> OverlayBackendProcess::destroy(
 
       Try<Nothing> rmdir = os::rmdir(rootfs);
       if (rmdir.isError()) {
-        return Failure(
-            "Failed to remove rootfs mount point '" + rootfs + "': " +
-            rmdir.error());
+        // NOTE: Due to the use of MNT_DETACH above, it's possible
+        // that `rmdir` will fail with EBUSY if some other mounts in
+        // other mount namespaces are still on this mount point on
+        // some old kernel (https://lwn.net/Articles/570338/). No need
+        // to return a hard failure here because the directory will be
+        // removed later and re-attempted on agent recovery.
+        //
+        // TODO(jieyu): Consider only ignore EBUSY error.
+        LOG(ERROR) << "Failed to remove rootfs mount point "
+                   << "'" << rootfs << "': " << rmdir.error();
       }
 
       // Clean up tempDir used for image layer links.
@@ -272,7 +285,7 @@ Future<bool> OverlayBackendProcess::destroy(
         // TODO(zhitao): This should be converted into a failure after
         // deprecation cycle started by 1.1.0.
         VLOG(1) << "Cannot find symlink to temporary directory '" << tempLink
-                <<"' for image links";
+                << "' for image links";
 
         return true;
       }
@@ -289,7 +302,9 @@ Future<bool> OverlayBackendProcess::destroy(
       if (realpath.isSome()) {
         Try<Nothing> rmdir = os::rmdir(realpath.get());
         if (rmdir.isError()) {
-          return Failure("");
+          return Failure(
+              "Failed to remove temporary directory for symlinks at "
+              "'" + realpath.get() + "': " + rmdir.error());
         }
 
         VLOG(1) << "Removed temporary directory '" << realpath.get()

@@ -37,12 +37,27 @@ TEST(JsonTest, DefaultValueIsNull)
 }
 
 
-TEST(JsonTest, BinaryData)
+TEST(JsonTest, UTF8)
 {
-  JSON::String s(string("\"\\/\b\f\n\r\t\x00\x19 !#[]\x7F\xFF", 17));
+  // We don't use the optional \uXXXX escaping for UTF-8,
+  // unless required (" U+0022, \ U+005C, and the control
+  // characters U+0000 to U+001F).
+  JSON::String s("Hello! \x01\x1F\x22\x5C \xF0\x9F\x98\x80");
 
-  EXPECT_EQ("\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0000\\u0019 !#[]\\u007f\xFF\"",
+  EXPECT_EQ("\"Hello! \\u0001\\u001F\\\"\\\\ \xF0\x9F\x98\x80\"",
             stringify(s));
+}
+
+
+TEST(JsonTest, InvalidUTF8)
+{
+  // There currently is no validation either when constructing
+  // invalid UTF-8 string, or during serialization. Here, we
+  // use a 4 byte sequence but only provide the first byte.
+  // For now, this just gets passed through.
+  JSON::String s("\xF0");
+
+  EXPECT_EQ("\"\xF0\"", stringify(s));
 }
 
 
@@ -270,6 +285,20 @@ TEST(JsonTest, ParseError)
     " ";
 
   EXPECT_ERROR(JSON::parse<JSON::Object>(jsonString));
+
+  jsonString = R"~(
+    {
+      "double1": 123123123121231231231231321312312312123123122E112312387129381723\x0d\x0a\x0d\x0a\x0d\x0a\x0d
+    })~";
+
+  EXPECT_ERROR(JSON::parse<JSON::Object>(jsonString));
+
+  jsonString = R"~(
+    {
+      "double2": -332861120361594135E400
+    })~";
+
+  EXPECT_ERROR(JSON::parse<JSON::Object>(jsonString));
 }
 
 
@@ -355,8 +384,6 @@ TEST(JsonTest, Find)
   EXPECT_NONE(object.find<JSON::Number>("nested1.nested2.null"));
   EXPECT_NONE(object.find<JSON::Object>("nested1.nested2.null"));
   EXPECT_NONE(object.find<JSON::Array>("nested1.nested2.null"));
-  EXPECT_NONE(object.find<JSON::True>("nested1.nested2.null"));
-  EXPECT_NONE(object.find<JSON::False>("nested1.nested2.null"));
   EXPECT_NONE(object.find<JSON::Boolean>("nested1.nested2.null"));
 
   // Also test getting JSON::Value when you don't know the type.
@@ -767,4 +794,25 @@ TEST(JsonTest, ContainsObject)
       "  }"
       "}");
   EXPECT_FALSE(nested.contains(nestedTest.get()));
+}
+
+
+TEST(JsonTest, NestingDepth)
+{
+  const size_t depth = 500000;
+
+  string deeplyNested;
+
+  for (size_t i = 0; i < depth; ++i) {
+    deeplyNested += "[";
+  }
+
+  deeplyNested += "42";
+
+  for (size_t i = 0; i < depth; ++i) {
+    deeplyNested += "]";
+  }
+
+  Try<JSON::Value> parsed = JSON::parse(deeplyNested);
+  ASSERT_ERROR(parsed); // Maximum depth exceeded.
 }

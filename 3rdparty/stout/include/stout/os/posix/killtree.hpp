@@ -49,7 +49,7 @@ inline Try<std::list<ProcessTree>> pstrees(
 // Note that if the process 'pid' has exited we'll signal the process
 // tree(s) rooted at pids in the group or session led by the process
 // if groups = true or sessions = true, respectively.
-// Returns the process trees that were succesfully or unsuccessfully
+// Returns the process trees that were successfully or unsuccessfully
 // signaled. Note that the process trees can be stringified.
 // TODO(benh): Allow excluding the root pid from stopping, killing,
 // and continuing so as to provide a means for expressing "kill all of
@@ -107,15 +107,14 @@ inline Try<std::list<ProcessTree>> killtree(
   // that we don't kill "up the tree". This can only be done if the
   // process is present.
   if (process.isSome() && (groups || sessions)) {
-    Option<Process> parent =
-      os::process(process.get().parent, processes.get());
+    Option<Process> parent = os::process(process->parent, processes.get());
 
     if (parent.isSome()) {
       if (groups) {
-        visited.groups.insert(parent.get().group);
+        visited.groups.insert(parent->group);
       }
-      if (sessions && parent.get().session.isSome()) {
-        visited.sessions.insert(parent.get().session.get());
+      if (sessions && parent->session.isSome()) {
+        visited.sessions.insert(parent->session.get());
       }
     }
   }
@@ -160,7 +159,7 @@ inline Try<std::list<ProcessTree>> killtree(
 
     // Now "visit" the group and/or session of the current process.
     if (groups) {
-      pid_t group = process.get().group;
+      pid_t group = process->group;
       if (visited.groups.count(group) == 0) {
         foreach (const Process& process, processes.get()) {
           if (process.group == group) {
@@ -176,8 +175,8 @@ inline Try<std::list<ProcessTree>> killtree(
     // not been reaped and thus is located somewhere in the tree we
     // are trying to kill. Therefore, we should discover it from our
     // tree traversal, or through its group (which is always present).
-    if (sessions && process.get().session.isSome()) {
-      pid_t session = process.get().session.get();
+    if (sessions && process->session.isSome()) {
+      pid_t session = process->session.get();
       if (visited.sessions.count(session) == 0) {
         foreach (const Process& process, processes.get()) {
           if (process.session.isSome() && process.session.get() == session) {

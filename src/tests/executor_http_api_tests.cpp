@@ -84,7 +84,23 @@ namespace tests {
 
 class ExecutorHttpApiTest
   : public MesosTest,
-    public WithParamInterface<ContentType> {};
+    public WithParamInterface<ContentType>
+{
+protected:
+  slave::Flags CreateSlaveFlags() override
+  {
+    slave::Flags flags = MesosTest::CreateSlaveFlags();
+
+#ifdef USE_SSL_SOCKET
+    // Disable executor authentication on the agent. Executor authentication
+    // currently has SSL as a dependency, so this is only necessary if Mesos was
+    // built with SSL support.
+    flags.authenticate_http_executors = false;
+#endif // USE_SSL_SOCKET
+
+    return flags;
+  }
+};
 
 
 // The tests are parameterized by the content type of the request.
@@ -112,7 +128,10 @@ TEST_F(ExecutorHttpApiTest, NoContentType)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -149,7 +168,10 @@ TEST_F(ExecutorHttpApiTest, ValidJsonButInvalidProtobuf)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -185,7 +207,10 @@ TEST_P(ExecutorHttpApiTest, MalformedContent)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -221,7 +246,10 @@ TEST_P(ExecutorHttpApiTest, UnsupportedContentMediaType)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -264,7 +292,10 @@ TEST_P(ExecutorHttpApiTest, MessageFromUnknownFramework)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -305,7 +336,10 @@ TEST_F(ExecutorHttpApiTest, GetRequest)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -337,7 +371,13 @@ TEST_P(ExecutorHttpApiTest, DefaultAccept)
   TestContainerizer containerizer(executorId, executor);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      &containerizer,
+      flags);
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -357,7 +397,7 @@ TEST_P(ExecutorHttpApiTest, DefaultAccept)
   AWAIT_READY(frameworkId);
   AWAIT_READY(offers);
 
-  ASSERT_EQ(1u, offers.get().size());
+  ASSERT_EQ(1u, offers->size());
 
   Future<v1::executor::Mesos*> executorLib;
   EXPECT_CALL(*executor, connected(_))
@@ -414,7 +454,13 @@ TEST_P(ExecutorHttpApiTest, NoAcceptHeader)
   TestContainerizer containerizer(executorId, executor);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      &containerizer,
+      flags);
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -434,7 +480,7 @@ TEST_P(ExecutorHttpApiTest, NoAcceptHeader)
   AWAIT_READY(frameworkId);
   AWAIT_READY(offers);
 
-  ASSERT_EQ(1u, offers.get().size());
+  ASSERT_EQ(1u, offers->size());
 
   Future<v1::executor::Mesos*> executorLib;
   EXPECT_CALL(*executor, connected(_))
@@ -488,7 +534,10 @@ TEST_P(ExecutorHttpApiTest, NotAcceptable)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -531,7 +580,10 @@ TEST_P(ExecutorHttpApiTest, ValidProtobufInvalidCall)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -609,7 +661,10 @@ TEST_P(ExecutorHttpApiTest, StatusUpdateCallFailedValidation)
   Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(__recover);
@@ -747,7 +802,12 @@ TEST_F(ExecutorHttpApiTest, SubscribeBeforeContainerizerRecovery)
   EXPECT_CALL(mockContainerizer, recover(_))
     .WillOnce(Return(recoveryPromise.future()));
 
-  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, &mockContainerizer);
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      &detector,
+      &mockContainerizer,
+      flags);
   ASSERT_SOME(slave);
 
   // Ensure that the agent has atleast set up HTTP routes upon startup.
@@ -795,7 +855,13 @@ TEST_P(ExecutorHttpApiTest, Subscribe)
   TestContainerizer containerizer(&exec);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      &containerizer,
+      flags);
   ASSERT_SOME(slave);
 
   MockScheduler sched;
@@ -815,7 +881,7 @@ TEST_P(ExecutorHttpApiTest, Subscribe)
   AWAIT_READY(frameworkId);
   AWAIT_READY(offers);
 
-  ASSERT_EQ(1u, offers.get().size());
+  ASSERT_EQ(1u, offers->size());
 
   Future<Message> registerExecutorMessage =
     DROP_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
@@ -853,9 +919,9 @@ TEST_P(ExecutorHttpApiTest, Subscribe)
   AWAIT_EXPECT_RESPONSE_HEADER_EQ("chunked", "Transfer-Encoding", response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(contentTypeString, "Content-Type", response);
 
-  ASSERT_EQ(Response::PIPE, response.get().type);
+  ASSERT_EQ(Response::PIPE, response->type);
 
-  Option<Pipe::Reader> reader = response.get().reader;
+  Option<Pipe::Reader> reader = response->reader;
   ASSERT_SOME(reader);
 
   auto deserializer =
@@ -870,12 +936,12 @@ TEST_P(ExecutorHttpApiTest, Subscribe)
   ASSERT_SOME(event.get());
 
   // Check event type is subscribed and if the ExecutorID matches.
-  ASSERT_EQ(Event::SUBSCRIBED, event.get().get().type());
-  ASSERT_EQ(event.get().get().subscribed().executor_info().executor_id(),
+  ASSERT_EQ(Event::SUBSCRIBED, event->get().type());
+  ASSERT_EQ(event->get().subscribed().executor_info().executor_id(),
             call.executor_id());
-  ASSERT_TRUE(event.get().get().subscribed().has_container_id());
+  ASSERT_TRUE(event->get().subscribed().has_container_id());
 
-  reader.get().close();
+  reader->close();
 
   driver.stop();
   driver.join();

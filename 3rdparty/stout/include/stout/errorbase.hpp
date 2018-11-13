@@ -15,6 +15,7 @@
 
 #include <errno.h>
 
+#include <ostream>
 #include <string>
 
 #include <stout/os/strerror.hpp>
@@ -37,6 +38,11 @@ class Error
 public:
   explicit Error(const std::string& _message) : message(_message) {}
 
+  bool operator==(const Error& that) const
+  {
+    return message == that.message;
+  }
+
   const std::string message;
 };
 
@@ -56,5 +62,11 @@ public:
 
   const int code;
 };
+
+
+inline std::ostream& operator<<(std::ostream& stream, const Error& error)
+{
+  return stream << error.message;
+}
 
 #endif // __STOUT_ERROR_BASE_HPP__

@@ -25,6 +25,8 @@
 
 #include "encoder.hpp"
 
+namespace inet4 = process::network::inet4;
+
 using process::Future;
 using process::Message;
 using process::MessageEncoder;
@@ -97,6 +99,10 @@ int main(int argc, char** argv)
     EXIT(EXIT_FAILURE) << "Usage: test-linkee <UPID>";
   }
 
+  // NOTE: On Windows, this initialization must take place before creating a
+  // `Socket`, otherwise the IOCP handle will be uninitialized. See MESOS-9097.
+  process::initialize();
+
   // Create a server socket.
   Try<Socket> create = Socket::create();
   if (create.isError()) {
@@ -120,12 +126,38 @@ int main(int argc, char** argv)
   }
 
   // Bind to some random port.
-  Try<Address> bind = __s__->bind(Address::ANY_ANY());
+  Try<Address> bind = __s__->bind(inet4::Address::ANY_ANY());
   if (bind.isError()) {
     EXIT(EXIT_FAILURE) << "Failed to bind: " << bind.error();
   }
 
   Address address = bind.get();
+
+  // Resolve the hostname if the IP is 0.0.0.0 in case we actually have
+  // a valid external IP address. Note that we need only one IP address,
+  // so that other processes can send and receive and don't get confused
+  // as to whom they are sending to.
+  //
+  // This code is copied from process::initialize(), so it matches
+  // how libprocess proper sets up its listening socket.
+  if (address.ip.isAny()) {
+    char hostname[512];
+
+    if (gethostname(hostname, sizeof(hostname)) < 0) {
+      PLOG(FATAL) << "Failed to get the local hostname";
+    }
+
+    // Lookup an IP address of local hostname, taking the first result.
+    Try<net::IP> ip = net::getIP(hostname, address.ip.family());
+
+    if (ip.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to obtain the IP address for '" << hostname << "';"
+        << " the DNS service may not be able to resolve it: " << ip.error();
+    }
+
+    address.ip = ip.get();
+  }
 
   // Start listening for incoming sockets.
   Try<Nothing> listen = __s__->listen(LISTEN_BACKLOG);
@@ -159,7 +191,7 @@ int main(int argc, char** argv)
       message.from = UPID("(1)", address);
       message.to = parent;
 
-      outgoing->send(MessageEncoder::encode(&message));
+      outgoing->send(MessageEncoder::encode(message));
     });
 
   // Now sit and accept links until the linkee is killed.

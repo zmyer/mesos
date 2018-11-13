@@ -42,6 +42,8 @@
 #include <stout/os/rm.hpp>
 #include <stout/os/write.hpp>
 
+#include "common/resources_utils.hpp"
+
 #include "messages/messages.hpp"
 
 namespace mesos {
@@ -72,39 +74,106 @@ struct TaskState;
 Try<State> recover(const std::string& rootDir, bool strict);
 
 
+// Reads the protobuf message(s) from the given path.
+// `T` may be either a single protobuf message or a sequence of messages
+// if `T` is a specialization of `google::protobuf::RepeatedPtrField`.
+template <typename T>
+Result<T> read(const std::string& path)
+{
+  Result<T> result = ::protobuf::read<T>(path);
+  if (result.isSome()) {
+    upgradeResources(&result.get());
+  }
+
+  return result;
+}
+
+
+// While we return a `Result<string>` here in order to keep the return
+// type of `state::read` consistent, the `None` case does not arise here.
+// That is, an empty file will result in an empty string, rather than
+// the `Result` ending up in a `None` state.
+template <>
+inline Result<std::string> read<std::string>(const std::string& path)
+{
+  return os::read(path);
+}
+
+
+template <>
+inline Result<Resources> read<Resources>(const std::string& path)
+{
+  Result<google::protobuf::RepeatedPtrField<Resource>> resources =
+    read<google::protobuf::RepeatedPtrField<Resource>>(path);
+
+  if (resources.isError()) {
+    return Error(resources.error());
+  }
+
+  if (resources.isNone()) {
+    return None();
+  }
+
+  return std::move(resources.get());
+}
+
+
 namespace internal {
 
 inline Try<Nothing> checkpoint(
     const std::string& path,
-    const std::string& message)
+    const std::string& message,
+    bool sync)
 {
-  return ::os::write(path, message);
+  return ::os::write(path, message, sync);
+}
+
+
+template <
+    typename T,
+    typename std::enable_if<
+        std::is_convertible<T*, google::protobuf::Message*>::value,
+        int>::type = 0>
+inline Try<Nothing> checkpoint(const std::string& path, T message, bool sync)
+{
+  // If the `Try` from `downgradeResources` returns an `Error`, we currently
+  // continue to checkpoint the resources in a partially downgraded state.
+  // This implies that an agent with refined reservations cannot be downgraded
+  // to versions before reservation refinement support, which was introduced
+  // in 1.4.0.
+  //
+  // TODO(mpark): Do something smarter with the result once
+  // something like an agent recovery capability is introduced.
+  downgradeResources(&message);
+  return ::protobuf::write(path, message, sync);
 }
 
 
 inline Try<Nothing> checkpoint(
     const std::string& path,
-    const google::protobuf::Message& message)
+    google::protobuf::RepeatedPtrField<Resource> resources,
+    bool sync)
 {
-  return ::protobuf::write(path, message);
-}
-
-
-template <typename T>
-Try<Nothing> checkpoint(
-    const std::string& path,
-    const google::protobuf::RepeatedPtrField<T>& messages)
-{
-  return ::protobuf::write(path, messages);
+  // If the `Try` from `downgradeResources` returns an `Error`, we currently
+  // continue to checkpoint the resources in a partially downgraded state.
+  // This implies that an agent with refined reservations cannot be downgraded
+  // to versions before reservation refinement support, which was introduced
+  // in 1.4.0.
+  //
+  // TODO(mpark): Do something smarter with the result once
+  // something like an agent recovery capability is introduced.
+  downgradeResources(&resources);
+  return ::protobuf::write(path, resources, sync);
 }
 
 
 inline Try<Nothing> checkpoint(
     const std::string& path,
-    const Resources& resources)
+    const Resources& resources,
+    bool sync)
 {
   const google::protobuf::RepeatedPtrField<Resource>& messages = resources;
-  return checkpoint(path, messages);
+  return checkpoint(path, messages, sync);
 }
 
 }  // namespace internal {
@@ -121,14 +190,19 @@ inline Try<Nothing> checkpoint(
 //
 // NOTE: We provide atomic (all-or-nothing) semantics here by always
 // writing to a temporary file first then using os::rename to atomically
-// move it to the desired path.
+// move it to the desired path. If `sync` is set to true, this call succeeds
+// only if `fsync` is supported and successfully commits the changes to the
+// filesystem for the checkpoint file and each created directory.
+//
+// TODO(chhsiao): Consider enabling syncing by default after evaluating its
+// performance impact.
 template <typename T>
-Try<Nothing> checkpoint(const std::string& path, const T& t)
+Try<Nothing> checkpoint(const std::string& path, const T& t, bool sync = false)
 {
   // Create the base directory.
   std::string base = Path(path).dirname();
 
-  Try<Nothing> mkdir = os::mkdir(base);
+  Try<Nothing> mkdir = os::mkdir(base, true, sync);
   if (mkdir.isError()) {
     return Error("Failed to create directory '" + base + "': " + mkdir.error());
   }
@@ -145,7 +219,7 @@ Try<Nothing> checkpoint(const std::string& path, const T& t)
   }
 
   // Now checkpoint the instance of T to the temporary file.
-  Try<Nothing> checkpoint = internal::checkpoint(temp.get(), t);
+  Try<Nothing> checkpoint = internal::checkpoint(temp.get(), t, sync);
   if (checkpoint.isError()) {
     // Try removing the temporary file on error.
     os::rm(temp.get());
@@ -155,7 +229,7 @@ Try<Nothing> checkpoint(const std::string& path, const T& t)
   }
 
   // Rename the temporary file to the path.
-  Try<Nothing> rename = os::rename(temp.get(), path);
+  Try<Nothing> rename = os::rename(temp.get(), path, sync);
   if (rename.isError()) {
     // Try removing the temporary file on error.
     os::rm(temp.get());
@@ -190,7 +264,7 @@ struct TaskState
   TaskID id;
   Option<Task> info;
   std::vector<StatusUpdate> updates;
-  hashset<UUID> acks;
+  hashset<id::UUID> acks;
   unsigned int errors;
 };
 
@@ -272,11 +346,6 @@ struct ResourcesState
       const std::string& rootDir,
       bool strict);
 
-  static Try<Resources> recoverResources(
-      const std::string& path,
-      bool strict,
-      unsigned int& errors);
-
   Resources resources;
   Option<Resources> target;
   unsigned int errors;
@@ -307,6 +376,7 @@ struct State
 
   Option<ResourcesState> resources;
   Option<SlaveState> slave;
+  bool rebooted = false;
 
   // TODO(jieyu): Consider using a vector of Option<Error> here so
   // that we can print all the errors. This also applies to all the

@@ -41,6 +41,8 @@
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/containerizer/fetcher.hpp"
 
+#include "slave/containerizer/mesos/containerizer.hpp"
+
 #include "slave/containerizer/mesos/isolators/gpu/nvidia.hpp"
 
 #include "tests/mesos.hpp"
@@ -66,6 +68,9 @@ using std::string;
 using std::vector;
 
 using testing::_;
+using testing::AllOf;
+using testing::AtMost;
+using testing::DoAll;
 using testing::Eq;
 using testing::Return;
 
@@ -73,7 +78,7 @@ namespace mesos {
 namespace internal {
 namespace tests {
 
-class NvidiaGpuTest : public MesosTest {};
+class NvidiaGpuTest : public ContainerizerTest<slave::MesosContainerizer> {};
 
 
 // This test verifies that we are able to enable the Nvidia GPU
@@ -91,8 +96,7 @@ TEST_F(NvidiaGpuTest, ROOT_CGROUPS_NVIDIA_GPU_VerifyDeviceAccess)
   // Assume at least one GPU is available for isolation.
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "filesystem/linux,cgroups/devices,gpu/nvidia";
-  flags.nvidia_gpu_devices = vector<unsigned int>({0u});
-  flags.resources = "gpus:1";
+  flags.resources = "cpus:1"; // To override the default with gpus:0.
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -132,12 +136,16 @@ TEST_F(NvidiaGpuTest, ROOT_CGROUPS_NVIDIA_GPU_VerifyDeviceAccess)
       Resources::parse("cpus:0.1;mem:128").get(),
       "nvidia-smi");
 
-  Future<TaskStatus> statusRunning1, statusFailed1;
+  Future<TaskStatus> statusStarting1, statusRunning1, statusFailed1;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting1))
     .WillOnce(FutureArg<1>(&statusRunning1))
     .WillOnce(FutureArg<1>(&statusFailed1));
 
   driver.launchTasks(offers1.get()[0].id(), {task1});
+
+  AWAIT_READY(statusStarting1);
+  ASSERT_EQ(TASK_STARTING, statusStarting1->state());
 
   AWAIT_READY(statusRunning1);
   ASSERT_EQ(TASK_RUNNING, statusRunning1->state());
@@ -158,12 +166,16 @@ TEST_F(NvidiaGpuTest, ROOT_CGROUPS_NVIDIA_GPU_VerifyDeviceAccess)
       "  exit 1;\n"
       "fi");
 
-  Future<TaskStatus> statusRunning2, statusFinished2;
+  Future<TaskStatus> statusStarting2, statusRunning2, statusFinished2;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting2))
     .WillOnce(FutureArg<1>(&statusRunning2))
     .WillOnce(FutureArg<1>(&statusFinished2));
 
   driver.launchTasks(offers2.get()[0].id(), {task2});
+
+  AWAIT_READY(statusStarting2);
+  ASSERT_EQ(TASK_STARTING, statusStarting2->state());
 
   AWAIT_READY(statusRunning2);
   ASSERT_EQ(TASK_RUNNING, statusRunning2->state());
@@ -201,94 +213,122 @@ TEST_F(NvidiaGpuTest, ROOT_INTERNET_CURL_CGROUPS_NVIDIA_GPU_NvidiaDockerImage)
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
-  MockScheduler sched;
+  // NOTE: We use the default executor (and thus v1 API) in this test to avoid
+  // executor registration timing out due to fetching the 'nvidia/cuda' image
+  // over a slow connection.
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.add_capabilities()->set_type(
-      FrameworkInfo::Capability::GPU_RESOURCES);
+      v1::FrameworkInfo::Capability::GPU_RESOURCES);
 
-  MesosSchedulerDriver driver(
-      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
 
-  Future<Nothing> schedRegistered;
-  EXPECT_CALL(sched, registered(_, _, _))
-    .WillOnce(FutureSatisfy(&schedRegistered));
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
 
-  Future<vector<Offer>> offers1, offers2;
-  EXPECT_CALL(sched, resourceOffers(_, _))
-    .WillOnce(FutureArg<1>(&offers1))
-    .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
-  driver.start();
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  AWAIT_READY(schedRegistered);
+  EXPECT_CALL(*scheduler, failure(_, _))
+    .Times(AtMost(2));
 
-  Image image;
-  image.set_type(Image::DOCKER);
+  v1::scheduler::TestMesos mesos(
+    master.get()->pid,
+    ContentType::PROTOBUF,
+    scheduler);
+
+  AWAIT_READY(subscribed);
+
+  const v1::FrameworkID& frameworkId = subscribed->framework_id();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::AgentID& agentId = offers->offers(0).agent_id();
+
+  mesos::v1::Image image;
+  image.set_type(mesos::v1::Image::DOCKER);
   image.mutable_docker()->set_name("nvidia/cuda");
 
-  // Launch a task requesting 1 GPU and verify
-  // that `nvidia-smi` lists exactly one GPU.
-  AWAIT_READY(offers1);
-  ASSERT_EQ(1u, offers1->size());
+  // Launch a task requesting 1 GPU and verify that `nvidia-smi` lists exactly
+  // one GPU.
+  v1::ExecutorInfo executor1 = v1::createExecutorInfo(
+      id::UUID::random().toString(),
+      None(),
+      "cpus:0.1;mem:32;disk:32",
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
-  TaskInfo task1 = createTask(
-      offers1->at(0).slave_id(),
-      Resources::parse("cpus:1;mem:128;gpus:1").get(),
+  v1::TaskInfo task1 = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:32;gpus:1").get(),
       "NUM_GPUS=`nvidia-smi --list-gpus | wc -l`;\n"
       "if [ \"$NUM_GPUS\" != \"1\" ]; then\n"
       "  exit 1;\n"
       "fi");
 
-  ContainerInfo* container = task1.mutable_container();
-  container->set_type(ContainerInfo::MESOS);
-  container->mutable_mesos()->mutable_image()->CopyFrom(image);
+  mesos::v1::ContainerInfo* container1 = task1.mutable_container();
+  container1->set_type(mesos::v1::ContainerInfo::MESOS);
+  container1->mutable_mesos()->mutable_image()->CopyFrom(image);
 
-  Future<TaskStatus> statusRunning1, statusFinished1;
-  EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&statusRunning1))
-    .WillOnce(FutureArg<1>(&statusFinished1));
+  // Launch a task requesting no GPU and verify that running `nvidia-smi` fails.
+  v1::ExecutorInfo executor2 = v1::createExecutorInfo(
+      id::UUID::random().toString(),
+      None(),
+      "cpus:0.1;mem:32;disk:32",
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
-  driver.launchTasks(offers1->at(0).id(), {task1});
-
-  // We wait wait up to 120 seconds
-  // to download the docker image.
-  AWAIT_READY_FOR(statusRunning1, Seconds(120));
-  ASSERT_EQ(TASK_RUNNING, statusRunning1->state());
-
-  AWAIT_READY(statusFinished1);
-  ASSERT_EQ(TASK_FINISHED, statusFinished1->state());
-
-  // Launch a task requesting no GPUs and
-  // verify that running `nvidia-smi` fails.
-  AWAIT_READY(offers2);
-  EXPECT_EQ(1u, offers2->size());
-
-  TaskInfo task2 = createTask(
-      offers2->at(0).slave_id(),
-      Resources::parse("cpus:1;mem:128").get(),
+  v1::TaskInfo task2 = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:32").get(),
       "nvidia-smi");
 
-  container = task2.mutable_container();
-  container->set_type(ContainerInfo::MESOS);
-  container->mutable_mesos()->mutable_image()->CopyFrom(image);
+  mesos::v1::ContainerInfo* container2 = task2.mutable_container();
+  container2->set_type(mesos::v1::ContainerInfo::MESOS);
+  container2->mutable_mesos()->mutable_image()->CopyFrom(image);
 
-  Future<TaskStatus> statusRunning2, statusFailed2;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&statusRunning2))
-    .WillOnce(FutureArg<1>(&statusFailed2));
+  EXPECT_CALL(*scheduler, update(_, TaskStatusUpdateStateEq(v1::TASK_STARTING)))
+    .Times(2)
+    .WillRepeatedly(v1::scheduler::SendAcknowledge(frameworkId, agentId));
 
-  driver.launchTasks(offers2->at(0).id(), {task2});
+  EXPECT_CALL(*scheduler, update(_, TaskStatusUpdateStateEq(v1::TASK_RUNNING)))
+    .Times(2)
+    .WillRepeatedly(v1::scheduler::SendAcknowledge(frameworkId, agentId));
 
-  AWAIT_READY_FOR(statusRunning2, Seconds(120));
-  ASSERT_EQ(TASK_RUNNING, statusRunning2->state());
+  Future<Nothing> task1Finished;
+  EXPECT_CALL(*scheduler, update(_, AllOf(
+      TaskStatusUpdateTaskIdEq(task1),
+      TaskStatusUpdateStateEq(v1::TASK_FINISHED))))
+    .WillOnce(DoAll(
+        FutureSatisfy(&task1Finished),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
 
-  AWAIT_READY(statusFailed2);
-  ASSERT_EQ(TASK_FAILED, statusFailed2->state());
+  Future<Nothing> task2Failed;
+  EXPECT_CALL(*scheduler, update(_, AllOf(
+      TaskStatusUpdateTaskIdEq(task2),
+      TaskStatusUpdateStateEq(v1::TASK_FAILED))))
+    .WillOnce(DoAll(
+        FutureSatisfy(&task2Failed),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
 
-  driver.stop();
-  driver.join();
+  mesos.send(v1::createCallAccept(
+      frameworkId,
+      offers->offers(0),
+      {v1::LAUNCH_GROUP(executor1, v1::createTaskGroupInfo({task1})),
+       v1::LAUNCH_GROUP(executor2, v1::createTaskGroupInfo({task2}))}));
+
+  // We wait up to 180 seconds to download the docker image.
+  AWAIT_READY_FOR(task1Finished, Seconds(180));
+  AWAIT_READY(task2Failed);
 }
 
 
@@ -336,7 +376,7 @@ TEST_F(NvidiaGpuTest, ROOT_CGROUPS_NVIDIA_GPU_FractionalResources)
   // Launch a task requesting a fractional number
   // of GPUs and verify that it fails as expected.
   AWAIT_READY(offers);
-  EXPECT_EQ(1u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(
       offers.get()[0].slave_id(),
@@ -647,6 +687,94 @@ TEST_F(NvidiaGpuTest, ROOT_NVIDIA_GPU_VolumeShouldInject)
   ASSERT_SOME(volume);
 
   ASSERT_FALSE(volume->shouldInject(manifest.get()));
+}
+
+
+// This test verifies that the DefaultExecutor is able to launch tasks
+// with restricted access to GPUs.
+// It launches a task with 1 GPU and verifies that a call to
+// `nvidia-smi` both succeeds and reports exactly 1 GPU available.
+TEST_F(NvidiaGpuTest, ROOT_CGROUPS_NVIDIA_GPU_DefaultExecutorVerifyDeviceAccess)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // Turn on Nvidia GPU isolation.
+  // Assume at least one GPU is available for isolation.
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "filesystem/linux,cgroups/devices,gpu/nvidia";
+  flags.resources = "cpus:1"; // To override the default with gpus:0.
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_capabilities()->set_type(
+      FrameworkInfo::Capability::GPU_RESOURCES);
+
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());      // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  Resources resources = Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  ExecutorInfo executorInfo;
+  executorInfo.set_type(ExecutorInfo::DEFAULT);
+  executorInfo.mutable_executor_id()->CopyFrom(DEFAULT_EXECUTOR_ID);
+  executorInfo.mutable_framework_id()->CopyFrom(frameworkId.get());
+  executorInfo.mutable_resources()->CopyFrom(resources);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers->front();
+  const SlaveID& slaveId = offer.slave_id();
+
+  TaskInfo taskInfo = createTask(
+      slaveId,
+      Resources::parse("cpus:0.1;mem:128;gpus:1").get(),
+      "NUM_GPUS=`nvidia-smi --list-gpus | wc -l`;\n"
+      "if [ \"$NUM_GPUS\" != \"1\" ]; then\n"
+      "  exit 1;\n"
+      "fi");
+
+  TaskGroupInfo taskGroup = createTaskGroupInfo({taskInfo});
+
+  Future<TaskStatus> statusStarting, statusRunning, statusFinished;
+
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.acceptOffers({offer.id()}, {LAUNCH_GROUP(executorInfo, taskGroup)});
+
+  AWAIT_READY(statusStarting);
+  ASSERT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  ASSERT_EQ(TASK_RUNNING, statusRunning->state());
+
+  AWAIT_READY(statusFinished);
+  ASSERT_EQ(TASK_FINISHED, statusFinished->state());
+
+  driver.stop();
+  driver.join();
 }
 
 } // namespace tests {

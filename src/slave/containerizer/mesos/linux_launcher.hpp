@@ -37,27 +37,32 @@ public:
   // Returns 'true' if prerequisites for using LinuxLauncher are available.
   static bool available();
 
-  virtual ~LinuxLauncher();
+  // Helper for determining the cgroup for a container (i.e., the path
+  // in a cgroup subsystem).
+  static std::string cgroup(
+      const std::string& cgroupsRoot,
+      const ContainerID& containerId);
 
-  virtual process::Future<hashset<ContainerID>> recover(
-      const std::list<mesos::slave::ContainerState>& states);
+  ~LinuxLauncher() override;
 
-  virtual Try<pid_t> fork(
+  process::Future<hashset<ContainerID>> recover(
+      const std::vector<mesos::slave::ContainerState>& states) override;
+
+  Try<pid_t> fork(
       const ContainerID& containerId,
       const std::string& path,
       const std::vector<std::string>& argv,
-      const process::Subprocess::IO& in,
-      const process::Subprocess::IO& out,
-      const process::Subprocess::IO& err,
+      const mesos::slave::ContainerIO& containerIO,
       const flags::FlagsBase* flags,
       const Option<std::map<std::string, std::string>>& environment,
       const Option<int>& enterNamespaces,
-      const Option<int>& cloneNamespaces);
+      const Option<int>& cloneNamespaces,
+      const std::vector<int_fd>& whitelistFds) override;
 
-  virtual process::Future<Nothing> destroy(const ContainerID& containerId);
+  process::Future<Nothing> destroy(const ContainerID& containerId) override;
 
-  virtual process::Future<ContainerStatus> status(
-      const ContainerID& containerId);
+  process::Future<ContainerStatus> status(
+      const ContainerID& containerId) override;
 
 private:
   LinuxLauncher(

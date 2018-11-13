@@ -17,8 +17,11 @@
 #ifndef __PROVISIONER_DOCKER_STORE_HPP__
 #define __PROVISIONER_DOCKER_STORE_HPP__
 
+#include <mesos/secret/resolver.hpp>
+
 #include <process/owned.hpp>
 
+#include <stout/hashset.hpp>
 #include <stout/try.hpp>
 
 #include "slave/flags.hpp"
@@ -39,20 +42,26 @@ class StoreProcess;
 class Store : public slave::Store
 {
 public:
-  static Try<process::Owned<slave::Store>> create(const Flags& flags);
+  static Try<process::Owned<slave::Store>> create(
+      const Flags& flags,
+      SecretResolver* secretResolver = nullptr);
 
   // This allows the puller to be mocked for testing.
   static Try<process::Owned<slave::Store>> create(
       const Flags& flags,
       const process::Owned<Puller>& puller);
 
-  virtual ~Store();
+  ~Store() override;
 
-  virtual process::Future<Nothing> recover();
+  process::Future<Nothing> recover() override;
 
-  virtual process::Future<ImageInfo> get(
+  process::Future<ImageInfo> get(
       const mesos::Image& image,
-      const std::string& backend);
+      const std::string& backend) override;
+
+  process::Future<Nothing> prune(
+      const std::vector<mesos::Image>& excludeImages,
+      const hashset<std::string>& activeLayerPaths) override;
 
 private:
   explicit Store(process::Owned<StoreProcess> process);

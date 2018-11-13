@@ -26,6 +26,7 @@
 namespace process {
 namespace io {
 
+#ifndef ENABLE_LIBWINIO
 /**
  * A possible event while polling.
  *
@@ -37,6 +38,7 @@ const short READ = 0x01;
  * @copydoc process::io::READ
  */
 const short WRITE = 0x02;
+#endif // ENABLE_LIBWINIO
 
 /**
  * Buffered read chunk size.
@@ -46,6 +48,32 @@ const short WRITE = 0x02;
 const size_t BUFFERED_READ_SIZE = 16*4096;
 
 /**
+ * Prepares a file descriptor to be ready for asynchronous IO. On POSIX
+ * systems, this sets the file descriptor to non-blocking. On Windows, this
+ * will assign the file descriptor to an IO completion port.
+ *
+ * NOTE: Because the IO completion port is only known at the libprocess level,
+ * we need this function instead of simply using stout's `os::nonblock` and
+ * `os::isNonblock` functions like we could do for POSIX systems.
+ *
+ * @return On success, returns Nothing. On error, returns an Error.
+ */
+Try<Nothing> prepare_async(int_fd fd);
+
+
+/**
+ * Checks if `io::prepare_async` has been called on the file descriptor.
+ *
+ * @return Returns if the file descriptor is asynchronous. An asynchronous
+ *     file descriptor is defined to be non-blocking on POSIX systems and
+ *     overlapped and associated with an IO completion port on Windows.
+ *     An error will be returned if the file descriptor is invalid.
+ */
+Try<bool> is_async(int_fd fd);
+
+
+#ifndef ENABLE_LIBWINIO
+/**
  * Returns the events (a subset of the events specified) that can be
  * performed on the specified file descriptor without blocking.
  *
@@ -53,12 +81,14 @@ const size_t BUFFERED_READ_SIZE = 16*4096;
  * @see process::io::WRITE
  */
 // TODO(benh): Add a version which takes multiple file descriptors.
-Future<short> poll(int fd, short events);
+Future<short> poll(int_fd fd, short events);
+#endif // ENABLE_LIBWINIO
 
 
 /**
  * Performs a single non-blocking read by polling on the specified
- * file descriptor until any data can be be read.
+ * file descriptor until any data can be be read. `io::prepare_async`
+ * needs to be called beforehand.
  *
  * The future will become ready when some data is read (may be less than
  * the specified size).
@@ -66,7 +96,7 @@ Future<short> poll(int fd, short events);
  * @return The number of bytes read or zero on EOF.
  *     A failure will be returned if an error is detected.
  */
-Future<size_t> read(int fd, void* data, size_t size);
+Future<size_t> read(int_fd fd, void* data, size_t size);
 
 
 /**
@@ -80,16 +110,13 @@ Future<size_t> read(int fd, void* data, size_t size);
  *     file descriptor cannot be duplicated, set to close-on-exec,
  *     or made non-blocking.
  */
-Future<std::string> read(int fd);
-#ifdef __WINDOWS__
-// Version of this function compatible with Windows `HANDLE`.
-Future<std::string> read(HANDLE fd);
-#endif // __WINDOWS__
+Future<std::string> read(int_fd fd);
 
 
 /**
  * Performs a single non-blocking write by polling on the specified
- * file descriptor until data can be be written.
+ * file descriptor until data can be be written. `io::prepare_async`
+ * needs to be called beforehand.
  *
  * The future will become ready when some data is written (may be less than
  * the specified size of the data).
@@ -99,7 +126,7 @@ Future<std::string> read(HANDLE fd);
  *     If writing to a socket or pipe, an error will be returned if the
  *     the read end of the socket or pipe has been closed.
  */
-Future<size_t> write(int fd, const void* data, size_t size);
+Future<size_t> write(int_fd fd, const void* data, size_t size);
 
 
 /**
@@ -111,7 +138,7 @@ Future<size_t> write(int fd, const void* data, size_t size);
  *     file descriptor cannot be duplicated, set to close-on-exec,
  *     or made non-blocking.
  */
-Future<Nothing> write(int fd, const std::string& data);
+Future<Nothing> write(int_fd fd, const std::string& data);
 
 /**
  * Redirect output from the 'from' file descriptor to the 'to' file
@@ -127,19 +154,10 @@ Future<Nothing> write(int fd, const std::string& data);
  *     set to close-on-exec, or made non-blocking.
  */
 Future<Nothing> redirect(
-    int from,
-    Option<int> to,
+    int_fd from,
+    Option<int_fd> to,
     size_t chunk = 4096,
     const std::vector<lambda::function<void(const std::string&)>>& hooks = {});
-
-#ifdef __WINDOWS__
-// Version of this function compatible with Windows `HANDLE`.
-Future<Nothing> redirect(
-    HANDLE from,
-    Option<int> to,
-    size_t chunk = 4096,
-    const std::vector<lambda::function<void(const std::string&)>>& hooks = {});
-#endif // __WINDOWS__
 
 } // namespace io {
 } // namespace process {

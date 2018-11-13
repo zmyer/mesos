@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <stdint.h>
+#include "common/values.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -32,7 +32,6 @@
 
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
-#include <stout/interval.hpp>
 #include <stout/strings.hpp>
 
 using std::max;
@@ -40,6 +39,9 @@ using std::min;
 using std::ostream;
 using std::string;
 using std::vector;
+
+using mesos::internal::values::intervalSetToRanges;
+using mesos::internal::values::rangesToIntervalSet;
 
 namespace mesos {
 
@@ -73,7 +75,8 @@ ostream& operator<<(ostream& stream, const Value::Scalar& scalar)
 {
   // Output the scalar's full significant digits and save the old
   // precision.
-  long precision = stream.precision(std::numeric_limits<double>::digits10);
+  std::streamsize precision =
+    stream.precision(std::numeric_limits<double>::digits10);
 
   // We discard any additional precision (of the fractional part)
   // from scalar resources before writing them to an ostream. This
@@ -226,6 +229,105 @@ void coalesce(Value::Ranges* result, vector<Range> ranges)
   CHECK_EQ(result->range_size(), count);
 }
 
+
+// Subtract `right_` from `left_`, and return the result as Value::Ranges.
+Value::Ranges subtract(const Value::Ranges& left_, const Value::Ranges& right_)
+{
+  if (left_.range_size() == 0 || right_.range_size() == 0) {
+    return left_;
+  }
+
+  // Convert the input `Ranges` to `vector<internal::Range>` and
+  // sort the vector based on the start of a range.
+  auto sortRanges = [](const Value::Ranges& ranges) {
+    vector<internal::Range> result;
+    result.reserve(ranges.range_size());
+
+    foreach (const Value::Range& range, ranges.range()) {
+      result.push_back({range.begin(), range.end()});
+    }
+
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const internal::Range& left, const internal::Range& right) {
+          return left.start < right.start;
+        });
+
+    return result;
+  };
+
+  Value::Ranges result;
+
+  vector<internal::Range> left = sortRanges(left_);
+  vector<internal::Range> right = sortRanges(right_);
+
+  vector<internal::Range>::iterator itLeft = left.begin();
+  for (vector<internal::Range>::const_iterator itRight = right.cbegin();
+       itLeft != left.end() && itRight != right.cend();) {
+    // Non-overlap:
+    // L: |___|
+    // R:       |___|
+    if (itLeft->end < itRight->start) {
+      Value::Range* newRange = result.add_range();
+      newRange->set_begin(itLeft->start);
+      newRange->set_end(itLeft->end);
+
+      itLeft++;
+      continue;
+    }
+
+    // Non-overlap:
+    // L:       |___|
+    // R: |___|
+    if (itLeft->start > itRight->end) {
+      itRight++;
+      continue;
+    }
+
+    if (itLeft->start < itRight->start) {
+      Value::Range* newRange = result.add_range();
+      newRange->set_begin(itLeft->start);
+      newRange->set_end(itRight->start - 1);
+
+      if (itLeft->end <= itRight->end) {
+        // L: |_____|
+        // R:    |____|
+        itLeft++;
+      } else {
+        // L: |________|
+        // R:    |___|
+        itLeft->start = itRight->end + 1;
+        itRight++;
+      }
+    } else { // itLeft->start >= itRight->start
+      if (itLeft->end <= itRight->end) {
+        // L:   |____|
+        // R: |________|
+        itLeft++;
+      } else {
+        // L:   |_____|
+        // R: |____|
+        itLeft->start = itRight->end + 1;
+        itRight++;
+      }
+    }
+  }
+
+  // Traverse what's left in the `left`, if any.
+  while (itLeft != left.end()) {
+    // TODO(mzhu): Consider reserving the exact size.
+    Value::Range* newRange = result.add_range();
+    newRange->set_begin(itLeft->start);
+    newRange->set_end(itLeft->end);
+
+    itLeft++;
+  }
+
+  return result;
+}
+
+
 } // namespace internal {
 
 
@@ -273,35 +375,6 @@ void coalesce(Value::Ranges* result, const Value::Range& addedRange)
   Value::Range* range = ranges.add_range();
   range->CopyFrom(addedRange);
   coalesce(result, {ranges});
-}
-
-
-// Convert Ranges value to IntervalSet value.
-IntervalSet<uint64_t> rangesToIntervalSet(const Value::Ranges& ranges)
-{
-  IntervalSet<uint64_t> set;
-
-  foreach (const Value::Range& range, ranges.range()) {
-    set += (Bound<uint64_t>::closed(range.begin()),
-            Bound<uint64_t>::closed(range.end()));
-  }
-
-  return set;
-}
-
-
-// Convert IntervalSet value to Ranges value.
-Value::Ranges intervalSetToRanges(const IntervalSet<uint64_t>& set)
-{
-  Value::Ranges ranges;
-
-  foreach (const Interval<uint64_t>& interval, set) {
-    Value::Range* range = ranges.add_range();
-    range->set_begin(interval.lower());
-    range->set_end(interval.upper() - 1);
-  }
-
-  return ranges;
 }
 
 
@@ -378,6 +451,7 @@ bool operator<=(const Value::Ranges& _left, const Value::Ranges& _right)
 }
 
 
+// TODO(mzhu): Make this consistent with how we do subtraction.
 Value::Ranges operator+(const Value::Ranges& left, const Value::Ranges& right)
 {
   Value::Ranges result;
@@ -388,12 +462,11 @@ Value::Ranges operator+(const Value::Ranges& left, const Value::Ranges& right)
 
 Value::Ranges operator-(const Value::Ranges& left, const Value::Ranges& right)
 {
-  Value::Ranges result;
-  coalesce(&result, {left});
-  return result -= right;
+  return internal::subtract(left, right);
 }
 
 
+// TODO(mzhu): Make this consistent with how we do subtraction.
 Value::Ranges& operator+=(Value::Ranges& left, const Value::Ranges& right)
 {
   coalesce(&left, {right});
@@ -401,15 +474,11 @@ Value::Ranges& operator+=(Value::Ranges& left, const Value::Ranges& right)
 }
 
 
-Value::Ranges& operator-=(Value::Ranges& _left, const Value::Ranges& _right)
+Value::Ranges& operator-=(Value::Ranges& left, const Value::Ranges& right)
 {
-  IntervalSet<uint64_t> left, right;
+  left = internal::subtract(left, right);
 
-  left = rangesToIntervalSet(_left);
-  right = rangesToIntervalSet(_right);
-  _left = intervalSetToRanges(left - right);
-
-  return _left;
+  return left;
 }
 
 
@@ -609,12 +678,11 @@ Try<Value> parse(const string& text)
       for (size_t i = 0; i < tokens.size(); i += 2) {
         Value::Range* range = ranges->add_range();
 
-        int j = i;
-        Try<uint64_t> begin = numify<uint64_t>(tokens[j++]);
-        Try<uint64_t> end = numify<uint64_t>(tokens[j++]);
+        Try<uint64_t> begin = numify<uint64_t>(tokens[i]);
+        Try<uint64_t> end = numify<uint64_t>(tokens[i + 1]);
         if (begin.isError() || end.isError()) {
           return Error(
-              "Expecting non-negative integers in '" + tokens[j - 1] + "'");
+              "Expecting non-negative integers in '" + tokens[i] + "'");
         }
 
         range->set_begin(begin.get());
@@ -661,5 +729,4 @@ Try<Value> parse(const string& text)
 
 } // namespace values {
 } // namespace internal {
-
 } // namespace mesos {

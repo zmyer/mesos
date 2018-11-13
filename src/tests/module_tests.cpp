@@ -87,7 +87,7 @@ protected:
 
   // During the per-test tear-down, we unload the module to allow
   // later loads to succeed.
-  ~ModuleTest()
+  ~ModuleTest() override
   {
     // The TestModule instance is created by calling new. Let's
     // delete it to avoid memory leaks.
@@ -178,7 +178,7 @@ Try<Modules> getModulesFromJson(
 }
 
 
-// Test that a module library gets loaded,  and its contents
+// Test that a module library gets loaded, and its contents
 // version-verified. The provided test library matches the current
 // Mesos version exactly.
 TEST_F(ModuleTest, ExampleModuleLoadTest)

@@ -15,14 +15,16 @@
 // limitations under the License.
 
 #include <iostream>
-#include <string>
 #include <queue>
+#include <string>
 
 #include <boost/lexical_cast.hpp>
 
 #include <mesos/v1/mesos.hpp>
 #include <mesos/v1/resources.hpp>
 #include <mesos/v1/scheduler.hpp>
+
+#include <mesos/authorizer/acls.hpp>
 
 #include <process/delay.hpp>
 #include <process/owned.hpp>
@@ -39,13 +41,16 @@
 #include <stout/numify.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
-#include <stout/option.hpp>
 #include <stout/path.hpp>
+#include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
+
+#include <stout/os/realpath.hpp>
 
 #include "common/status_utils.hpp"
 
-#include "logging/flags.hpp"
+#include "examples/flags.hpp"
+
 #include "logging/logging.hpp"
 
 using namespace mesos::v1;
@@ -65,33 +70,29 @@ using mesos::v1::scheduler::Event;
 const int32_t CPUS_PER_TASK = 1;
 const int32_t MEM_PER_TASK = 128;
 
+constexpr char EXECUTOR_BINARY[] = "test-http-executor";
+constexpr char EXECUTOR_NAME[] = "Test Executor (C++)";
+constexpr char FRAMEWORK_NAME[] = "Event Call Scheduler using libprocess (C++)";
+
+
 class HTTPScheduler : public process::Process<HTTPScheduler>
 {
 public:
   HTTPScheduler(const FrameworkInfo& _framework,
                 const ExecutorInfo& _executor,
-                const string& _master)
-    : framework(_framework),
-      executor(_executor),
-      master(_master),
-      state(INITIALIZING),
-      tasksLaunched(0),
-      tasksFinished(0),
-      totalTasks(5) {}
-
-  HTTPScheduler(const FrameworkInfo& _framework,
-                const ExecutorInfo& _executor,
                 const string& _master,
-                const Credential& credential)
+                const Option<Credential>& _credential)
     : framework(_framework),
+      role(_framework.roles(0)),
       executor(_executor),
       master(_master),
+      credential(_credential),
       state(INITIALIZING),
       tasksLaunched(0),
       tasksFinished(0),
       totalTasks(5) {}
 
-  ~HTTPScheduler() {}
+  ~HTTPScheduler() override {}
 
   void connected()
   {
@@ -149,6 +150,10 @@ public:
           break;
         }
 
+        // TODO(greggomann): Implement handling of operation status updates.
+        case Event::UPDATE_OPERATION_STATUS:
+          break;
+
         case Event::MESSAGE: {
           cout << endl << "Received a MESSAGE event" << endl;
           break;
@@ -201,37 +206,38 @@ public:
   }
 
 protected:
-virtual void initialize()
-{
-  // We initialize the library here to ensure that callbacks are only invoked
-  // after the process has spawned.
-  mesos.reset(new scheduler::Mesos(
-      master,
-      mesos::ContentType::PROTOBUF,
-      process::defer(self(), &Self::connected),
-      process::defer(self(), &Self::disconnected),
-      process::defer(self(), &Self::received, lambda::_1),
-      None()));
-}
+  void initialize() override
+  {
+    // We initialize the library here to ensure that callbacks are only invoked
+    // after the process has spawned.
+    mesos.reset(
+        new scheduler::Mesos(
+            master,
+            mesos::ContentType::PROTOBUF,
+            process::defer(self(), &Self::connected),
+            process::defer(self(), &Self::disconnected),
+            process::defer(self(), &Self::received, lambda::_1),
+            credential));
+  }
 
 private:
   void resourceOffers(const vector<Offer>& offers)
   {
     foreach (const Offer& offer, offers) {
       cout << "Received offer " << offer.id() << " with "
-           << Resources(offer.resources())
-           << endl;
+           << Resources(offer.resources()) << endl;
 
-      static const Resources TASK_RESOURCES = Resources::parse(
+      Resources taskResources = Resources::parse(
           "cpus:" + stringify(CPUS_PER_TASK) +
           ";mem:" + stringify(MEM_PER_TASK)).get();
+      taskResources.allocate(role);
 
       Resources remaining = offer.resources();
 
       // Launch tasks.
       vector<TaskInfo> tasks;
       while (tasksLaunched < totalTasks &&
-             remaining.flatten().contains(TASK_RESOURCES)) {
+             remaining.toUnreserved().contains(taskResources)) {
         int taskId = tasksLaunched++;
 
         cout << "Launching task " << taskId << " using offer "
@@ -239,14 +245,21 @@ private:
 
         TaskInfo task;
         task.set_name("Task " + lexical_cast<string>(taskId));
-        task.mutable_task_id()->set_value(
-            lexical_cast<string>(taskId));
+        task.mutable_task_id()->set_value(lexical_cast<string>(taskId));
         task.mutable_agent_id()->MergeFrom(offer.agent_id());
         task.mutable_executor()->MergeFrom(executor);
 
-        Try<Resources> flattened = TASK_RESOURCES.flatten(framework.role());
-        CHECK_SOME(flattened);
-        Option<Resources> resources = remaining.find(flattened.get());
+        Option<Resources> resources = [&]() {
+          if (role == "*") {
+            return remaining.find(taskResources);
+          } else {
+            Resource::ReservationInfo reservation;
+            reservation.set_type(Resource::ReservationInfo::STATIC);
+            reservation.set_role(role);
+
+            return remaining.find(taskResources.pushReservation(reservation));
+          }
+        }();
 
         CHECK_SOME(resources);
 
@@ -335,12 +348,10 @@ private:
 
     mesos->send(call);
 
-    process::delay(Seconds(1),
-                   self(),
-                   &Self::doReliableRegistration);
+    process::delay(Seconds(1), self(), &Self::doReliableRegistration);
   }
 
-  void finalize()
+  void finalize() override
   {
     Call call;
     CHECK(framework.has_id());
@@ -351,8 +362,10 @@ private:
   }
 
   FrameworkInfo framework;
+  const string role;
   const ExecutorInfo executor;
   const string master;
+  const Option<Credential> credential;
   process::Owned<scheduler::Mesos> mesos;
 
   enum State
@@ -377,18 +390,7 @@ void usage(const char* argv0, const flags::FlagsBase& flags)
 }
 
 
-class Flags : public virtual mesos::internal::logging::Flags
-{
-public:
-  Flags()
-  {
-    add(&Flags::role, "role", "Role to use when registering", "*");
-    add(&Flags::master, "master", "ip:port of master to connect");
-  }
-
-  string role;
-  Option<string> master;
-};
+class Flags : public virtual mesos::internal::examples::Flags {};
 
 
 int main(int argc, char** argv)
@@ -397,66 +399,85 @@ int main(int argc, char** argv)
   string uri;
   Option<string> value = os::getenv("MESOS_HELPER_DIR");
   if (value.isSome()) {
-    uri = path::join(value.get(), "test-http-executor");
+    uri = path::join(value.get(), EXECUTOR_BINARY);
   } else {
-    uri = path::join(
-        os::realpath(Path(argv[0]).dirname()).get(),
-        "test-http-executor");
+    uri =
+      path::join(os::realpath(Path(argv[0]).dirname()).get(), EXECUTOR_BINARY);
   }
 
   Flags flags;
 
-  Try<flags::Warnings> load = flags.load(None(), argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_EXAMPLE_", argc, argv);
 
-  if (load.isError()) {
-    cerr << load.error() << endl;
-    usage(argv[0], flags);
-    EXIT(EXIT_FAILURE);
-  } else if (flags.master.isNone()) {
-    cerr << "Missing --master" << endl;
-    usage(argv[0], flags);
-    EXIT(EXIT_FAILURE);
+  if (flags.help) {
+    cout << flags.usage() << endl;
+    return EXIT_SUCCESS;
   }
 
-  process::initialize();
-  mesos::internal::logging::initialize(argv[0], flags, true); // Catch signals.
+  if (load.isError()) {
+    cerr << flags.usage(load.error()) << endl;
+    return EXIT_FAILURE;
+  }
 
-  // Log any flag warnings (after logging is initialized).
+  mesos::internal::logging::initialize(argv[0], true, flags); // Catch signals.
+
+  // Log any flag warnings.
   foreach (const flags::Warning& warning, load->warnings) {
     LOG(WARNING) << warning.message;
   }
 
   FrameworkInfo framework;
-  framework.set_name("Event Call Scheduler using libprocess (C++)");
-  framework.set_role(flags.role);
+  framework.set_principal(flags.principal);
+  framework.set_name(FRAMEWORK_NAME);
+  framework.set_checkpoint(flags.checkpoint);
+  framework.add_roles(flags.role);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::MULTI_ROLE);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
 
   const Result<string> user = os::user();
 
   CHECK_SOME(user);
   framework.set_user(user.get());
 
-  value = os::getenv("MESOS_CHECKPOINT");
-  if (value.isSome()) {
-    framework.set_checkpoint(
-        numify<bool>(value.get()).get());
-  }
-
   ExecutorInfo executor;
   executor.mutable_executor_id()->set_value("default");
   executor.mutable_command()->set_value(uri);
-  executor.set_name("Test Executor (C++)");
-  executor.set_source("cpp_test");
+  executor.set_name(EXECUTOR_NAME);
 
-  value = os::getenv("DEFAULT_PRINCIPAL");
-  if (value.isNone()) {
-    EXIT(EXIT_FAILURE)
-      << "Expecting authentication principal in the environment";
+  Option<Credential> credential = None();
+
+  if (flags.authenticate) {
+    LOG(INFO) << "Enabling authentication for the framework";
+
+    Credential credential_;
+    credential_.set_principal(flags.principal);
+    if (flags.secret.isSome()) {
+      credential_.set_secret(flags.secret.get());
+    }
+    credential = credential_;
   }
 
-  framework.set_principal(value.get());
+  if (flags.master == "local") {
+    // Configure master.
+    os::setenv("MESOS_ROLES", flags.role);
+
+    os::setenv(
+        "MESOS_AUTHENTICATE_HTTP_FRAMEWORKS",
+        stringify(flags.authenticate));
+
+    os::setenv("MESOS_HTTP_FRAMEWORK_AUTHENTICATORS", "basic");
+
+    mesos::ACLs acls;
+    mesos::ACL::RegisterFramework* acl = acls.add_register_frameworks();
+    acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+    acl->mutable_roles()->add_values("*");
+    os::setenv("MESOS_ACLS", stringify(JSON::protobuf(acls)));
+  }
 
   process::Owned<HTTPScheduler> scheduler(
-      new HTTPScheduler(framework, executor, flags.master.get()));
+      new HTTPScheduler(framework, executor, flags.master, credential));
 
   process::spawn(scheduler.get());
   process::wait(scheduler.get());

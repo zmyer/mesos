@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <array>
+
 #include <process/future.hpp>
 #include <process/io.hpp>
 #include <process/owned.hpp>
@@ -21,6 +23,8 @@
 #include <stout/abort.hpp>
 #include <stout/os.hpp>
 #include <stout/try.hpp>
+
+#include "logging/logging.hpp"
 
 #include "slave/containerizer/mesos/io/switchboard.hpp"
 
@@ -38,8 +42,7 @@ using process::Owned;
 // support to defer a signal handler to a thread, but we currently
 // don't expose this through libprocess. Once we do expose this, we
 // should change this logic to use it.
-int unblockFds[2];
-
+std::array<int_fd, 2> unblockFds;
 
 static void sigtermHandler(int sig)
 {
@@ -62,9 +65,18 @@ int main(int argc, char** argv)
 
   // Load and validate flags from the environment and command line.
   Try<flags::Warnings> load = flags.load(None(), &argc, &argv);
-  if (load.isError()) {
-    EXIT(EXIT_FAILURE) << flags.usage(load.error());
+
+  if (flags.help) {
+    std::cout << flags.usage() << std::endl;
+    return EXIT_SUCCESS;
   }
+
+  if (load.isError()) {
+    std::cerr << flags.usage(load.error()) << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  mesos::internal::logging::initialize(argv[0], false);
 
   // Verify non-optional flags have valid values.
   if (flags.stdin_to_fd.isNone()) {
@@ -91,11 +103,13 @@ int main(int argc, char** argv)
     EXIT(EXIT_FAILURE) << flags.usage("'--socket_path' is missing");
   }
 
-  Try<Nothing> pipe = os::pipe(unblockFds);
+  Try<std::array<int_fd, 2>> pipe = os::pipe();
   if (pipe.isError()) {
     EXIT(EXIT_FAILURE) << "Failed to create pipe for signaling unblock:"
                        << " " + pipe.error();
   }
+
+  unblockFds = pipe.get();
 
   if (os::signals::install(SIGTERM, sigtermHandler) != 0) {
     EXIT(EXIT_FAILURE) << "Failed to register signal"
@@ -134,6 +148,8 @@ int main(int argc, char** argv)
 
   Future<Nothing> run = server.get()->run();
   run.await();
+
+  server->reset();
 
   if (!run.isReady()) {
     EXIT(EXIT_FAILURE) << "The io switchboard server failed: "

@@ -12,6 +12,11 @@
 
 #include <signal.h>
 
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
 #include <glog/logging.h>
 #include <glog/raw_logging.h>
 
@@ -23,25 +28,74 @@
 #include <process/gtest.hpp>
 #include <process/process.hpp>
 
-#ifndef __WINDOWS__
+#include <stout/duration.hpp>
+#include <stout/exit.hpp>
+#include <stout/flags.hpp>
+
 #include <stout/os/signals.hpp>
-#endif // __WINDOWS__
 
+#include <stout/tests/environment.hpp>
 
-// NOTE: We use RAW_LOG instead of LOG because RAW_LOG doesn't
-// allocate any memory or grab locks. And according to
-// https://code.google.com/p/google-glog/issues/detail?id=161
-// it should work in 'most' cases in signal handlers.
-inline void handler(int signal)
+using std::cerr;
+using std::cout;
+using std::endl;
+using std::make_shared;
+using std::shared_ptr;
+using std::string;
+using std::vector;
+
+using stout::internal::tests::Environment;
+using stout::internal::tests::TestFilter;
+
+using std::shared_ptr;
+using std::vector;
+
+namespace {
+
+class Flags : public virtual flags::FlagsBase
 {
-  RAW_LOG(FATAL, "Unexpected signal in signal handler: %d", signal);
-}
+public:
+  Flags()
+  {
+    add(&Flags::test_await_timeout,
+        "test_await_timeout",
+        "The default timeout for awaiting test events.",
+        process::TEST_AWAIT_TIMEOUT);
+  }
+
+  Duration test_await_timeout;
+};
+
+} // namespace {
 
 
 int main(int argc, char** argv)
 {
+  Flags flags;
+
+  // Load flags from environment and command line but allow unknown
+  // flags (since we might have gtest/gmock flags as well).
+  Try<flags::Warnings> load = flags.load("LIBPROCESS_", argc, argv, true);
+
+  if (flags.help) {
+    cout << flags.usage() << endl;
+    testing::InitGoogleMock(&argc, argv); // Get usage from gtest too.
+    return EXIT_SUCCESS;
+  }
+
+  if (load.isError()) {
+    cerr << flags.usage(load.error()) << endl;
+    return EXIT_FAILURE;
+  }
+
+  process::TEST_AWAIT_TIMEOUT = flags.test_await_timeout;
+
   // Initialize Google Mock/Test.
   testing::InitGoogleMock(&argc, argv);
+
+#if !GTEST_IS_THREADSAFE
+  EXIT(EXIT_FAILURE) << "Testing environment is not thread safe, bailing!";
+#endif // !GTEST_IS_THREADSAFE
 
   // Initialize libprocess.
   process::initialize(
@@ -60,6 +114,10 @@ int main(int argc, char** argv)
   // results in a stack trace otherwise.
   os::signals::reset(SIGTERM);
 #endif // __WINDOWS__
+
+  vector<shared_ptr<TestFilter>> filters = {};
+  Environment* environment = new Environment(filters);
+  testing::AddGlobalTestEnvironment(environment);
 
   // Add the libprocess test event listeners.
   ::testing::TestEventListeners& listeners =

@@ -18,17 +18,28 @@
 
 #include <gmock/gmock.h>
 
+// This header include must be enclosed in an `extern "C"` block to
+// workaround a bug in glibc <= 2.12 (see MESOS-7378).
+//
+// TODO(neilc): Remove this when we no longer support glibc <= 2.12.
+extern "C" {
+#include <sys/sysmacros.h>
+}
+
 #include <stout/foreach.hpp>
 #include <stout/gtest.hpp>
 #include <stout/hashset.hpp>
 #include <stout/none.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
+#include <stout/path.hpp>
 #include <stout/try.hpp>
 
 #include <stout/tests/utils.hpp>
 
 #include "linux/fs.hpp"
+
+#include "tests/environment.hpp"
 
 using std::set;
 using std::string;
@@ -72,7 +83,7 @@ TEST_F(FsTest, MountTableRead)
 
   Option<MountTable::Entry> root = None();
   Option<MountTable::Entry> proc = None();
-  foreach (const MountTable::Entry& entry, table.get().entries) {
+  foreach (const MountTable::Entry& entry, table->entries) {
     if (entry.dir == "/") {
       root = entry;
     } else if (entry.dir == "/proc") {
@@ -82,7 +93,7 @@ TEST_F(FsTest, MountTableRead)
 
   EXPECT_SOME(root);
   ASSERT_SOME(proc);
-  EXPECT_EQ("proc", proc.get().type);
+  EXPECT_EQ("proc", proc->type);
 }
 
 
@@ -93,14 +104,14 @@ TEST_F(FsTest, MountTableHasOption)
   ASSERT_SOME(table);
 
   Option<MountTable::Entry> proc = None();
-  foreach (const MountTable::Entry& entry, table.get().entries) {
+  foreach (const MountTable::Entry& entry, table->entries) {
     if (entry.dir == "/proc") {
       proc = entry;
     }
   }
 
   ASSERT_SOME(proc);
-  EXPECT_TRUE(proc.get().hasOption(MNTOPT_RW));
+  EXPECT_TRUE(proc->hasOption(MNTOPT_RW));
 }
 
 
@@ -112,16 +123,16 @@ TEST_F(FsTest, MountInfoTableParse)
   Try<MountInfoTable::Entry> entry = MountInfoTable::Entry::parse(privateMount);
 
   ASSERT_SOME(entry);
-  EXPECT_EQ(19, entry.get().id);
-  EXPECT_EQ(1, entry.get().parent);
-  EXPECT_EQ(makedev(8, 1), entry.get().devno);
-  EXPECT_EQ("/", entry.get().root);
-  EXPECT_EQ("/", entry.get().target);
-  EXPECT_EQ("rw,relatime", entry.get().vfsOptions);
-  EXPECT_EQ("rw,seclabel,data=ordered", entry.get().fsOptions);
-  EXPECT_EQ("", entry.get().optionalFields);
-  EXPECT_EQ("ext4", entry.get().type);
-  EXPECT_EQ("/dev/sda1", entry.get().source);
+  EXPECT_EQ(19, entry->id);
+  EXPECT_EQ(1, entry->parent);
+  EXPECT_EQ(makedev(8, 1), entry->devno);
+  EXPECT_EQ("/", entry->root);
+  EXPECT_EQ("/", entry->target);
+  EXPECT_EQ("rw,relatime", entry->vfsOptions);
+  EXPECT_EQ("rw,seclabel,data=ordered", entry->fsOptions);
+  EXPECT_EQ("", entry->optionalFields);
+  EXPECT_EQ("ext4", entry->type);
+  EXPECT_EQ("/dev/sda1", entry->source);
 
   // Parse a shared mount (includes one optional field).
   const string sharedMount =
@@ -129,19 +140,20 @@ TEST_F(FsTest, MountInfoTableParse)
   entry = MountInfoTable::Entry::parse(sharedMount);
 
   ASSERT_SOME(entry);
-  EXPECT_EQ(19, entry.get().id);
-  EXPECT_EQ(1, entry.get().parent);
-  EXPECT_EQ(makedev(8, 1), entry.get().devno);
-  EXPECT_EQ("/", entry.get().root);
-  EXPECT_EQ("/", entry.get().target);
-  EXPECT_EQ("rw,relatime", entry.get().vfsOptions);
-  EXPECT_EQ("rw,seclabel", entry.get().fsOptions);
-  EXPECT_EQ("shared:2", entry.get().optionalFields);
-  EXPECT_EQ("ext4", entry.get().type);
-  EXPECT_EQ("/dev/sda1", entry.get().source);
+  EXPECT_EQ(19, entry->id);
+  EXPECT_EQ(1, entry->parent);
+  EXPECT_EQ(makedev(8, 1), entry->devno);
+  EXPECT_EQ("/", entry->root);
+  EXPECT_EQ("/", entry->target);
+  EXPECT_EQ("rw,relatime", entry->vfsOptions);
+  EXPECT_EQ("rw,seclabel", entry->fsOptions);
+  EXPECT_EQ("shared:2", entry->optionalFields);
+  EXPECT_EQ("ext4", entry->type);
+  EXPECT_EQ("/dev/sda1", entry->source);
 }
 
 
+// TODO(alexr): Enable after MESOS-8709 is resolved.
 TEST_F(FsTest, DISABLED_MountInfoTableRead)
 {
   // Examine the calling process's mountinfo table.
@@ -150,7 +162,7 @@ TEST_F(FsTest, DISABLED_MountInfoTableRead)
 
   // Every system should have at least a rootfs mounted.
   Option<MountInfoTable::Entry> root = None();
-  foreach (const MountInfoTable::Entry& entry, table.get().entries) {
+  foreach (const MountInfoTable::Entry& entry, table->entries) {
     if (entry.target == "/") {
       root = entry;
     }
@@ -164,7 +176,7 @@ TEST_F(FsTest, DISABLED_MountInfoTableRead)
 
   // Every system should have at least a rootfs mounted.
   root = None();
-  foreach (const MountInfoTable::Entry& entry, table.get().entries) {
+  foreach (const MountInfoTable::Entry& entry, table->entries) {
     if (entry.target == "/") {
       root = entry;
     }
@@ -229,6 +241,27 @@ TEST_F(FsTest, MountInfoTableReadSortedParentOfSelf)
 }
 
 
+TEST_F(FsTest, ROOT_ReadOnlyMount)
+{
+  string directory = os::getcwd();
+
+  string ro = path::join(directory, "ro");
+  string rw = path::join(directory, "rw");
+
+  ASSERT_SOME(os::mkdir(ro));
+  ASSERT_SOME(os::mkdir(rw));
+
+  ASSERT_SOME(fs::mount(rw, ro, None(), MS_BIND | MS_RDONLY, None()));
+
+  EXPECT_ERROR(os::touch(path::join(ro, "touched")));
+  EXPECT_SOME(os::touch(path::join(rw, "touched")));
+
+  EXPECT_SOME(fs::unmount(ro));
+
+  EXPECT_SOME(os::touch(path::join(ro, "touched")));
+}
+
+
 TEST_F(FsTest, ROOT_SharedMount)
 {
   string directory = os::getcwd();
@@ -244,14 +277,14 @@ TEST_F(FsTest, ROOT_SharedMount)
   ASSERT_SOME(table);
 
   Option<MountInfoTable::Entry> entry;
-  foreach (const MountInfoTable::Entry& _entry, table.get().entries) {
+  foreach (const MountInfoTable::Entry& _entry, table->entries) {
     if (_entry.target == directory) {
       entry = _entry;
     }
   }
 
   ASSERT_SOME(entry);
-  EXPECT_SOME(entry.get().shared());
+  EXPECT_SOME(entry->shared());
 
   // Clean up the mount.
   EXPECT_SOME(fs::unmount(directory));
@@ -288,7 +321,7 @@ TEST_F(FsTest, ROOT_SlaveMount)
 
   Option<MountInfoTable::Entry> parent;
   Option<MountInfoTable::Entry> child;
-  foreach (const MountInfoTable::Entry& entry, table.get().entries) {
+  foreach (const MountInfoTable::Entry& entry, table->entries) {
     if (entry.target == directory) {
       ASSERT_NONE(parent);
       parent = entry;
@@ -301,13 +334,66 @@ TEST_F(FsTest, ROOT_SlaveMount)
   ASSERT_SOME(parent);
   ASSERT_SOME(child);
 
-  EXPECT_SOME(parent.get().shared());
-  EXPECT_SOME(child.get().master());
-  EXPECT_EQ(child.get().master(), parent.get().shared());
+  EXPECT_SOME(parent->shared());
+  EXPECT_SOME(child->master());
+  EXPECT_EQ(child->master(), parent->shared());
 
   // Clean up the mount.
   EXPECT_SOME(fs::unmount(target));
   EXPECT_SOME(fs::unmount(directory));
+}
+
+
+TEST_F(FsTest, ROOT_FindTargetInMountInfoTable)
+{
+  Try<string> base = environment->mkdtemp();
+  ASSERT_SOME(base);
+
+  const string sourceDir = path::join(base.get(), "sourceDir");
+  const string targetDir = path::join(base.get(), "targetDir");
+  const string sourceFile = path::join(base.get(), "sourceFile");
+  const string targetFile = path::join(base.get(), "targetFile");
+
+  // `targetDirUnrelated` is a prefix of `targetDir`, but under the
+  // same base directory.
+  const string sourceDirUnrelated = path::join(base.get(), "source");
+  const string targetDirUnrelated = path::join(base.get(), "target");
+
+  const string file = path::join(targetDir, "file");
+
+  ASSERT_SOME(os::mkdir(sourceDir));
+  ASSERT_SOME(os::mkdir(targetDir));
+  ASSERT_SOME(os::touch(sourceFile));
+  ASSERT_SOME(os::touch(targetFile));
+  ASSERT_SOME(os::mkdir(sourceDirUnrelated));
+  ASSERT_SOME(os::mkdir(targetDirUnrelated));
+
+  ASSERT_SOME(fs::mount(sourceDir, targetDir, None(), MS_BIND, None()));
+  ASSERT_SOME(fs::mount(sourceFile, targetFile, None(), MS_BIND, None()));
+
+  ASSERT_SOME(fs::mount(
+      sourceDirUnrelated,
+      targetDirUnrelated,
+      None(),
+      MS_BIND,
+      None()));
+
+  ASSERT_SOME(os::touch(file));
+
+  Try<MountInfoTable> table = MountInfoTable::read();
+  ASSERT_SOME(table);
+
+  Try<MountInfoTable::Entry> entry = table->findByTarget(targetDir);
+  ASSERT_SOME(entry);
+  EXPECT_EQ(entry->target, targetDir);
+
+  entry = table->findByTarget(file);
+  ASSERT_SOME(entry);
+  EXPECT_EQ(entry->target, targetDir);
+
+  entry = table->findByTarget(targetFile);
+  ASSERT_SOME(entry);
+  EXPECT_EQ(entry->target, targetFile);
 }
 
 } // namespace tests {

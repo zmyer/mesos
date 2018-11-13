@@ -206,7 +206,9 @@ Accept: application/json
     "value": "9aaa9d0d-e00d-444f-bfbd-23dd197939a0-0000"
   },
   "type": "MESSAGE",
-  "data": "t+Wonz5fRFKMzCnEptlv5A=="
+  "message": {
+    "data": "t+Wonz5fRFKMzCnEptlv5A=="
+  }
 }
 
 MESSAGE Response:
@@ -279,7 +281,7 @@ LAUNCH_GROUP Event (JSON)
   "launch_group": {
     "task_group" : {
       "tasks" : [
-        "task": {
+        {
           "name": "dummy-task",
           "task_id": {
             "value": "d40f3f3e-bbe3-44af-a230-4cb1eae72f67"
@@ -389,6 +391,7 @@ The following environment variables are set by the agent that can be used by the
 * `MESOS_AGENT_ENDPOINT`: Agent endpoint (i.e., ip:port to be used by the executor to connect to the agent).
 * `MESOS_CHECKPOINT`: If set to true, denotes that framework has checkpointing enabled.
 * `MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD`: Amount of time the agent would wait for an executor to shut down (e.g., 60secs, 3mins etc.) after sending a `SHUTDOWN` event.
+* `MESOS_EXECUTOR_AUTHENTICATION_TOKEN`: The token the executor should use to authenticate with the agent. When executor authentication is enabled, the agent generates a JSON web token (JWT) that the executor can use to authenticate with the agent's default JWT authenticator.
 
 If `MESOS_CHECKPOINT` is set (i.e., if framework checkpointing is enabled), the following additional variables are also set that can be used by the executor for retrying upon a disconnection with the agent:
 
@@ -411,7 +414,7 @@ Upon detecting a disconnection from the agent, the retry behavior depends on whe
 
 Upon agent startup, an agent performs [recovery](agent-recovery.md). This allows the agent to recover status updates and reconnect with old executors. Currently, the agent supports the following recovery mechanisms specified via the `--recover` flag:
 
-* **reconnect** (default): This mode allows the agent to reconnect with any of it’s old live executors provided the framework has enabled checkpointing. The recovery of the agent is only marked complete once all the disconnected executors have connected and hung executors have been destroyed. Hence, it is mandatory that every executor retries at least once within the interval (`MESOS_SUBSCRIPTION_BACKOFF_MAX`) to ensure it is not shutdown by the agent due to being hung/unresponsive.
+* **reconnect** (default): This mode allows the agent to reconnect with any of it's old live executors provided the framework has enabled checkpointing. The recovery of the agent is only marked complete once all the disconnected executors have connected and hung executors have been destroyed. Hence, it is mandatory that every executor retries at least once within the interval (`MESOS_SUBSCRIPTION_BACKOFF_MAX`) to ensure it is not shutdown by the agent due to being hung/unresponsive.
 * **cleanup**: This mode kills any old live executors and then exits the agent. This is usually done by operators when making a non-compatible agent/executor upgrade. Upon receiving a `SUBSCRIBE` request from the executor of a framework with checkpointing enabled, the agent would send it a `SHUTDOWN` event as soon as it reconnects. For hung executors, the agent would wait for a duration of `--executor_shutdown_grace_period` (configurable at agent startup) and then forcefully kill the container where the executor is running in.
 
 <a name="backoff-strategies"></a>

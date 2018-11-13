@@ -14,6 +14,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 #include <stout/base64.hpp>
 #include <stout/duration.hpp>
@@ -29,8 +30,9 @@
 #include <process/time.hpp>
 
 #include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
 #include <process/metrics/metrics.hpp>
+#include <process/metrics/pull_gauge.hpp>
+#include <process/metrics/push_gauge.hpp>
 #include <process/metrics/timer.hpp>
 
 namespace authentication = process::http::authentication;
@@ -46,7 +48,8 @@ using http::Response;
 using http::Unauthorized;
 
 using metrics::Counter;
-using metrics::Gauge;
+using metrics::PullGauge;
+using metrics::PushGauge;
 using metrics::Timer;
 
 using process::Clock;
@@ -54,14 +57,16 @@ using process::Failure;
 using process::Future;
 using process::PID;
 using process::Process;
+using process::Promise;
 using process::READONLY_HTTP_AUTHENTICATION_REALM;
 using process::Statistics;
 using process::UPID;
 
 using std::map;
 using std::string;
+using std::vector;
 
-class GaugeProcess : public Process<GaugeProcess>
+class PullGaugeProcess : public Process<PullGaugeProcess>
 {
 public:
   double get()
@@ -76,8 +81,12 @@ public:
 
   Future<double> pending()
   {
-    return Future<double>();
+    return promise.future();
   }
+
+  // Need to use a promise for the call to pending instead of just a
+  // `Future<double>()` so we don't return an abandoned future.
+  Promise<double> promise;
 };
 
 
@@ -94,7 +103,7 @@ protected:
     return authentication::setAuthenticator(realm, authenticator);
   }
 
-  virtual void TearDown()
+  void TearDown() override
   {
     foreach (const string& realm, realms) {
       // We need to wait in order to ensure that the operation
@@ -136,17 +145,14 @@ TEST_F(MetricsTest, Counter)
 }
 
 
-// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, Gauge)
+TEST_F(MetricsTest, PullGauge)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
-  GaugeProcess process;
-  PID<GaugeProcess> pid = spawn(&process);
+  PullGaugeProcess process;
+  PID<PullGaugeProcess> pid = spawn(&process);
   ASSERT_TRUE(pid);
 
-  // Gauge with a value.
-  Gauge gauge("test/gauge", defer(pid, &GaugeProcess::get));
+  // PullGauge with a value.
+  PullGauge gauge("test/gauge", defer(pid, &PullGaugeProcess::get));
 
   AWAIT_READY(metrics::add(gauge));
 
@@ -155,7 +161,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, Gauge)
   AWAIT_READY(metrics::remove(gauge));
 
   // Failing gauge.
-  gauge = Gauge("test/failedgauge", defer(pid, &GaugeProcess::fail));
+  gauge = PullGauge("test/failedgauge", defer(pid, &PullGaugeProcess::fail));
 
   AWAIT_READY(metrics::add(gauge));
 
@@ -165,6 +171,36 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, Gauge)
 
   terminate(process);
   wait(process);
+}
+
+
+TEST_F(MetricsTest, PushGauge)
+{
+  // Gauge with a value.
+  PushGauge gauge("test/gauge");
+
+  AWAIT_READY(metrics::add(gauge));
+
+  AWAIT_EXPECT_EQ(0.0, gauge.value());
+
+  ++gauge;
+  AWAIT_EXPECT_EQ(1.0, gauge.value());
+
+  gauge += 42;
+  AWAIT_EXPECT_EQ(43.0, gauge.value());
+
+  --gauge;
+  AWAIT_EXPECT_EQ(42.0, gauge.value());
+
+  gauge -= 42;
+  AWAIT_EXPECT_EQ(0.0, gauge.value());
+
+  gauge = 42;
+  AWAIT_EXPECT_EQ(42.0, gauge.value());
+
+  EXPECT_NONE(gauge.statistics());
+
+  AWAIT_READY(metrics::remove(gauge));
 }
 
 
@@ -186,42 +222,41 @@ TEST_F(MetricsTest, Statistics)
   Option<Statistics<double>> statistics = counter.statistics();
   EXPECT_SOME(statistics);
 
-  EXPECT_EQ(11u, statistics.get().count);
+  EXPECT_EQ(11u, statistics->count);
 
-  EXPECT_FLOAT_EQ(0.0, statistics.get().min);
-  EXPECT_FLOAT_EQ(10.0, statistics.get().max);
+  EXPECT_DOUBLE_EQ(0.0, statistics->min);
+  EXPECT_DOUBLE_EQ(10.0, statistics->max);
 
-  EXPECT_FLOAT_EQ(5.0, statistics.get().p50);
-  EXPECT_FLOAT_EQ(9.0, statistics.get().p90);
-  EXPECT_FLOAT_EQ(9.5, statistics.get().p95);
-  EXPECT_FLOAT_EQ(9.9, statistics.get().p99);
-  EXPECT_FLOAT_EQ(9.99, statistics.get().p999);
-  EXPECT_FLOAT_EQ(9.999, statistics.get().p9999);
+  EXPECT_DOUBLE_EQ(5.0, statistics->p50);
+  EXPECT_DOUBLE_EQ(9.0, statistics->p90);
+  EXPECT_DOUBLE_EQ(9.5, statistics->p95);
+  EXPECT_DOUBLE_EQ(9.9, statistics->p99);
+  EXPECT_DOUBLE_EQ(9.99, statistics->p999);
+  EXPECT_DOUBLE_EQ(9.999, statistics->p9999);
 
   AWAIT_READY(metrics::remove(counter));
 }
 
 
-// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, Snapshot)
+TEST_F(MetricsTest, THREADSAFE_Snapshot)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   UPID upid("metrics", process::address());
 
   Clock::pause();
 
-  // Add a gauge and a counter.
-  GaugeProcess process;
-  PID<GaugeProcess> pid = spawn(&process);
+  // Add a pull-gauge and a counter.
+  PullGaugeProcess process;
+  PID<PullGaugeProcess> pid = spawn(&process);
   ASSERT_TRUE(pid);
 
-  Gauge gauge("test/gauge", defer(pid, &GaugeProcess::get));
-  Gauge gaugeFail("test/gauge_fail", defer(pid, &GaugeProcess::fail));
+  PullGauge gauge("test/gauge", defer(pid, &PullGaugeProcess::get));
+  PullGauge gaugeFail("test/gauge_fail", defer(pid, &PullGaugeProcess::fail));
+  PullGauge gaugeConst("test/gauge_const", []() { return 99.0; });
   Counter counter("test/counter");
 
   AWAIT_READY(metrics::add(gauge));
   AWAIT_READY(metrics::add(gaugeFail));
+  AWAIT_READY(metrics::add(gaugeConst));
   AWAIT_READY(metrics::add(counter));
 
   // Advance the clock to avoid rate limit.
@@ -232,23 +267,27 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, Snapshot)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
   // Parse the response.
-  Try<JSON::Object> responseJSON =
-      JSON::parse<JSON::Object>(response.get().body);
+  Try<JSON::Object> responseJSON = JSON::parse<JSON::Object>(response->body);
   ASSERT_SOME(responseJSON);
 
-  map<string, JSON::Value> values = responseJSON.get().values;
+  map<string, JSON::Value> values = responseJSON->values;
 
   EXPECT_EQ(1u, values.count("test/counter"));
-  EXPECT_FLOAT_EQ(0.0, values["test/counter"].as<JSON::Number>().as<double>());
+  EXPECT_DOUBLE_EQ(0.0, values["test/counter"].as<JSON::Number>().as<double>());
 
   EXPECT_EQ(1u, values.count("test/gauge"));
-  EXPECT_FLOAT_EQ(42.0, values["test/gauge"].as<JSON::Number>().as<double>());
+  EXPECT_DOUBLE_EQ(42.0, values["test/gauge"].as<JSON::Number>().as<double>());
+
+  EXPECT_EQ(1u, values.count("test/gauge_const"));
+  EXPECT_DOUBLE_EQ(
+      99.0, values["test/gauge_const"].as<JSON::Number>().as<double>());
 
   EXPECT_EQ(0u, values.count("test/gauge_fail"));
 
   // Remove the metrics and ensure they are no longer in the snapshot.
   AWAIT_READY(metrics::remove(gauge));
   AWAIT_READY(metrics::remove(gaugeFail));
+  AWAIT_READY(metrics::remove(gaugeConst));
   AWAIT_READY(metrics::remove(counter));
 
   // Advance the clock to avoid rate limit.
@@ -262,24 +301,72 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, Snapshot)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
   // Parse the response.
-  responseJSON = JSON::parse<JSON::Object>(response.get().body);
+  responseJSON = JSON::parse<JSON::Object>(response->body);
   ASSERT_SOME(responseJSON);
 
-  values = responseJSON.get().values;
+  values = responseJSON->values;
   EXPECT_EQ(0u, values.count("test/counter"));
   EXPECT_EQ(0u, values.count("test/gauge"));
   EXPECT_EQ(0u, values.count("test/gauge_fail"));
+  EXPECT_EQ(0u, values.count("test/gauge_const"));
 
   terminate(process);
   wait(process);
 }
 
 
-// GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, SnapshotTimeout)
+// Ensure the response string has the JSON keys sorted
+// alphabetically, we do this for easier human consumption.
+TEST_F(MetricsTest, SnapshotAlphabetical)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
+  UPID upid("metrics", process::address());
 
+  Clock::pause();
+
+  vector<Counter> counters = {
+    Counter("test/f"),
+    Counter("test/e"),
+    Counter("test/d"),
+    Counter("test/c"),
+    Counter("test/b"),
+    Counter("test/a"),
+  };
+
+  foreach (const Counter& counter, counters) {
+    AWAIT_READY(metrics::add(counter));
+  }
+
+  // Advance the clock to avoid rate limit.
+  Clock::advance(Seconds(1));
+
+  // Get the snapshot.
+  Future<Response> response = http::get(upid, "snapshot");
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+  // Ensure the response is ordered alphabetically.
+  EXPECT_LT(response->body.find("test/e"),
+            response->body.find("test/f"));
+
+  EXPECT_LT(response->body.find("test/d"),
+            response->body.find("test/e"));
+
+  EXPECT_LT(response->body.find("test/c"),
+            response->body.find("test/d"));
+
+  EXPECT_LT(response->body.find("test/b"),
+            response->body.find("test/c"));
+
+  EXPECT_LT(response->body.find("test/a"),
+            response->body.find("test/b"));
+
+  foreach (const Counter& counter, counters) {
+    AWAIT_READY(metrics::remove(counter));
+  }
+}
+
+
+TEST_F(MetricsTest, THREADSAFE_SnapshotTimeout)
+{
   UPID upid("metrics", process::address());
 
   Clock::pause();
@@ -295,15 +382,22 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, SnapshotTimeout)
   // Advance the clock to avoid rate limit.
   Clock::advance(Seconds(1));
 
-  // Add gauges and a counter.
-  GaugeProcess process;
-  PID<GaugeProcess> pid = spawn(&process);
+  // Add pull-gauges and a counter.
+  PullGaugeProcess process;
+  PID<PullGaugeProcess> pid = spawn(&process);
   ASSERT_TRUE(pid);
 
-  Gauge gauge("test/gauge", defer(pid, &GaugeProcess::get));
-  Gauge gaugeFail("test/gauge_fail", defer(pid, &GaugeProcess::fail));
-  Gauge gaugeTimeout("test/gauge_timeout", defer(pid, &GaugeProcess::pending));
-  Counter counter("test/counter");
+  PullGauge gauge(
+      "test/gauge",
+      defer(pid, &PullGaugeProcess::get));
+  PullGauge gaugeFail(
+      "test/gauge_fail",
+      defer(pid, &PullGaugeProcess::fail));
+  PullGauge gaugeTimeout(
+      "test/gauge_timeout",
+      defer(pid, &PullGaugeProcess::pending));
+  Counter counter(
+      "test/counter");
 
   AWAIT_READY(metrics::add(gauge));
   AWAIT_READY(metrics::add(gaugeFail));
@@ -331,20 +425,19 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, SnapshotTimeout)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
   // Parse the response.
-  Try<JSON::Object> responseJSON =
-      JSON::parse<JSON::Object>(response.get().body);
+  Try<JSON::Object> responseJSON = JSON::parse<JSON::Object>(response->body);
   ASSERT_SOME(responseJSON);
 
   // We can't use simple JSON equality testing here as initializing
   // libprocess adds metrics to the system. We want to only check if
   // the metrics from this test are correctly handled.
-  map<string, JSON::Value> values = responseJSON.get().values;
+  map<string, JSON::Value> values = responseJSON->values;
 
   EXPECT_EQ(1u, values.count("test/counter"));
-  EXPECT_FLOAT_EQ(0.0, values["test/counter"].as<JSON::Number>().as<double>());
+  EXPECT_DOUBLE_EQ(0.0, values["test/counter"].as<JSON::Number>().as<double>());
 
   EXPECT_EQ(1u, values.count("test/gauge"));
-  EXPECT_FLOAT_EQ(42.0, values["test/gauge"].as<JSON::Number>().as<double>());
+  EXPECT_DOUBLE_EQ(42.0, values["test/gauge"].as<JSON::Number>().as<double>());
 
   EXPECT_EQ(0u, values.count("test/gauge_fail"));
   EXPECT_EQ(0u, values.count("test/gauge_timeout"));
@@ -366,10 +459,10 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, SnapshotTimeout)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
   // Parse the response.
-  responseJSON = JSON::parse<JSON::Object>(response.get().body);
+  responseJSON = JSON::parse<JSON::Object>(response->body);
   ASSERT_SOME(responseJSON);
 
-  values = responseJSON.get().values;
+  values = responseJSON->values;
 
   ASSERT_SOME(responseJSON);
   EXPECT_EQ(0u, values.count("test/counter"));
@@ -421,8 +514,7 @@ TEST_F(MetricsTest, SnapshotStatistics)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-  Try<JSON::Object> responseJSON =
-      JSON::parse<JSON::Object>(response.get().body);
+  Try<JSON::Object> responseJSON = JSON::parse<JSON::Object>(response->body);
 
   ASSERT_SOME(responseJSON);
 
@@ -430,7 +522,7 @@ TEST_F(MetricsTest, SnapshotStatistics)
   hashmap<string, double> responseValues;
   foreachpair (const string& key,
                const JSON::Value& value,
-               responseJSON.get().values) {
+               responseJSON->values) {
     if (value.is<JSON::Number>()) {
       // "test/counter/count" is an integer, everything else is a double.
       JSON::Number number = value.as<JSON::Number>();
@@ -441,7 +533,7 @@ TEST_F(MetricsTest, SnapshotStatistics)
   // Ensure the expected keys are in the response and that the values match
   // expectations.
   foreachkey (const string& key, expected) {
-    EXPECT_FLOAT_EQ(expected[key], responseValues[key]);
+    EXPECT_DOUBLE_EQ(expected[key], responseValues[key]);
   }
 
   AWAIT_READY(metrics::remove(counter));
@@ -466,7 +558,7 @@ TEST_F(MetricsTest, Timer)
 
   Future<double> value = timer.value();
   AWAIT_READY(value);
-  EXPECT_FLOAT_EQ(value.get(), Microseconds(1).ns());
+  EXPECT_DOUBLE_EQ(value.get(), static_cast<double>(Microseconds(1).ns()));
 
   // It is not an error to stop a timer that has already been stopped.
   timer.stop();
@@ -502,7 +594,7 @@ TEST_F(MetricsTest, AsyncTimer)
 
   // The future should have taken zero time.
   AWAIT_READY(t.value());
-  EXPECT_FLOAT_EQ(t.value().get(), 0.0);
+  EXPECT_DOUBLE_EQ(t.value().get(), 0.0);
 
   AWAIT_READY(metrics::remove(t));
 }
@@ -510,11 +602,8 @@ TEST_F(MetricsTest, AsyncTimer)
 
 // Tests that the `/metrics/snapshot` endpoint rejects unauthenticated requests
 // when HTTP authentication is enabled.
-// NOTE: GTEST_IS_THREADSAFE is not defined on Windows. See MESOS-5903.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(MetricsTest, SnapshotAuthenticationEnabled)
+TEST_F(MetricsTest, THREADSAFE_SnapshotAuthenticationEnabled)
 {
-  ASSERT_TRUE(GTEST_IS_THREADSAFE);
-
   process::Owned<Authenticator> authenticator(
     new BasicAuthenticator(
         READONLY_HTTP_AUTHENTICATION_REALM, {{"foo", "bar"}}));

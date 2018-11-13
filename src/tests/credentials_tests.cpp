@@ -18,6 +18,8 @@
 
 #include <gmock/gmock.h>
 
+#include <stout/uri.hpp>
+
 #include <process/gmock.hpp>
 #include <process/owned.hpp>
 #include <process/pid.hpp>
@@ -52,7 +54,7 @@ class CredentialsTest : public MesosTest {};
 
 // This test verifies that an authenticated slave is
 // granted registration by the master.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(CredentialsTest, AuthenticatedSlave)
+TEST_F(CredentialsTest, AuthenticatedSlave)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -65,18 +67,18 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(CredentialsTest, AuthenticatedSlave)
   ASSERT_SOME(slave);
 
   AWAIT_READY(slaveRegisteredMessage);
-  ASSERT_NE("", slaveRegisteredMessage.get().slave_id().value());
+  ASSERT_NE("", slaveRegisteredMessage->slave_id().value());
 }
 
 
 // Test verifing well executed credential authentication
 // using text formatted credentials so as to test
 // backwards compatibility.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(CredentialsTest, AuthenticatedSlaveText)
+TEST_F(CredentialsTest, AuthenticatedSlaveText)
 {
-  string path =  path::join(os::getcwd(), "credentials");
+  string path = path::join(os::getcwd(), "credentials");
 
-  Try<int> fd = os::open(
+  Try<int_fd> fd = os::open(
       path,
       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP);
@@ -91,7 +93,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(CredentialsTest, AuthenticatedSlaveText)
 
   ASSERT_SOME(os::close(fd.get()));
 
-  map<string, Option<string>> values{{"credentials", Some("file://" + path)}};
+  map<string, Option<string>> values{
+    {"credentials", Some(uri::from_path(path))}};
 
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.load(values, true);
@@ -110,17 +113,17 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(CredentialsTest, AuthenticatedSlaveText)
   ASSERT_SOME(slave);
 
   AWAIT_READY(slaveRegisteredMessage);
-  ASSERT_NE("", slaveRegisteredMessage.get().slave_id().value());
+  ASSERT_NE("", slaveRegisteredMessage->slave_id().value());
 }
 
 
 // Using JSON base file for authentication without
 // protobuf tools assistance.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(CredentialsTest, AuthenticatedSlaveJSON)
+TEST_F(CredentialsTest, AuthenticatedSlaveJSON)
 {
-  string path =  path::join(os::getcwd(), "credentials");
+  string path = path::join(os::getcwd(), "credentials");
 
-  Try<int> fd = os::open(
+  Try<int_fd> fd = os::open(
       path,
       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
       S_IRUSR | S_IWUSR | S_IRGRP);
@@ -144,7 +147,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(CredentialsTest, AuthenticatedSlaveJSON)
 
   ASSERT_SOME(os::close(fd.get()));
 
-  map<string, Option<string>> values{{"credentials", Some("file://" + path)}};
+  map<string, Option<string>> values{
+    {"credentials", Some(uri::from_path(path))}};
 
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.load(values, true);
@@ -163,7 +167,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(CredentialsTest, AuthenticatedSlaveJSON)
   ASSERT_SOME(slave);
 
   AWAIT_READY(slaveRegisteredMessage);
-  ASSERT_NE("", slaveRegisteredMessage.get().slave_id().value());
+  ASSERT_NE("", slaveRegisteredMessage->slave_id().value());
 }
 
 } // namespace tests {

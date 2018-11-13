@@ -30,8 +30,11 @@
 
 #include <gtest/gtest.h>
 
+#include <checks/checker_process.hpp>
+
 #include "docker/docker.hpp"
 
+#include <process/defer.hpp>
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
 #include <process/owned.hpp>
@@ -39,17 +42,20 @@
 #include <stout/check.hpp>
 #include <stout/error.hpp>
 #include <stout/exit.hpp>
+#include <stout/lambda.hpp>
 #include <stout/none.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
 #include <stout/result.hpp>
+#include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 
 #include <stout/os/exists.hpp>
 #include <stout/os/pstree.hpp>
 #include <stout/os/shell.hpp>
 #include <stout/os/temp.hpp>
+#include <stout/os/which.hpp>
 
 #ifdef __linux__
 #include "linux/cgroups.hpp"
@@ -57,7 +63,7 @@
 #include "linux/perf.hpp"
 #endif
 
-#ifdef WITH_NETWORK_ISOLATOR
+#ifdef ENABLE_PORT_MAPPING_ISOLATOR
 #include "linux/routing/utils.hpp"
 #endif
 
@@ -67,7 +73,7 @@
 #include "tests/flags.hpp"
 #include "tests/utils.hpp"
 
-#ifdef WITH_NETWORK_ISOLATOR
+#ifdef ENABLE_PORT_MAPPING_ISOLATOR
 using namespace routing;
 #endif
 
@@ -76,7 +82,12 @@ using std::set;
 using std::string;
 using std::vector;
 
+using process::Failure;
+using process::Future;
 using process::Owned;
+
+using stout::internal::tests::TestFilter;
+
 
 namespace mesos {
 namespace internal {
@@ -86,36 +97,10 @@ namespace tests {
 Environment* environment;
 
 
-class TestFilter
-{
-public:
-  TestFilter() {}
-  virtual ~TestFilter() {}
-
-  // Returns true iff the test should be disabled.
-  virtual bool disable(const ::testing::TestInfo* test) const = 0;
-
-  // Returns whether the test name / parameterization matches the
-  // pattern.
-  static bool matches(const ::testing::TestInfo* test, const string& pattern)
-  {
-    if (strings::contains(test->test_case_name(), pattern) ||
-        strings::contains(test->name(), pattern)) {
-      return true;
-    } else if (test->type_param() != nullptr &&
-               strings::contains(test->type_param(), pattern)) {
-      return true;
-    }
-
-    return false;
-  }
-};
-
-
 class BenchmarkFilter : public TestFilter
 {
 public:
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "BENCHMARK_") && !flags.benchmark;
   }
@@ -152,7 +137,7 @@ public:
       std::cerr
         << "-------------------------------------------------------------\n"
         << "The 'CFS_' tests cannot be run because:\n"
-        << cfsError.get().message << "\n"
+        << cfsError->message << "\n"
         << "-------------------------------------------------------------"
         << std::endl;
     }
@@ -163,7 +148,7 @@ public:
 #endif // __linux__
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "CFS_") && cfsError.isSome();
   }
@@ -191,7 +176,7 @@ public:
         << std::endl;
 
       error = hierarchies.error();
-    } else if (!hierarchies.get().empty()) {
+    } else if (!hierarchies->empty()) {
       std::cerr
         << "-------------------------------------------------------------\n"
         << "We cannot run any cgroups tests that require mounting\n"
@@ -206,7 +191,7 @@ public:
 #endif // __linux__
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     if (matches(test, "CGROUPS_") || matches(test, "Cgroups")) {
 #ifdef __linux__
@@ -238,7 +223,18 @@ class CurlFilter : public TestFilter
 public:
   CurlFilter()
   {
-    curlError = os::system("which curl") != 0;
+#ifndef __WINDOWS__
+    curlError = os::which("curl").isNone();
+#else
+    // NOTE: We cannot use `os::which` here because it specifically checks the
+    // `PATH` for `curl`, but on Windows, we rely on `curl` being placed by the
+    // build next to the other executables (e.g. `mesos-agent` and
+    // `mesos-tests`). When placed like this, `::CreateProcess` is guaranteed to
+    // find it, regardless of `PATH` (and likewise `os::which`). Because it is
+    // built and placed as a build dependency of `mesos-agent`, it will always
+    // be available for testing.
+    curlError = false;
+#endif // __WINDOWS__
     if (curlError) {
       std::cerr
         << "-------------------------------------------------------------\n"
@@ -248,7 +244,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "CURL_") && curlError;
   }
@@ -263,8 +259,8 @@ class NvidiaGpuFilter : public TestFilter
 public:
   NvidiaGpuFilter()
   {
-    exists = os::system("which nvidia-smi") == 0;
-    if (!exists) {
+    nvidiaGpuError = os::which("nvidia-smi").isNone();
+    if (nvidiaGpuError) {
       std::cerr
         << "-------------------------------------------------------------\n"
         << "No 'nvidia-smi' command found so no Nvidia GPU tests will run\n"
@@ -273,13 +269,13 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
-    return matches(test, "NVIDIA_GPU_") && !exists;
+    return matches(test, "NVIDIA_GPU_") && nvidiaGpuError;
   }
 
 private:
-  bool exists;
+  bool nvidiaGpuError;
 };
 
 
@@ -288,35 +284,237 @@ class DockerFilter : public TestFilter
 public:
   DockerFilter()
   {
-#ifdef __linux__
+#if defined(__linux__) || defined(__WINDOWS__)
     Try<Owned<Docker>> docker = Docker::create(
         flags.docker,
         flags.docker_socket);
 
-    if (docker.isError()) {
+    if (!docker.isError()) {
+      Try<Nothing> version = docker.get()->validateVersion(Version(1, 9, 0));
+      if (version.isError()) {
+        dockerUserNetworkError = version.error();
+      }
+    } else {
       dockerError = docker.error();
     }
+
+#ifdef __WINDOWS__
+    // On Windows, the ability to enter another container's namespace was
+    // enabled on newer Windows builds (>=1709). So, check if we can do
+    // this to run the docker health check tests.
+    LOG(WARNING) << "Testing shared container network namespaces on Windows. "
+                 << "This might take up to 30 seconds...";
+
+    if (dockerError.isNone() && dockerUserNetworkError.isNone()) {
+      dockerNamespaceError = runNetNamespaceCheck(docker.get());
+    }
+#endif // __WINDOWS__
 #else
-    dockerError = Error("Docker tests not supported on non-Linux systems");
-#endif // __linux__
+    dockerError = Error("Docker tests are not supported on this platform");
+#endif // __linux__ || __WINDOWS__
 
     if (dockerError.isSome()) {
       std::cerr
         << "-------------------------------------------------------------\n"
         << "We cannot run any Docker tests because:\n"
-        << dockerError.get().message << "\n"
+        << dockerError->message << "\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+
+    if (dockerUserNetworkError.isSome()) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "We cannot run any Docker user network tests because:\n"
+        << dockerUserNetworkError->message << "\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+
+    if (dockerNamespaceError.isSome()) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "We cannot run any Docker network health checks tests because:\n"
+        << dockerNamespaceError->message << "\n"
         << "-------------------------------------------------------------"
         << std::endl;
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
-    return matches(test, "DOCKER_") && dockerError.isSome();
+    if (dockerError.isSome()) {
+      return matches(test, "DOCKER_");
+    }
+
+    if (dockerUserNetworkError.isSome()) {
+      return matches(test, "DOCKER_USERNETWORK_");
+    }
+
+    return matches(test, "DOCKER_") &&
+      matches(test, "NETNAMESPACE_") &&
+      dockerNamespaceError.isSome();
   }
 
 private:
+#ifdef __WINDOWS__
+  Future<Nothing> launchContainer(
+      const Owned<Docker>& docker,
+      const string& containerName,
+      const string& networkName,
+      const string& imageName)
+  {
+    Docker::RunOptions opts;
+    opts.privileged = false;
+    opts.name = containerName;
+    opts.network = networkName;
+    opts.additionalOptions = {"-d", "--rm"};
+    opts.image = imageName;
+    opts.arguments = {"ping", "-n", "60", "127.0.0.1"};
+
+    // Launches the container in detached mode, which means that docker
+    // run should return as soon as the container successfully launched.
+    return docker->run(opts, process::Subprocess::PATH(os::DEV_NULL))
+      .then([=](const Option<int>& status) -> Future<Nothing> {
+        if (!status.isSome()) {
+          return Failure(
+              "Container " + containerName + " failed with unknown exit code");
+        }
+
+        if (status.get() != 0) {
+          return Failure(
+              "Container " + containerName + " returned exit code " +
+              stringify(status.get()));
+        }
+
+        return Nothing();
+      });
+  }
+
+  Option<Error> runNetNamespaceCheck(const Owned<Docker>& docker)
+  {
+    const string image =
+      string(mesos::internal::checks::DOCKER_HEALTH_CHECK_IMAGE);
+
+    // Use `os::system` here because `docker->inspect()` only works on
+    // containers even though `docker inspect` cli command works on images.
+    const Option<int> res = os::system(strings::join(
+        " ",
+        docker->getPath(),
+        "-H",
+        docker->getSocket(),
+        "inspect",
+        image,
+        "> NUL"));
+
+    if (res != 0) {
+      return Error("Cannot find " + image);
+    }
+
+    // Launch two containers. One with regular network settings and the
+    // other with "--network=container:<ID>" to enter the first container's
+    // namespace.
+    const string container1 = id::UUID::random().toString();
+    const string container2 = id::UUID::random().toString();
+
+    Future<Nothing> containers =
+      launchContainer(docker, container1, "nat", image)
+        .then(process::defer([=]() {
+          return launchContainer(
+              docker, container2, "container:" + container1, image)
+            .then(lambda::bind(&Docker::rm, docker, container2, true))
+            .onAny(lambda::bind(&Docker::rm, docker, container1, true));
+      }));
+
+    // A minute should be enough for both containers to lauch and delete.
+    containers.await(Minutes(1));
+
+    if (containers.isFailed()) {
+      return Error("Failed to launch containers: " + containers.failure());
+    } else if (!containers.isReady()) {
+      return Error("Container launch timed out");
+    }
+
+    return None();
+  }
+#endif // __WINDOWS__
+
   Option<Error> dockerError;
+  Option<Error> dockerUserNetworkError;
+  Option<Error> dockerNamespaceError;
+};
+
+
+// Note: This is a temporary filter to disable tests that use
+// overlay as backend on filesystems where `d_type` support is
+// missing. In particular, many XFS nodes are known to have this
+// issue due to mkfs option with `f_type = 0`. Please see
+// MESOS-8121 for more info.
+//
+// This filter assumes that the affected tests will use
+// `/tmp` as root directory of the agent's work dir.
+class DtypeFilter : public TestFilter
+{
+public:
+  DtypeFilter()
+  {
+#ifdef __linux__
+    auto checkDirDtype = [this](const string& directory) {
+      string probeDir = path::join(directory, ".probe");
+
+      Try<Nothing> mkdir = os::mkdir(probeDir);
+      if (mkdir.isError()) {
+        dtypeError = Error(
+            "Cannot verify filesystem d_type attribute: "
+            "Failed to create temporary directory '" +
+            probeDir + "': " + mkdir.error());
+      }
+
+      Try<bool> supportDType = fs::dtypeSupported(directory);
+
+      // Clean up the temporary directory that is used
+      // for d_type detection.
+      Try<Nothing> rmdir = os::rmdir(probeDir);
+      if (rmdir.isError()) {
+        LOG(WARNING) << "Failed to remove temporary directory"
+                     << "' " << probeDir << "': " << rmdir.error();
+      }
+
+      if (supportDType.isError()) {
+        dtypeError = Error(
+          "Cannot verify filesystem d_type attribute: " +
+          supportDType.error());
+      }
+
+      if (!supportDType.get()) {
+        dtypeError = Error(
+            "The underlying filesystem of " + directory +
+            " misses d_type support.");
+      }
+    };
+
+    // TODO(mzhu): Avoid hard coding a specific directory for
+    // filtering. This is a temporary solution.
+    checkDirDtype(os::temp());
+
+    if (dtypeError.isSome()) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "We cannot run any overlay backend tests because:\n"
+        << dtypeError->message << "\n"
+        << "-------------------------------------------------------------\n";
+      return;
+    }
+#endif
+  }
+
+  bool disable(const ::testing::TestInfo* test) const override
+  {
+    return dtypeError.isSome() && matches(test, "DTYPE_");
+  }
+
+private:
+  Option<Error> dtypeError;
 };
 
 
@@ -325,7 +523,11 @@ class InternetFilter : public TestFilter
 public:
   InternetFilter()
   {
+#ifdef __WINDOWS__
+    error = os::system("ping -n 1 -w 1000 google.com") != 0;
+#else
     error = os::system("ping -c 1 -W 1 google.com") != 0;
+#endif // __WINDOWS__
     if (error) {
       std::cerr
         << "-------------------------------------------------------------\n"
@@ -335,7 +537,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "INTERNET_") && error;
   }
@@ -345,12 +547,63 @@ private:
 };
 
 
+class IPTablesFilter : public TestFilter
+{
+public:
+  IPTablesFilter()
+  {
+#ifdef __linux__
+    // Check iptables -w option
+    //
+    if (os::which("iptables").isNone()) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "No 'iptables' command found so no tests depending\n"
+        << "on 'iptables' will be run\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+
+      iptablesError = Error("iptables command not found");
+      return;
+    }
+
+    if (::geteuid() != 0) {
+      iptablesError = Error("iptables command requires root");
+      return;
+    }
+
+    Try<string> iptables = os::shell("iptables -w -n -L OUTPUT");
+    if (iptables.isError()) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "'iptables' command does not support '-w' option\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+
+      iptablesError = Error("iptables command does not support -w option");
+      return;
+    }
+#else
+    iptablesError = Error("Unsupported platform");
+#endif
+  }
+
+  bool disable(const ::testing::TestInfo* test) const override
+  {
+    return iptablesError.isSome() && matches(test, "IPTABLES_");
+  }
+
+private:
+  Option<Error> iptablesError;
+};
+
+
 class LogrotateFilter : public TestFilter
 {
 public:
   LogrotateFilter()
   {
-    logrotateError = os::system("which logrotate") != 0;
+    logrotateError = os::which("logrotate").isNone();
     if (logrotateError) {
       std::cerr
         << "-------------------------------------------------------------\n"
@@ -361,7 +614,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "LOGROTATE_") && logrotateError;
   }
@@ -376,7 +629,7 @@ class NetcatFilter : public TestFilter
 public:
   NetcatFilter()
   {
-    netcatError = os::system("which nc") != 0;
+    netcatError = os::which("nc").isNone();
     if (netcatError) {
       std::cerr
         << "-------------------------------------------------------------\n"
@@ -386,7 +639,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "NC_") && netcatError;
   }
@@ -442,7 +695,7 @@ public:
 #endif
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "NET_CLS_") && netClsError;
   }
@@ -457,7 +710,7 @@ class NetworkIsolatorTestFilter : public TestFilter
 public:
   NetworkIsolatorTestFilter()
   {
-#ifdef WITH_NETWORK_ISOLATOR
+#ifdef ENABLE_PORT_MAPPING_ISOLATOR
     Try<Nothing> check = routing::check();
     if (check.isError()) {
       std::cerr
@@ -471,11 +724,11 @@ public:
 #endif
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     if (matches(test, "PortMappingIsolatorTest") ||
         matches(test, "PortMappingMesosTest")) {
-#ifdef WITH_NETWORK_ISOLATOR
+#ifdef ENABLE_PORT_MAPPING_ISOLATOR
       return !portMappingError.isNone();
 #else
       return true;
@@ -511,7 +764,7 @@ public:
       std::cerr
         << "-------------------------------------------------------------\n"
         << "We cannot run any " << fsname << " tests because:\n"
-        << fsSupportError.get().message << "\n"
+        << fsSupportError->message << "\n"
         << "-------------------------------------------------------------\n";
     }
   }
@@ -525,7 +778,7 @@ class AufsFilter : public SupportedFilesystemTestFilter
 public:
   AufsFilter() : SupportedFilesystemTestFilter("aufs") {}
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return fsSupportError.isSome() && matches(test, "AUFS_");
   }
@@ -537,7 +790,7 @@ class OverlayFSFilter : public SupportedFilesystemTestFilter
 public:
   OverlayFSFilter() : SupportedFilesystemTestFilter("overlayfs") {}
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return fsSupportError.isSome() && matches(test, "OVERLAYFS_");
   }
@@ -549,7 +802,7 @@ class XfsFilter : public SupportedFilesystemTestFilter
 public:
   XfsFilter() : SupportedFilesystemTestFilter("xfs") {}
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return fsSupportError.isSome() && matches(test, "XFS_");
   }
@@ -586,13 +839,13 @@ public:
     if (perfError.isSome()) {
       std::cerr
         << "-------------------------------------------------------------\n"
-        << perfError.get().message << "\n"
+        << perfError->message << "\n"
         << "-------------------------------------------------------------"
         << std::endl;
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     // Disable all tests that try to sample 'cpu-cycles' events using 'perf'.
     return (matches(test, "ROOT_CGROUPS_PERF_PerfTest") ||
@@ -625,7 +878,7 @@ public:
 #endif // __linux__
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "PERF_") && perfError;
   }
@@ -638,11 +891,11 @@ private:
 class RootFilter : public TestFilter
 {
 public:
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
 #ifdef __WINDOWS__
-    // On Windows, `root` does not exist, so we cannot run `ROOT_` tests.
-    return matches(test, "ROOT_");
+    // On Windows, tests are expected to be run as Administrator.
+    return false;
 #else
     Result<string> user = os::user();
     CHECK_SOME(user);
@@ -661,12 +914,49 @@ public:
 };
 
 
+class UnprivilegedUserFilter : public TestFilter
+{
+public:
+  UnprivilegedUserFilter()
+  {
+#ifdef __WINDOWS__
+    unprivilegedUserFound = false;
+#else
+    Option<string> user = os::getenv("SUDO_USER");
+    if (user.isNone() || user.get() == "root") {
+      unprivilegedUserFound = false;
+    } else {
+      unprivilegedUserFound = true;
+    }
+
+    if (!unprivilegedUserFound) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "No usable unprivileged user found from the 'SUDO_USER'\n"
+        << "environment variable. So tests that rely on an unprivileged\n"
+        << "user will not run\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+#endif
+  }
+
+  bool disable(const ::testing::TestInfo* test) const override
+  {
+    return matches(test, "UNPRIVILEGED_USER_") && !unprivilegedUserFound;
+  }
+
+private:
+  bool unprivilegedUserFound;
+};
+
+
 class UnzipFilter : public TestFilter
 {
 public:
   UnzipFilter()
   {
-    unzipError = os::system("which unzip") != 0;
+    unzipError = os::which("unzip").isNone();
     if (unzipError) {
       std::cerr
         << "-------------------------------------------------------------\n"
@@ -676,7 +966,7 @@ public:
     }
   }
 
-  bool disable(const ::testing::TestInfo* test) const
+  bool disable(const ::testing::TestInfo* test) const override
   {
     return matches(test, "UNZIP_") && unzipError;
   }
@@ -686,99 +976,106 @@ private:
 };
 
 
-// Return list of disabled tests based on test name based filters.
-static vector<string> disabled(
-    const ::testing::UnitTest* unitTest,
-    const vector<Owned<TestFilter>>& filters)
+// This is a test filter for the veth CNI plugin.
+class VEthFilter : public TestFilter
 {
-  vector<string> disabled;
+public:
+  VEthFilter()
+  {
+#ifdef __linux__
+    vector<string> messages;
 
-  for (int i = 0; i < unitTest->total_test_case_count(); i++) {
-    const ::testing::TestCase* testCase = unitTest->GetTestCase(i);
-    for (int j = 0; j < testCase->total_test_count(); j++) {
-      const ::testing::TestInfo* test = testCase->GetTestInfo(j);
+    // Checking if it runs as root.
+    Result<string> user = os::user();
+    CHECK_SOME(user);
 
-      foreach (const Owned<TestFilter>& filter, filters) {
-        if (filter->disable(test)) {
-          disabled.push_back(
-              test->test_case_name() + string(".") + test->name());
-          break;
+    if (user.get() != "root") {
+      messages.emplace_back("non-root user");
+    }
+
+    // This command returns `ip utility, iproute2-YYMMDD` where
+    // `YYMMDD` is a release (snapshot) date of iproute2.
+    Try<string> ipVersion = os::shell("ip -Version");
+
+    // Checking if iproute2 exists.
+    if (ipVersion.isError()) {
+      messages.emplace_back("iproute2 not found");
+    } else {
+      // Checking if it supports `ip link set ... netns ...`.
+      const string version = strings::trim(ipVersion.get());
+      if (version.size() < 6) {
+        messages.emplace_back("unexpected version");
+      } else {
+        Try<int> snapshot = numify<int>(version.substr(version.size() - 6));
+        if (snapshot.isError()) {
+          messages.emplace_back("iproute2 version is not an integer");
+        } else if (snapshot.get() < 100224) {
+          // Support for `netns` was added to iproute2 in v2.6.33.
+          messages.emplace_back("iproute2 doesn't support network namespaces");
         }
       }
     }
+
+    // Checking if libprocess is bound on loopback address, in that
+    // case network namespace with veth network won't be able to
+    // connect to parent process on host network namespace.
+    // TODO(urbanserj): Improve the network connectivity check.
+    process::network::inet::Address address = process::address();
+    if (address.ip.isLoopback()) {
+      messages.emplace_back("libprocess is bound on loopback address");
+    }
+
+    disabled = !messages.empty();
+    if (disabled) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "We can't run any VETH tests:\n"
+        << strings::join("\n", messages) << "\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+#else
+    disabled = true;
+#endif // __linux__
   }
 
-  return disabled;
-}
+  bool disable(const ::testing::TestInfo* test) const override
+  {
+    return matches(test, "VETH_") && disabled;
+  }
+
+private:
+  bool disabled;
+};
 
 
-// We use the constructor to setup specific tests by updating the
-// gtest filter. We do this so that we can selectively run tests that
-// require root or specific OS support (e.g., cgroups). Note that this
-// should not effect any other filters that have been put in place
-// either on the command line or via an environment variable.
-// N.B. This MUST be done _before_ invoking RUN_ALL_TESTS.
-Environment::Environment(const Flags& _flags) : flags(_flags)
+Environment::Environment(const Flags& _flags)
+  : stout::internal::tests::Environment(
+        std::vector<std::shared_ptr<TestFilter>>{
+            std::make_shared<AufsFilter>(),
+            std::make_shared<BenchmarkFilter>(),
+            std::make_shared<CfsFilter>(),
+            std::make_shared<CgroupsFilter>(),
+            std::make_shared<CurlFilter>(),
+            std::make_shared<DockerFilter>(),
+            std::make_shared<DtypeFilter>(),
+            std::make_shared<InternetFilter>(),
+            std::make_shared<IPTablesFilter>(),
+            std::make_shared<LogrotateFilter>(),
+            std::make_shared<NetcatFilter>(),
+            std::make_shared<NetClsCgroupsFilter>(),
+            std::make_shared<NetworkIsolatorTestFilter>(),
+            std::make_shared<NvidiaGpuFilter>(),
+            std::make_shared<OverlayFSFilter>(),
+            std::make_shared<PerfCPUCyclesFilter>(),
+            std::make_shared<PerfFilter>(),
+            std::make_shared<RootFilter>(),
+            std::make_shared<UnprivilegedUserFilter>(),
+            std::make_shared<UnzipFilter>(),
+            std::make_shared<VEthFilter>(),
+            std::make_shared<XfsFilter>()}),
+    flags(_flags)
 {
-  // First we split the current filter into enabled and disabled tests
-  // (which are separated by a '-').
-  const string& filter = ::testing::GTEST_FLAG(filter);
-
-  // An empty filter indicates no tests should be run.
-  if (filter.empty()) {
-    return;
-  }
-
-  string enabled;
-  string disabled;
-
-  size_t dash = filter.find('-');
-  if (dash != string::npos) {
-    enabled = filter.substr(0, dash);
-    disabled = filter.substr(dash + 1);
-  } else {
-    enabled = filter;
-  }
-
-  // Use universal filter if not specified.
-  if (enabled.empty()) {
-    enabled = "*";
-  }
-
-  // Ensure disabled tests end with ":" separator before we add more.
-  if (!disabled.empty() && !strings::endsWith(disabled, ":")) {
-    disabled += ":";
-  }
-
-  vector<Owned<TestFilter>> filters;
-
-  filters.push_back(Owned<TestFilter>(new AufsFilter()));
-  filters.push_back(Owned<TestFilter>(new BenchmarkFilter()));
-  filters.push_back(Owned<TestFilter>(new CfsFilter()));
-  filters.push_back(Owned<TestFilter>(new CgroupsFilter()));
-  filters.push_back(Owned<TestFilter>(new CurlFilter()));
-  filters.push_back(Owned<TestFilter>(new DockerFilter()));
-  filters.push_back(Owned<TestFilter>(new InternetFilter()));
-  filters.push_back(Owned<TestFilter>(new LogrotateFilter()));
-  filters.push_back(Owned<TestFilter>(new NetcatFilter()));
-  filters.push_back(Owned<TestFilter>(new NetClsCgroupsFilter()));
-  filters.push_back(Owned<TestFilter>(new NetworkIsolatorTestFilter()));
-  filters.push_back(Owned<TestFilter>(new NvidiaGpuFilter()));
-  filters.push_back(Owned<TestFilter>(new OverlayFSFilter()));
-  filters.push_back(Owned<TestFilter>(new PerfCPUCyclesFilter()));
-  filters.push_back(Owned<TestFilter>(new PerfFilter()));
-  filters.push_back(Owned<TestFilter>(new RootFilter()));
-  filters.push_back(Owned<TestFilter>(new UnzipFilter()));
-  filters.push_back(Owned<TestFilter>(new XfsFilter()));
-
-  // Construct the filter string to handle system or platform specific tests.
-  ::testing::UnitTest* unitTest = ::testing::UnitTest::GetInstance();
-
-  disabled += strings::join(":", tests::disabled(unitTest, filters));
-
-  // Now update the gtest flag.
-  ::testing::GTEST_FLAG(filter) = enabled + "-" + disabled;
-
   // Add our test event listeners.
   ::testing::TestEventListeners& listeners =
     ::testing::UnitTest::GetInstance()->listeners();
@@ -810,16 +1107,9 @@ void Environment::SetUp()
     os::setenv("MESOS_NATIVE_JAVA_LIBRARY", path);
   }
 
-  // TODO(hausdorff): Revisit whether we need this check when we complete work
-  // to light up Agent tests on Windows (see epic tracking this work at
-  // MESOS-6695). As we incrementally add tests to the Windows build, we will
-  // add this check to the tests that need it; eventually, the goal is to get
-  // rid of this altogether. See MESOS-5903.
-#ifndef __WINDOWS__
-  if (!GTEST_IS_THREADSAFE) {
-    EXIT(EXIT_FAILURE) << "Testing environment is not thread safe, bailing!";
-  }
-#endif // __WINDOWS__
+#if !GTEST_IS_THREADSAFE
+  EXIT(EXIT_FAILURE) << "Testing environment is not thread safe, bailing!";
+#endif // !GTEST_IS_THREADSAFE
 }
 
 
@@ -832,7 +1122,7 @@ void Environment::TearDown()
   // that we can identify leaked processes more precisely.
   Try<os::ProcessTree> pstree = os::pstree(0);
 
-  if (pstree.isSome() && !pstree.get().children.empty()) {
+  if (pstree.isSome() && !pstree->children.empty()) {
     FAIL() << "Tests completed with child processes remaining:\n"
            << pstree.get();
   }

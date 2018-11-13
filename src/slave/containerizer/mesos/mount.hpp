@@ -24,7 +24,7 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
-// "mount" subcommand functions similiarly to the mount program.
+// "mount" subcommand functions similarly to the mount program.
 // However, this subcommand is necessary because of the following reasons:
 // - `mount --make-rslave <dir>` doesn't work on ubuntu 14.04 due to an existing
 //    bug.
@@ -50,8 +50,8 @@ public:
   Flags flags;
 
 protected:
-  virtual int execute();
-  virtual flags::FlagsBase* getFlags() { return &flags; }
+  int execute() override;
+  flags::FlagsBase* getFlags() override { return &flags; }
 };
 
 } // namespace slave {

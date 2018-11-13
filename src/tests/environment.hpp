@@ -24,6 +24,8 @@
 
 #include <stout/try.hpp>
 
+#include <stout/tests/environment.hpp>
+
 #include "tests/flags.hpp"
 
 namespace mesos {
@@ -31,13 +33,13 @@ namespace internal {
 namespace tests {
 
 // Used to set up and manage the test environment.
-class Environment : public ::testing::Environment {
+class Environment : public stout::internal::tests::Environment {
 public:
   Environment(const Flags& flags);
 
-  virtual void SetUp();
+  void SetUp() override;
 
-  virtual void TearDown();
+  void TearDown() override;
 
   // Helper to create a temporary directory based on the current test
   // case name and test name (derived from TestInfo via
@@ -55,7 +57,7 @@ private:
     Try<std::string> mkdtemp();
 
   protected:
-    virtual void OnTestEnd(const ::testing::TestInfo&);
+    void OnTestEnd(const ::testing::TestInfo&) override;
 
     // Temporary directories that we created and need to remove.
     std::list<std::string> directories;

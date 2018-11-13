@@ -35,10 +35,16 @@
 #include <stout/os/close.hpp>
 #include <stout/os/exists.hpp>
 #include <stout/os/ftruncate.hpp>
+#include <stout/os/int_fd.hpp>
 #include <stout/os/ls.hpp>
+#include <stout/os/lseek.hpp>
 #include <stout/os/read.hpp>
 #include <stout/os/realpath.hpp>
 #include <stout/os/stat.hpp>
+
+#include <stout/os/realpath.hpp>
+
+#include "common/resources_utils.hpp"
 
 #include "messages/messages.hpp"
 
@@ -78,10 +84,9 @@ Try<State> recover(const string& rootDir, bool strict)
   // resources checkpoint file.
   state.resources = resources.get();
 
-  // If the machine has rebooted, skip recovering slave state.
   const string& bootIdPath = paths::getBootIdPath(rootDir);
   if (os::exists(bootIdPath)) {
-    Try<string> read = os::read(bootIdPath);
+    Result<string> read = state::read<string>(bootIdPath);
     if (read.isError()) {
       LOG(WARNING) << "Failed to read '"
                    << bootIdPath << "': " << read.error();
@@ -91,7 +96,7 @@ Try<State> recover(const string& rootDir, bool strict)
 
       if (id.get() != strings::trim(read.get())) {
         LOG(INFO) << "Agent host rebooted";
-        return state;
+        state.rebooted = true;
       }
     }
   }
@@ -146,7 +151,7 @@ Try<SlaveState> SlaveState::recover(
     return state;
   }
 
-  const Result<SlaveInfo>& slaveInfo = ::protobuf::read<SlaveInfo>(path);
+  Result<SlaveInfo> slaveInfo = state::read<SlaveInfo>(path);
 
   if (slaveInfo.isError()) {
     const string& message = "Failed to read agent info from '" + path + "': " +
@@ -191,7 +196,7 @@ Try<SlaveState> SlaveState::recover(
     }
 
     state.frameworks[frameworkId] = framework.get();
-    state.errors += framework.get().errors;
+    state.errors += framework->errors;
   }
 
   return state;
@@ -218,8 +223,7 @@ Try<FrameworkState> FrameworkState::recover(
     return state;
   }
 
-  const Result<FrameworkInfo>& frameworkInfo =
-    ::protobuf::read<FrameworkInfo>(path);
+  const Result<FrameworkInfo> frameworkInfo = state::read<FrameworkInfo>(path);
 
   if (frameworkInfo.isError()) {
     message = "Failed to read framework info from '" + path + "': " +
@@ -252,7 +256,7 @@ Try<FrameworkState> FrameworkState::recover(
     return state;
   }
 
-  Try<string> pid = os::read(path);
+  Result<string> pid = state::read<string>(path);
 
   if (pid.isError()) {
     message =
@@ -267,7 +271,7 @@ Try<FrameworkState> FrameworkState::recover(
     }
   }
 
-  if (pid.get().empty()) {
+  if (pid->empty()) {
     // This could happen if the slave died after opening the file for
     // writing but before it checkpointed anything.
     LOG(WARNING) << "Found empty framework pid file '" << path << "'";
@@ -300,7 +304,7 @@ Try<FrameworkState> FrameworkState::recover(
     }
 
     state.executors[executorId] = executor.get();
-    state.errors += executor.get().errors;
+    state.errors += executor->errors;
   }
 
   return state;
@@ -362,7 +366,7 @@ Try<ExecutorState> ExecutorState::recover(
       }
 
       state.runs[containerId] = run.get();
-      state.errors += run.get().errors;
+      state.errors += run->errors;
     }
   }
 
@@ -385,8 +389,7 @@ Try<ExecutorState> ExecutorState::recover(
     return state;
   }
 
-  const Result<ExecutorInfo>& executorInfo =
-    ::protobuf::read<ExecutorInfo>(path);
+  Result<ExecutorInfo> executorInfo = state::read<ExecutorInfo>(path);
 
   if (executorInfo.isError()) {
     message = "Failed to read executor info from '" + path + "': " +
@@ -463,7 +466,7 @@ Try<RunState> RunState::recover(
     }
 
     state.tasks[taskId] = task.get();
-    state.errors += task.get().errors;
+    state.errors += task->errors;
   }
 
   // Read the forked pid.
@@ -476,7 +479,7 @@ Try<RunState> RunState::recover(
     return state;
   }
 
-  Try<string> pid = os::read(path);
+  Result<string> pid = state::read<string>(path);
 
   if (pid.isError()) {
     message = "Failed to read executor forked pid from '" + path +
@@ -491,7 +494,7 @@ Try<RunState> RunState::recover(
     }
   }
 
-  if (pid.get().empty()) {
+  if (pid->empty()) {
     // This could happen if the slave died after opening the file for
     // writing but before it checkpointed anything.
     LOG(WARNING) << "Found empty executor forked pid file '" << path << "'";
@@ -500,8 +503,9 @@ Try<RunState> RunState::recover(
 
   Try<pid_t> forkedPid = numify<pid_t>(pid.get());
   if (forkedPid.isError()) {
-    return Error("Failed to parse forked pid " + pid.get() +
-                 ": " + forkedPid.error());
+    return Error("Failed to parse forked pid '" + pid.get() + "' "
+                 "from pid file '" + path + "': " +
+                 forkedPid.error());
   }
 
   state.forkedPid = forkedPid.get();
@@ -511,7 +515,7 @@ Try<RunState> RunState::recover(
       rootDir, slaveId, frameworkId, executorId, containerId);
 
   if (os::exists(path)) {
-    pid = os::read(path);
+    pid = state::read<string>(path);
 
     if (pid.isError()) {
       message = "Failed to read executor libprocess pid from '" + path +
@@ -526,7 +530,7 @@ Try<RunState> RunState::recover(
       }
     }
 
-    if (pid.get().empty()) {
+    if (pid->empty()) {
       // This could happen if the slave died after opening the file for
       // writing but before it checkpointed anything.
       LOG(WARNING) << "Found empty executor libprocess pid file '" << path
@@ -543,15 +547,18 @@ Try<RunState> RunState::recover(
   path = paths::getExecutorHttpMarkerPath(
       rootDir, slaveId, frameworkId, executorId, containerId);
 
+  // The marker could be absent if the slave died before the executor
+  // registered with the slave.
   if (!os::exists(path)) {
-    // This could happen if the slave died before the executor
-    // registered with the slave.
-    LOG(WARNING) << "Failed to find executor libprocess pid/http marker file";
+    LOG(WARNING) << "Failed to find '" << paths::LIBPROCESS_PID_FILE
+                 << "' or '" << paths::HTTP_MARKER_FILE
+                 << "' for container " << containerId
+                 << " of executor '" << executorId
+                 << "' of framework " << frameworkId;
     return state;
   }
 
   state.http = true;
-
   return state;
 }
 
@@ -579,7 +586,7 @@ Try<TaskState> TaskState::recover(
     return state;
   }
 
-  const Result<Task>& task = ::protobuf::read<Task>(path);
+  Result<Task> task = state::read<Task>(path);
 
   if (task.isError()) {
     message = "Failed to read task info from '" + path + "': " + task.error();
@@ -614,8 +621,7 @@ Try<TaskState> TaskState::recover(
 
   // Open the status updates file for reading and writing (for
   // truncating).
-  Try<int> fd = os::open(path, O_RDWR | O_CLOEXEC);
-
+  Try<int_fd> fd = os::open(path, O_RDWR | O_CLOEXEC);
   if (fd.isError()) {
     message = "Failed to open status updates file '" + path +
               "': " + fd.error();
@@ -640,19 +646,21 @@ Try<TaskState> TaskState::recover(
       break;
     }
 
-    if (record.get().type() == StatusUpdateRecord::UPDATE) {
-      state.updates.push_back(record.get().update());
+    if (record->type() == StatusUpdateRecord::UPDATE) {
+      state.updates.push_back(record->update());
     } else {
-      state.acks.insert(UUID::fromBytes(record.get().uuid()).get());
+      state.acks.insert(id::UUID::fromBytes(record->uuid()).get());
     }
   }
 
-  off_t offset = lseek(fd.get(), 0, SEEK_CUR);
-
-  if (offset < 0) {
+  Try<off_t> lseek = os::lseek(fd.get(), 0, SEEK_CUR);
+  if (lseek.isError()) {
     os::close(fd.get());
-    return ErrnoError("Failed to lseek status updates file '" + path + "'");
+    return Error(
+        "Failed to lseek status updates file '" + path + "':" + lseek.error());
   }
+
+  off_t offset = lseek.get();
 
   // Always truncate the file to contain only valid updates.
   // NOTE: This is safe even though we ignore partial protobuf read
@@ -705,14 +713,23 @@ Try<ResourcesState> ResourcesState::recover(
     return state;
   }
 
-  Try<Resources> resources = ResourcesState::recoverResources(
-      infoPath, strict, state.errors);
+  Result<Resources> info = state::read<Resources>(infoPath);
+  if (info.isError()) {
+    string message =
+      "Failed to read resources file '" + infoPath + "': " + info.error();
 
-  if (resources.isError()) {
-    return Error(resources.error());
+    if (strict) {
+      return Error(message);
+    } else {
+      LOG(WARNING) << message;
+      state.errors++;
+      return state;
+    }
   }
 
-  state.resources = resources.get();
+  if (info.isSome()) {
+    state.resources = info.get();
+  }
 
   // Process the target resources.
   const string& targetPath = paths::getResourcesTargetPath(rootDir);
@@ -720,91 +737,25 @@ Try<ResourcesState> ResourcesState::recover(
     return state;
   }
 
-  Try<Resources> target = ResourcesState::recoverResources(
-      targetPath, strict, state.errors);
-
+  Result<Resources> target = state::read<Resources>(targetPath);
   if (target.isError()) {
-    return Error(target.error());
+    string message =
+      "Failed to read resources file '" + targetPath + "': " + target.error();
+
+    if (strict) {
+      return Error(message);
+    } else {
+      LOG(WARNING) << message;
+      state.errors++;
+      return state;
+    }
   }
 
-  state.target = target.get();
+  if (target.isSome()) {
+    state.target = target.get();
+  }
 
   return state;
-}
-
-
-Try<Resources> ResourcesState::recoverResources(
-    const string& path,
-    bool strict,
-    unsigned int& errors)
-{
-  Resources resources;
-
-  Try<int> fd = os::open(path, O_RDWR | O_CLOEXEC);
-  if (fd.isError()) {
-    string message =
-      "Failed to open resources file '" + path + "': " + fd.error();
-
-    if (strict) {
-      return Error(message);
-    } else {
-      LOG(WARNING) << message;
-      errors++;
-      return resources;
-    }
-  }
-
-  Result<Resource> resource = None();
-  while (true) {
-    // Ignore errors due to partial protobuf read and enable undoing
-    // failed reads by reverting to the previous seek position.
-    resource = ::protobuf::read<Resource>(fd.get(), true, true);
-    if (!resource.isSome()) {
-      break;
-    }
-
-    resources += resource.get();
-  }
-
-  off_t offset = lseek(fd.get(), 0, SEEK_CUR);
-  if (offset < 0) {
-    os::close(fd.get());
-    return ErrnoError("Failed to lseek resources file '" + path + "'");
-  }
-
-  // Always truncate the file to contain only valid resources.
-  // NOTE: This is safe even though we ignore partial protobuf read
-  // errors above, because the 'fd' is properly set to the end of the
-  // last valid resource by 'protobuf::read()'.
-  Try<Nothing> truncated = os::ftruncate(fd.get(), offset);
-
-  if (truncated.isError()) {
-    os::close(fd.get());
-    return Error(
-      "Failed to truncate resources file '" + path +
-      "': " + truncated.error());
-  }
-
-  // After reading a non-corrupted resources file, 'record' should be
-  // 'none'.
-  if (resource.isError()) {
-    string message =
-      "Failed to read resources file  '" + path + "': " + resource.error();
-
-    os::close(fd.get());
-
-    if (strict) {
-      return Error(message);
-    } else {
-      LOG(WARNING) << message;
-      errors++;
-      return resources;
-    }
-  }
-
-  os::close(fd.get());
-
-  return resources;
 }
 
 } // namespace state {

@@ -40,6 +40,8 @@
 #include <stout/os/su.hpp>
 #include <stout/os/write.hpp>
 
+#include "logging/logging.hpp"
+
 #include "slave/container_loggers/logrotate.hpp"
 
 
@@ -61,7 +63,7 @@ public:
     buffer = new char[length];
   }
 
-  virtual ~LogrotateLoggerProcess()
+  ~LogrotateLoggerProcess() override
   {
     if (buffer != nullptr) {
       delete[] buffer;
@@ -97,9 +99,9 @@ public:
     }
 
     // NOTE: This is a prerequisuite for `io::read`.
-    Try<Nothing> nonblock = os::nonblock(STDIN_FILENO);
-    if (nonblock.isError()) {
-      return Failure("Failed to set nonblocking pipe: " + nonblock.error());
+    Try<Nothing> async = io::prepare_async(STDIN_FILENO);
+    if (async.isError()) {
+      return Failure("Failed to set async pipe: " + async.error());
     }
 
     // NOTE: This does not block.
@@ -226,9 +228,17 @@ int main(int argc, char** argv)
   // Load and validate flags from the environment and command line.
   Try<flags::Warnings> load = flags.load(None(), &argc, &argv);
 
-  if (load.isError()) {
-    EXIT(EXIT_FAILURE) << flags.usage(load.error());
+  if (flags.help) {
+    std::cout << flags.usage() << std::endl;
+    return EXIT_SUCCESS;
   }
+
+  if (load.isError()) {
+    std::cerr << flags.usage(load.error()) << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  mesos::internal::logging::initialize(argv[0], false);
 
   // Log any flag warnings.
   foreach (const flags::Warning& warning, load->warnings) {

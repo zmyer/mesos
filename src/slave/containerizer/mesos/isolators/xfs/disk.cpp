@@ -18,25 +18,37 @@
 
 #include <glog/logging.h>
 
+#include <process/after.hpp>
+#include <process/dispatch.hpp>
 #include <process/id.hpp>
+#include <process/loop.hpp>
+
+#include <process/metrics/metrics.hpp>
 
 #include <stout/check.hpp>
 #include <stout/foreach.hpp>
+#include <stout/fs.hpp>
 #include <stout/os.hpp>
+#include <stout/unreachable.hpp>
+#include <stout/utils.hpp>
 
 #include <stout/os/stat.hpp>
+
+#include "common/protobuf_utils.hpp"
 
 #include "slave/paths.hpp"
 
 using std::list;
+using std::make_pair;
+using std::pair;
 using std::string;
+using std::vector;
 
 using process::Failure;
 using process::Future;
 using process::Owned;
 using process::PID;
 using process::Process;
-using process::Promise;
 
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
@@ -67,7 +79,35 @@ static Try<IntervalSet<prid_t>> getIntervalSet(
 }
 
 
-static Option<Bytes> getDiskResource(
+static Try<Nothing> isPathSupported(const string& path)
+{
+  if (!xfs::isPathXfs(path)) {
+    return Error("'" + path + "' is not an XFS filesystem");
+  }
+
+  Try<bool> enabled = xfs::isQuotaEnabled(path);
+  if (enabled.isError()) {
+    return Error(
+        "Failed to get quota status for '" + path + "': " + enabled.error());
+  }
+
+  if (!enabled.get()) {
+    return Error(
+        "XFS project quotas are not enabled on '" + path + "'");
+  }
+
+  return Nothing();
+}
+
+
+static bool isMountDisk(const Resource::DiskInfo& info)
+{
+  return info.has_source() &&
+    info.source().type() == Resource::DiskInfo::Source::MOUNT;
+}
+
+
+static Option<Bytes> getSandboxDisk(
     const Resources& resources)
 {
   Option<Bytes> bytes = None();
@@ -77,16 +117,7 @@ static Option<Bytes> getDiskResource(
       continue;
     }
 
-    // TODO(jpeach): Ignore persistent volume resources. The problem here is
-    // that we need to guarantee that we can track the removal of every
-    // directory for which we assign a project ID. Since destruction of
-    // persistent is not visible to the isolator, we don't want to risk
-    // leaking the project ID, or spuriously reusing it.
-    if (Resources::isPersistentVolume(resource)) {
-      continue;
-    }
-
-    if (resource.has_disk() && resource.disk().has_volume()) {
+    if (Resources::isPersistentVolume(resource) || resource.has_disk()) {
       continue;
     }
 
@@ -103,8 +134,32 @@ static Option<Bytes> getDiskResource(
 
 Try<Isolator*> XfsDiskIsolatorProcess::create(const Flags& flags)
 {
-  if (!xfs::pathIsXfs(flags.work_dir)) {
-    return Error("'" + flags.work_dir + "' is not an XFS filesystem");
+  Try<Nothing> supported = isPathSupported(flags.work_dir);
+  if (supported.isError()) {
+    return Error(supported.error());
+  }
+
+  // In general, we can't be sure of the filesystem configuration of
+  // PATH disks. We verify prior to use so that we don't later have to
+  // emit a confusing error (like "inappropriate IOCTL") when attempting
+  // to sample the project ID.
+  vector<Resource> resources = CHECK_NOTERROR(Resources::fromString(
+        flags.resources.getOrElse(""), flags.default_role));
+
+  foreach (const Resource& resource, resources) {
+    if (resource.name() != "disk" || !resource.has_disk()) {
+      continue;
+    }
+
+    const Resource::DiskInfo& diskInfo = resource.disk();
+
+    if (diskInfo.has_source() &&
+        diskInfo.source().type() == Resource::DiskInfo::Source::PATH) {
+      supported = isPathSupported(diskInfo.source().path().root());
+      if (supported.isError()) {
+        return Error(supported.error());
+      }
+    }
   }
 
   Result<uid_t> uid = os::getuid();
@@ -120,20 +175,19 @@ Try<Isolator*> XfsDiskIsolatorProcess::create(const Flags& flags)
   if (projects.isError()) {
     return Error(
         "Failed to parse XFS project range '" +
-        flags.xfs_project_range +
-        "'");
+        flags.xfs_project_range + "'");
   }
 
-  if (projects.get().type() != Value::RANGES) {
+  if (projects->type() != Value::RANGES) {
     return Error(
         "Invalid XFS project resource type " +
-        mesos::Value_Type_Name(projects.get().type()) +
+        mesos::Value_Type_Name(projects->type()) +
         ", expecting " +
         mesos::Value_Type_Name(Value::RANGES));
   }
 
   Try<IntervalSet<prid_t>> totalProjectIds =
-    getIntervalSet(projects.get().ranges());
+    getIntervalSet(projects->ranges());
 
   if (totalProjectIds.isError()) {
     return Error(totalProjectIds.error());
@@ -144,23 +198,46 @@ Try<Isolator*> XfsDiskIsolatorProcess::create(const Flags& flags)
     return Error(status->message);
   }
 
+  xfs::QuotaPolicy quotaPolicy = xfs::QuotaPolicy::ACCOUNTING;
+
+  if (flags.enforce_container_disk_quota) {
+    quotaPolicy = flags.xfs_kill_containers
+      ? xfs::QuotaPolicy::ENFORCING_ACTIVE
+      : xfs::QuotaPolicy::ENFORCING_PASSIVE;
+  }
+
   return new MesosIsolator(Owned<MesosIsolatorProcess>(
-      new XfsDiskIsolatorProcess(flags, totalProjectIds.get())));
+      new XfsDiskIsolatorProcess(
+          flags.container_disk_watch_interval,
+          quotaPolicy,
+          flags.work_dir,
+          totalProjectIds.get(),
+          flags.disk_watch_interval)));
 }
 
 
 XfsDiskIsolatorProcess::XfsDiskIsolatorProcess(
-    const Flags& _flags,
-    const IntervalSet<prid_t>& projectIds)
+    Duration _watchInterval,
+    xfs::QuotaPolicy _quotaPolicy,
+    const std::string& _workDir,
+    const IntervalSet<prid_t>& projectIds,
+    Duration _projectWatchInterval)
   : ProcessBase(process::ID::generate("xfs-disk-isolator")),
-    flags(_flags),
+    watchInterval(_watchInterval),
+    projectWatchInterval(_projectWatchInterval),
+    quotaPolicy(_quotaPolicy),
+    workDir(_workDir),
     totalProjectIds(projectIds),
     freeProjectIds(projectIds)
 {
   // At the beginning, the free project range is the same as the
   // configured project range.
 
-  LOG(INFO) << "Allocating XFS project IDs from the range " << totalProjectIds;
+  LOG(INFO) << "Allocating " << totalProjectIds.size()
+            << " XFS project IDs from the range " << totalProjectIds;
+
+  metrics.project_ids_total = totalProjectIds.size();
+  metrics.project_ids_free = totalProjectIds.size();
 }
 
 
@@ -168,7 +245,7 @@ XfsDiskIsolatorProcess::~XfsDiskIsolatorProcess() {}
 
 
 Future<Nothing> XfsDiskIsolatorProcess::recover(
-    const list<ContainerState>& states,
+    const vector<ContainerState>& states,
     const hashset<ContainerID>& orphans)
 {
   // We don't need to explicitly deal with orphans since we are primarily
@@ -176,7 +253,7 @@ Future<Nothing> XfsDiskIsolatorProcess::recover(
   // for project IDs that we have not recovered and make a best effort to
   // remove all the corresponding on-disk state.
   Try<list<string>> sandboxes = os::glob(path::join(
-      paths::getSandboxRootDir(flags.work_dir),
+      paths::getSandboxRootDir(workDir),
       "*",
       "frameworks",
       "*",
@@ -224,6 +301,12 @@ Future<Nothing> XfsDiskIsolatorProcess::recover(
     infos.put(containerId, Owned<Info>(new Info(sandbox, projectId.get())));
     freeProjectIds -= projectId.get();
 
+    // The operator could have changed the project ID range, so as per
+    // returnProjectId(), we should only count this if is is still in range.
+    if (totalProjectIds.contains(projectId.get())) {
+      --metrics.project_ids_free;
+    }
+
     // If this is a known orphan, the containerizer will send a cleanup call
     // later. If this is a live container, we will manage it. Otherwise, we have
     // to dispatch a cleanup ourselves.  Note that we don't wait for the result
@@ -232,6 +315,53 @@ Future<Nothing> XfsDiskIsolatorProcess::recover(
     if (!orphans.contains(containerId) && !alive.contains(containerId)) {
       dispatch(self(), &XfsDiskIsolatorProcess::cleanup, containerId);
     }
+  }
+
+  Try<list<string>> volumes = paths::getPersistentVolumePaths(workDir);
+
+  if (volumes.isError()) {
+    return Failure(
+        "Failed to scan persistent volume directories: " + volumes.error());
+  }
+
+  // Track any project IDs that we have assigned to persistent volumes. Note
+  // that is is possible for operators to delete persistent volumes while
+  // the agent isn't running. If that happened, the quota record would be
+  // stale, but eventually the project ID would be re-used and the quota
+  // updated correctly.
+  foreach (const string& directory, volumes.get()) {
+    Result<prid_t> projectId = xfs::getProjectId(directory);
+    if (projectId.isError()) {
+      return Failure(projectId.error());
+    }
+
+    if (projectId.isNone()) {
+      continue;
+    }
+
+    // We should never have duplicate projects IDs assigned
+    // to persistent volumes, and since we haven't checked the
+    // recovered container resources yet, we can't already know
+    // about this persistent volume.
+    CHECK(!scheduledProjects.contains(projectId.get()))
+        << "Duplicate project ID " << projectId.get()
+        << " assigned to '" << directory << "'"
+        << " and '" << scheduledProjects.at(projectId.get()).second << "'";
+
+    freeProjectIds -= projectId.get();
+    if (totalProjectIds.contains(projectId.get())) {
+      --metrics.project_ids_free;
+    }
+
+    Try<string> devname = xfs::getDeviceForPath(directory);
+    if (devname.isError()) {
+      LOG(ERROR) << "Unable to schedule project ID " << projectId.get()
+                 << " for reclaimation: " << devname.error();
+      continue;
+    }
+
+    scheduledProjects.put(
+        projectId.get(), make_pair(devname.get(), directory));
   }
 
   return Nothing();
@@ -272,22 +402,73 @@ Future<Option<ContainerLaunchInfo>> XfsDiskIsolatorProcess::prepare(
   LOG(INFO) << "Assigned project " << stringify(projectId.get()) << " to '"
             << containerConfig.directory() << "'";
 
-  return update(containerId, containerConfig.executor_info().resources())
+  return update(containerId, containerConfig.resources())
     .then([]() -> Future<Option<ContainerLaunchInfo>> {
       return None();
     });
 }
 
 
-Future<Nothing> XfsDiskIsolatorProcess::isolate(
-    const ContainerID& containerId,
-    pid_t pid)
+Future<ContainerLimitation> XfsDiskIsolatorProcess::watch(
+    const ContainerID& containerId)
 {
-  if (!infos.contains(containerId)) {
-    return Failure("Unknown container");
+  if (infos.contains(containerId)) {
+    return infos[containerId]->limitation.future();
   }
 
-  return Nothing();
+  // Any container that did not have a project ID assigned when
+  // we recovered it won't be tracked. This will happend when the
+  // isolator is first enabled, since we didn't get a chance to
+  // assign project IDs to existing containers. We don't want to
+  // cause those containers to fail, so we just ignore them.
+  LOG(WARNING) << "Ignoring watch for unknown container " << containerId;
+  return Future<ContainerLimitation>();
+}
+
+
+static Try<xfs::QuotaInfo> applyProjectQuota(
+    const string& path,
+    prid_t projectId,
+    Bytes limit,
+    xfs::QuotaPolicy quotaPolicy)
+{
+  switch (quotaPolicy) {
+    case xfs::QuotaPolicy::ACCOUNTING: {
+      Try<Nothing> status = xfs::clearProjectQuota(path, projectId);
+
+      if (status.isError()) {
+        return Error("Failed to clear quota for project " +
+                     stringify(projectId) + ": " + status.error());
+      }
+
+      return xfs::QuotaInfo();
+    }
+
+    case xfs::QuotaPolicy::ENFORCING_ACTIVE:
+    case xfs::QuotaPolicy::ENFORCING_PASSIVE: {
+      Bytes hardLimit = limit;
+
+      // The purpose behind adding to the hard limit is so that the soft
+      // limit can be exceeded thereby allowing us to check if the limit
+      // has been reached without allowing the process to allocate too
+      // much beyond the desired limit.
+      if (quotaPolicy == xfs::QuotaPolicy::ENFORCING_ACTIVE) {
+        hardLimit += Megabytes(10);
+      }
+
+      Try<Nothing> status = xfs::setProjectQuota(
+          path, projectId, limit, hardLimit);
+
+      if (status.isError()) {
+        return Error("Failed to update quota for project " +
+                     stringify(projectId) + ": " + status.error());
+      }
+
+      return xfs::QuotaInfo{limit, hardLimit, 0};
+    }
+  }
+
+  UNREACHABLE();
 }
 
 
@@ -302,32 +483,159 @@ Future<Nothing> XfsDiskIsolatorProcess::update(
 
   const Owned<Info>& info = infos[containerId];
 
-  Option<Bytes> needed = getDiskResource(resources);
-  if (needed.isNone()) {
-    // TODO(jpeach) If there's no disk resource attached, we should set the
-    // minimum quota (1 block), since a zero quota would be unconstrained.
-    LOG(WARNING) << "Ignoring quota update with no disk resources";
-    return Nothing();
+  // First, apply the disk quota to the sandbox.
+  Option<Bytes> sandboxQuota = getSandboxDisk(resources);
+  if (sandboxQuota.isSome()) {
+    foreachpair (
+        const string& directory, Info::PathInfo& pathInfo, info->paths) {
+      if (pathInfo.disk.isNone()) {
+        pathInfo.quota = sandboxQuota.get();
+
+        Try<xfs::QuotaInfo> status = applyProjectQuota(
+            directory, pathInfo.projectId, sandboxQuota.get(), quotaPolicy);
+        if (status.isError()) {
+          return Failure(status.error());
+        }
+
+        LOG(INFO) << "Set quota on container " << containerId
+                  << " for project " << pathInfo.projectId
+                  << " to " << status->softLimit << "/" << status->hardLimit;
+        break;
+      }
+    }
   }
 
-  // Only update the disk quota if it has changed.
-  if (needed.get() != info->quota) {
-    Try<Nothing> status =
-      xfs::setProjectQuota(info->directory, info->projectId, needed.get());
+  // Make sure that we have project IDs assigned to all persistent volumes.
+  foreach (const Resource& resource, resources.persistentVolumes()) {
+    CHECK(resource.disk().has_volume());
 
-    if (status.isError()) {
-      return Failure("Failed to update quota for project " +
-                     stringify(info->projectId) + ": " + status.error());
+    const Bytes size = Megabytes(resource.scalar().value());
+    const string directory = paths::getPersistentVolumePath(workDir, resource);
+
+    // Don't apply project quotas to mount disks, since they are never
+    // subdivided and we can't guarantee that they are XFS filesystems. We
+    // still track the path for the container so that we can generate disk
+    // statistics correctly.
+    if (isMountDisk(resource.disk())) {
+      info->paths.put(directory, Info::PathInfo{size, 0, resource.disk()});
+      continue;
     }
 
-    info->quota = needed.get();
+    Result<prid_t> projectId = xfs::getProjectId(directory);
+    if (projectId.isError()) {
+      return Failure(projectId.error());
+    }
 
-    LOG(INFO) << "Set quota on container " << containerId
-              << " for project " << info->projectId
-              << " to " << info->quota;
+    // If this volume already has a project ID, we must have assigned it
+    // here, or assigned or recovered it during project recovery.
+    if (projectId.isSome()) {
+      CHECK(scheduledProjects.contains(projectId.get()))
+        << "untracked project ID " << projectId.get()
+        << " for volume ID " << resource.disk().persistence().id()
+        << " on " << directory;
+    }
+
+    if (projectId.isNone()) {
+      Try<Nothing> supported = isPathSupported(directory);
+      if (supported.isError()) {
+        return Failure(supported.error());
+      }
+
+      projectId = nextProjectId();
+
+      Try<Nothing> status = xfs::setProjectId(directory, projectId.get());
+      if (status.isError()) {
+        return Failure(
+            "Failed to assign project " + stringify(projectId.get()) + ": " +
+            status.error());
+      }
+
+      LOG(INFO) << "Assigned project " << stringify(projectId.get()) << " to '"
+                << directory << "'";
+    }
+
+    Try<xfs::QuotaInfo> status =
+      applyProjectQuota(directory, projectId.get(), size, quotaPolicy);
+    if (status.isError()) {
+      return Failure(status.error());
+    }
+
+    info->paths.put(
+        directory, Info::PathInfo{size, projectId.get(), resource.disk()});
+
+    LOG(INFO) << "Set quota on volume " << resource.disk().persistence().id()
+              << " for project " << projectId.get()
+              << " to " << status->softLimit << "/" << status->hardLimit;
+
+    if (!scheduledProjects.contains(projectId.get())) {
+      Try<string> devname = xfs::getDeviceForPath(directory);
+      if (devname.isError()) {
+        LOG(ERROR) << "Unable to schedule project " << projectId.get()
+                   << " for reclaimation: " << devname.error();
+        continue;
+      }
+
+      scheduledProjects.put(
+          projectId.get(), make_pair(devname.get(), directory));
+    }
   }
 
   return Nothing();
+}
+
+
+void XfsDiskIsolatorProcess::check()
+{
+  CHECK(quotaPolicy == xfs::QuotaPolicy::ENFORCING_ACTIVE);
+
+  foreachpair(const ContainerID& containerId, const Owned<Info>& info, infos) {
+    foreachpair(
+        const string& directory, const Info::PathInfo& pathInfo, info->paths) {
+      Result<xfs::QuotaInfo> quotaInfo = xfs::getProjectQuota(
+          directory, pathInfo.projectId);
+
+      if (quotaInfo.isError()) {
+        LOG(WARNING)
+          << "Failed to check disk usage for container '"
+          << containerId  << "' in '" << directory << "': "
+          << quotaInfo.error();
+
+        continue;
+      }
+
+      // If the soft limit is exceeded the container should be killed.
+      if (quotaInfo->used > quotaInfo->softLimit) {
+        Resource resource;
+        resource.set_name("disk");
+        resource.set_type(Value::SCALAR);
+        resource.mutable_scalar()->set_value(
+          quotaInfo->used.bytes() / Bytes::MEGABYTES);
+
+        string volumeInfo;
+
+        if (pathInfo.disk.isSome()) {
+          resource.mutable_disk()->CopyFrom(pathInfo.disk.get());
+          volumeInfo =
+            " for volume '" + pathInfo.disk->persistence().id() + "'";
+        }
+
+        LOG(INFO)
+          << "Container " << stringify(containerId)
+          << " disk usage " << stringify(quotaInfo->used)
+          << " exceeded quota " << stringify(quotaInfo->softLimit)
+          << volumeInfo
+          << " in '" << directory << "'";
+
+        info->limitation.set(
+            protobuf::slave::createContainerLimitation(
+                Resources(resource),
+                "Disk usage (" + stringify(quotaInfo->used) +
+                ") exceeded quota (" + stringify(quotaInfo->softLimit) + ")" +
+                volumeInfo,
+                TaskStatus::REASON_CONTAINER_LIMITATION_DISK));
+      }
+    }
+  }
 }
 
 
@@ -339,19 +647,59 @@ Future<ResourceStatistics> XfsDiskIsolatorProcess::usage(
     return ResourceStatistics();
   }
 
-  ResourceStatistics statistics;
   const Owned<Info>& info = infos[containerId];
+  ResourceStatistics statistics;
 
-  Result<xfs::QuotaInfo> quota = xfs::getProjectQuota(
-      info->directory, info->projectId);
+  foreachpair(
+      const string& directory, const Info::PathInfo& pathInfo, info->paths) {
+    DiskStatistics* disk = nullptr;
 
-  if (quota.isError()) {
-    return Failure(quota.error());
-  }
+    if (pathInfo.disk.isSome()) {
+      disk = statistics.add_disk_statistics();
+      disk->mutable_persistence()->CopyFrom(pathInfo.disk->persistence());
 
-  if (quota.isSome()) {
-    statistics.set_disk_limit_bytes(quota.get().limit.bytes());
-    statistics.set_disk_used_bytes(quota.get().used.bytes());
+      // Root disk volumes don't have a source.
+      if (pathInfo.disk->has_source()) {
+        disk->mutable_source()->CopyFrom(pathInfo.disk->source());
+      }
+    }
+
+    // We don't require XFS on MOUNT disks, but we still want the isolator
+    // to publish usage for them to make them visible to operational tooling.
+    if (disk && isMountDisk(pathInfo.disk.get())) {
+      Try<Bytes> used = fs::used(directory);
+      if (used.isError()) {
+        return Failure("Failed to query disk usage for '" + directory +
+                      "': " + used.error());
+      }
+
+      disk->set_used_bytes(used->bytes());
+      continue;
+    }
+
+    Result<xfs::QuotaInfo> quotaInfo =
+      xfs::getProjectQuota(directory, pathInfo.projectId);
+    if (quotaInfo.isError()) {
+      return Failure(quotaInfo.error());
+    }
+
+    if (quotaInfo.isSome()) {
+      if (disk) {
+        disk->set_used_bytes(quotaInfo->used.bytes());
+      } else {
+        statistics.set_disk_used_bytes(quotaInfo->used.bytes());
+      }
+    }
+
+    // If we didn't set the quota (ie. we are in ACCOUNTING mode),
+    // the quota limit will be 0. Since we are already tracking
+    // what the quota ought to be in the Info, we just always
+    // use that.
+    if (disk) {
+      disk->set_limit_bytes(pathInfo.quota.bytes());
+    } else {
+      statistics.set_disk_limit_bytes(pathInfo.quota.bytes());
+    }
   }
 
   return statistics;
@@ -368,42 +716,41 @@ Future<Nothing> XfsDiskIsolatorProcess::cleanup(const ContainerID& containerId)
     return Nothing();
   }
 
-  // Take a copy of the Info we are removing so that we can use it
-  // to construct the Failure message if necessary.
-  const Info info = *infos[containerId];
+  const Owned<Info>& info = infos[containerId];
+
+  // Schedule the directory for project ID reclaimation.
+  //
+  // We don't reclaim project ID here but wait until sandbox GC time.
+  // This is because the sandbox can potentially contain symlinks,
+  // from which we can't remove the project ID due to kernel API
+  // limitations. Such symlinks would then contribute to disk usage
+  // of another container if the project ID was reused causing small
+  // inaccuracies in accounting.
+  //
+  // Fortunately, this behaviour also suffices to reclaim project IDs from
+  // persistent volumes. We can just leave the project quota in place until
+  // we determine that the persistent volume is no longer present.
+  foreachpair (
+      const string& directory, const Info::PathInfo& pathInfo, info->paths) {
+    // If we assigned a project ID to a persistent volume, it might
+    // already be scheduled for reclaimation.
+    if (scheduledProjects.contains(pathInfo.projectId)) {
+      continue;
+    }
+
+    Try<string> devname = xfs::getDeviceForPath(directory);
+    if (devname.isError()) {
+      LOG(ERROR) << "Unable to schedule project " << pathInfo.projectId
+                 << " for reclaimation: " << devname.error();
+      continue;
+    }
+
+    scheduledProjects.put(
+        pathInfo.projectId, make_pair(devname.get(), directory));
+  }
 
   infos.erase(containerId);
-
-  LOG(INFO) << "Removing project ID " << info.projectId
-            << " from '" << info.directory << "'";
-
-  Try<Nothing> quotaStatus = xfs::clearProjectQuota(
-      info.directory, info.projectId);
-
-  if (quotaStatus.isError()) {
-    LOG(ERROR) << "Failed to clear quota for '"
-               << info.directory << "': " << quotaStatus.error();
-  }
-
-  Try<Nothing> projectStatus = xfs::clearProjectId(info.directory);
-  if (projectStatus.isError()) {
-    LOG(ERROR) << "Failed to remove project ID "
-               << info.projectId
-               << " from '" << info.directory << "': "
-               << projectStatus.error();
-  }
-
-  // If we failed to remove the on-disk project ID we can't reclaim it
-  // because the quota would then be applied across two containers. This
-  // would be a project ID leak, but we could recover it at GC time if
-  // that was visible to isolators.
-  if (quotaStatus.isError() || projectStatus.isError()) {
-    freeProjectIds -= info.projectId;
-    return Failure("Failed to cleanup '" + info.directory + "'");
-  } else {
-    returnProjectId(info.projectId);
-    return Nothing();
-  }
+  return Nothing();
 }
 
 
@@ -416,8 +763,10 @@ Option<prid_t> XfsDiskIsolatorProcess::nextProjectId()
   prid_t projectId = freeProjectIds.begin()->lower();
 
   freeProjectIds -= projectId;
+  --metrics.project_ids_free;
   return projectId;
 }
+
 
 void XfsDiskIsolatorProcess::returnProjectId(
     prid_t projectId)
@@ -427,7 +776,83 @@ void XfsDiskIsolatorProcess::returnProjectId(
   // and we recover a previous container from the old range.
   if (totalProjectIds.contains(projectId)) {
     freeProjectIds += projectId;
+    ++metrics.project_ids_free;
   }
+}
+
+
+void XfsDiskIsolatorProcess::reclaimProjectIds()
+{
+  // Note that we need both the directory we assigned the project ID to,
+  // and the device node for the block device hosting the directory. Since
+  // we can only reclaim the project ID if the former doesn't exist, we
+  // need the latter to make the corresponding quota record updates.
+
+  foreachpair (
+      prid_t projectId, const auto& dir, utils::copy(scheduledProjects)) {
+    if (os::exists(dir.second)) {
+      continue;
+    }
+
+    Try<Nothing> status = xfs::clearProjectQuota(dir.first, projectId);
+    if (status.isError()) {
+      LOG(ERROR) << "Failed to clear quota for '"
+                 << dir.second << "': " << status.error();
+    }
+
+    returnProjectId(projectId);
+    scheduledProjects.erase(projectId);
+
+    LOG(INFO) << "Reclaimed project ID " << projectId
+              << " from '" << dir.second << "'";
+  }
+}
+
+
+void XfsDiskIsolatorProcess::initialize()
+{
+  process::PID<XfsDiskIsolatorProcess> self(this);
+
+  if (quotaPolicy == xfs::QuotaPolicy::ENFORCING_ACTIVE) {
+    // Start a loop to periodically check for containers
+    // breaking the soft limit.
+    process::loop(
+        self,
+        [=]() {
+          return process::after(watchInterval);
+        },
+        [=](const Nothing&) -> process::ControlFlow<Nothing> {
+          check();
+          return process::Continue();
+        });
+  }
+
+  // Start a periodic check for which project IDs are currently in use.
+  process::loop(
+      self,
+      [=]() {
+        return process::after(projectWatchInterval);
+      },
+      [=](const Nothing&) -> process::ControlFlow<Nothing> {
+        reclaimProjectIds();
+        return process::Continue();
+      });
+}
+
+
+XfsDiskIsolatorProcess::Metrics::Metrics()
+  : project_ids_total("containerizer/mesos/disk/project_ids_total"),
+    project_ids_free("containerizer/mesos/disk/project_ids_free")
+{
+  process::metrics::add(project_ids_total);
+  process::metrics::add(project_ids_free);
+}
+
+
+XfsDiskIsolatorProcess::Metrics::~Metrics()
+{
+  process::metrics::remove(project_ids_free);
+  process::metrics::remove(project_ids_total);
 }
 
 } // namespace slave {

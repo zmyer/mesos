@@ -49,8 +49,13 @@ namespace slave {
 // `pid` of the `init` process of these containers. For now, we
 // compensate for this by simply walking the process tree from the
 // container's `init` process up to 2-levels down (where the task
-// process would exist) and look to see if any process along the way
-// has a different `mnt` namespace. If it does, we return a reference
+// process would exist) and look to see if any 2-nd level process
+// has a different `mnt` namespace. Only one pair of processes matches
+// this property - command executor and its task. One important detail
+// is that we skip all 1st-level processes whose `mnt` namespace is not
+// the same as the `mnt` namespace of the `init` process.
+//
+// If we found such a 2-nd level process, we return a reference
 // to its `pid` as the `pid` for entering the `mnt` namespace of the
 // container.  Otherwise, we return the `init` process's `pid`.
 //
@@ -58,54 +63,80 @@ namespace slave {
 // tasks with the default (a.k.a. "pod" executor).
 Try<pid_t> getMountNamespaceTarget(pid_t parent)
 {
-  Try<ino_t> parentNamespace = ns::getns(parent, "mnt");
+  Result<ino_t> parentNamespace = ns::getns(parent, "mnt");
   if (parentNamespace.isError()) {
-    return Error("Cannot get 'mnt' namespace for"
-                 " process '" + stringify(parent) + "'");
-  }
-
-  // Search for a new mount namespace in all direct children.
-  Try<set<pid_t>> children = os::children(parent, false);
-  if (children.isError()) {
-    return Error("Cannot get children for process"
+    return Error("Cannot get 'mnt' namespace for process"
+                 " '" + stringify(parent) + "': " + parentNamespace.error());
+  } else if (parentNamespace.isNone()) {
+    return Error("Cannot get 'mnt' namespace for non-existing process"
                  " '" + stringify(parent) + "'");
   }
 
+  Try<set<pid_t>> children = os::children(parent, false);
+  if (children.isError()) {
+    return Error("Cannot get children for process"
+                 " '" + stringify(parent) + "': " + children.error());
+  }
+
+  pid_t candidate = parent;
+  int numCandidates = 0;
+  bool hasGrandchild = false;
+
   foreach (pid_t child, children.get()) {
-    Try<ino_t> childNamespace = ns::getns(child, "mnt");
+    Result<ino_t> childNamespace = ns::getns(child, "mnt");
     if (childNamespace.isError()) {
-      return Error("Cannot get 'mnt' namespace for"
-                   " child process '" + stringify(child) + "'");
+      return Error("Cannot get 'mnt' namespace for child process"
+                   " '" + stringify(child) + "': " + childNamespace.error());
+    } else if (childNamespace.isNone()) {
+      VLOG(1) << "Cannot get 'mnt' namespace for non-existing child process"
+                 " '" + stringify(child) + "'";
+      continue;
     }
 
     if (parentNamespace.get() != childNamespace.get()) {
-      return child;
+      // We skip this child, because we know that it's not a command executor.
+      continue;
     }
-  }
 
-  // Search for a new mount namespace in all 2nd-level children.
-  foreach (pid_t child, children.get()) {
+    // Search for a new mount namespace in 2nd-level children.
     Try<set<pid_t>> children2 = os::children(child, false);
     if (children2.isError()) {
       return Error("Cannot get 2nd-level children for process"
                    " '" + stringify(parent) + "' with child"
-                   " '" + stringify(child) + "'");
+                   " '" + stringify(child) + "': " + children2.error());
     }
 
     foreach (pid_t child2, children2.get()) {
-      Try<ino_t> child2Namespace = ns::getns(child2, "mnt");
+      Result<ino_t> child2Namespace = ns::getns(child2, "mnt");
       if (child2Namespace.isError()) {
-        return Error("Cannot get 'mnt' namespace for 2nd-level"
-                     " child process '" + stringify(child2) + "'");
+        return Error("Cannot get 'mnt' namespace for 2nd-level child process"
+                     " '" + stringify(child2) +
+                     "': " + child2Namespace.error());
+      } else if (child2Namespace.isNone()) {
+        VLOG(1) << "Cannot get 'mnt' namespace for non-existing 2nd-level"
+                   " child process '" + stringify(child2) + "'";
+        continue;
       }
 
+      hasGrandchild = true;
+
       if (parentNamespace.get() != child2Namespace.get()) {
-        return child2;
+        ++numCandidates;
+        candidate = child2;
       }
     }
   }
 
-  return parent;
+  if (!hasGrandchild) {
+    return Error("Cannot detect task process: no 2nd-level processes found");
+  }
+
+  if (numCandidates > 1) {
+    return Error("Cannot detect task process: unexpected number of candidates"
+                 " found: " + stringify(numCandidates));
+  }
+
+  return candidate;
 }
 #endif // __linux__
 

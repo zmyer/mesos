@@ -14,8 +14,8 @@
 #define __PROCESS_COLLECT_HPP__
 
 #include <functional>
-#include <list>
 #include <tuple>
+#include <vector>
 
 #include <process/check.hpp>
 #include <process/defer.hpp>
@@ -36,7 +36,7 @@ namespace process {
 // the result will be a failure. Likewise, if any future fails then
 // the result future will be a failure.
 template <typename T>
-Future<std::list<T>> collect(const std::list<Future<T>>& futures);
+Future<std::vector<T>> collect(const std::vector<Future<T>>& futures);
 
 
 // Waits on each future specified and returns the wrapping future
@@ -48,13 +48,69 @@ Future<std::tuple<Ts...>> collect(const Future<Ts>&... futures);
 // Waits on each future in the specified set and returns the list of
 // non-pending futures.
 template <typename T>
-Future<std::list<Future<T>>> await(const std::list<Future<T>>& futures);
+Future<std::vector<Future<T>>> await(const std::vector<Future<T>>& futures);
 
 
 // Waits on each future specified and returns the wrapping future
 // typed of a tuple of futures.
 template <typename... Ts>
 Future<std::tuple<Future<Ts>...>> await(const Future<Ts>&... futures);
+
+
+// Waits on the future specified and returns after the future has been
+// completed or the await has been discarded. This is useful when
+// wanting to "break out" of a future chain if a discard occurs but
+// the underlying future has not been discarded. For example:
+//
+//   Future<string> foo()
+//   {
+//     return bar()
+//       .then([](int i) {
+//         return stringify(i);
+//       });
+//   }
+//
+//   Future<stringify> future = foo();
+//   future.discard();
+//
+// In the above code we'll propagate the discard to `bar()` but might
+// wait forever if `bar()` can't discard their computation. In some
+// circumstances you might want to break out early and you can do that
+// by using `await`, because if we discard an `await` that function
+// will return even though all of the future's it is waiting on have
+// not been discarded (in other words, the `await` can be properly
+// discarded even if the underlying futures have not been discarded).
+//
+//   Future<string> foo()
+//   {
+//     return await(bar())
+//       .recover([](const Future<Future<string>>& future) {
+//         if (future.isDiscarded()) {
+//           cleanup();
+//         }
+//         return Failure("Discarded waiting");
+//       })
+//       .then([](const Future<int>& future) {
+//         return future
+//           .then([](int i) {
+//             return stringify(i);
+//           });
+//       });
+//   }
+//
+//   Future<string> future = foo();
+//   future.discard();
+//
+// Using `await` will enable you to continue execution even if `bar()`
+// does not (or can not) discard their execution.
+template <typename T>
+Future<Future<T>> await(const Future<T>& future)
+{
+  return await(std::vector<Future<T>>{future})
+    .then([=]() {
+      return Future<Future<T>>(future);
+    });
+}
 
 
 namespace internal {
@@ -64,36 +120,49 @@ class CollectProcess : public Process<CollectProcess<T>>
 {
 public:
   CollectProcess(
-      const std::list<Future<T>>& _futures,
-      Promise<std::list<T>>* _promise)
+      const std::vector<Future<T>>& _futures,
+      Promise<std::vector<T>>* _promise)
     : ProcessBase(ID::generate("__collect__")),
       futures(_futures),
       promise(_promise),
       ready(0) {}
 
-  virtual ~CollectProcess()
+  ~CollectProcess() override
   {
     delete promise;
   }
 
-  virtual void initialize()
+protected:
+  void initialize() override
   {
     // Stop this nonsense if nobody cares.
     promise->future().onDiscard(defer(this, &CollectProcess::discarded));
 
     foreach (const Future<T>& future, futures) {
       future.onAny(defer(this, &CollectProcess::waited, lambda::_1));
+      future.onAbandoned(defer(this, &CollectProcess::abandoned));
     }
   }
 
 private:
+  void abandoned()
+  {
+    // There is no use waiting because this future will never complete
+    // so terminate this process which will cause `promise` to get
+    // deleted and our future to also be abandoned.
+    terminate(this);
+  }
+
   void discarded()
   {
-    promise->discard();
-
     foreach (Future<T> future, futures) {
       future.discard();
     }
+
+    // NOTE: we discard the promise after we set discard on each of
+    // the futures so that there is a happens-before relationship that
+    // can be assumed by callers.
+    promise->discard();
 
     terminate(this);
   }
@@ -110,18 +179,21 @@ private:
       CHECK_READY(future);
       ready += 1;
       if (ready == futures.size()) {
-        std::list<T> values;
+        std::vector<T> values;
+        values.reserve(futures.size());
+
         foreach (const Future<T>& future, futures) {
           values.push_back(future.get());
         }
-        promise->set(values);
+
+        promise->set(std::move(values));
         terminate(this);
       }
     }
   }
 
-  const std::list<Future<T>> futures;
-  Promise<std::list<T>>* promise;
+  const std::vector<Future<T>> futures;
+  Promise<std::vector<T>>* promise;
   size_t ready;
 };
 
@@ -131,36 +203,48 @@ class AwaitProcess : public Process<AwaitProcess<T>>
 {
 public:
   AwaitProcess(
-      const std::list<Future<T>>& _futures,
-      Promise<std::list<Future<T>>>* _promise)
+      const std::vector<Future<T>>& _futures,
+      Promise<std::vector<Future<T>>>* _promise)
     : ProcessBase(ID::generate("__await__")),
       futures(_futures),
       promise(_promise),
       ready(0) {}
 
-  virtual ~AwaitProcess()
+  ~AwaitProcess() override
   {
     delete promise;
   }
 
-  virtual void initialize()
+  void initialize() override
   {
     // Stop this nonsense if nobody cares.
     promise->future().onDiscard(defer(this, &AwaitProcess::discarded));
 
     foreach (const Future<T>& future, futures) {
       future.onAny(defer(this, &AwaitProcess::waited, lambda::_1));
+      future.onAbandoned(defer(this, &AwaitProcess::abandoned));
     }
   }
 
 private:
+  void abandoned()
+  {
+    // There is no use waiting because this future will never complete
+    // so terminate this process which will cause `promise` to get
+    // deleted and our future to also be abandoned.
+    terminate(this);
+  }
+
   void discarded()
   {
-    promise->discard();
-
     foreach (Future<T> future, futures) {
       future.discard();
     }
+
+    // NOTE: we discard the promise after we set discard on each of
+    // the futures so that there is a happens-before relationship that
+    // can be assumed by callers.
+    promise->discard();
 
     terminate(this);
   }
@@ -171,13 +255,14 @@ private:
 
     ready += 1;
     if (ready == futures.size()) {
-      promise->set(futures);
+      // It is safe to move futures at this point.
+      promise->set(std::move(futures));
       terminate(this);
     }
   }
 
-  const std::list<Future<T>> futures;
-  Promise<std::list<Future<T>>>* promise;
+  std::vector<Future<T>> futures;
+  Promise<std::vector<Future<T>>>* promise;
   size_t ready;
 };
 
@@ -186,15 +271,15 @@ private:
 
 
 template <typename T>
-inline Future<std::list<T>> collect(
-    const std::list<Future<T>>& futures)
+inline Future<std::vector<T>> collect(
+    const std::vector<Future<T>>& futures)
 {
   if (futures.empty()) {
-    return std::list<T>();
+    return std::vector<T>();
   }
 
-  Promise<std::list<T>>* promise = new Promise<std::list<T>>();
-  Future<std::list<T>> future = promise->future();
+  Promise<std::vector<T>>* promise = new Promise<std::vector<T>>();
+  Future<std::vector<T>> future = promise->future();
   spawn(new internal::CollectProcess<T>(futures, promise), true);
   return future;
 }
@@ -203,7 +288,7 @@ inline Future<std::list<T>> collect(
 template <typename... Ts>
 Future<std::tuple<Ts...>> collect(const Future<Ts>&... futures)
 {
-  std::list<Future<Nothing>> wrappers = {
+  std::vector<Future<Nothing>> wrappers = {
     futures.then([]() { return Nothing(); })...
   };
 
@@ -221,16 +306,16 @@ Future<std::tuple<Ts...>> collect(const Future<Ts>&... futures)
 
 
 template <typename T>
-inline Future<std::list<Future<T>>> await(
-    const std::list<Future<T>>& futures)
+inline Future<std::vector<Future<T>>> await(
+    const std::vector<Future<T>>& futures)
 {
   if (futures.empty()) {
     return futures;
   }
 
-  Promise<std::list<Future<T>>>* promise =
-    new Promise<std::list<Future<T>>>();
-  Future<std::list<Future<T>>> future = promise->future();
+  Promise<std::vector<Future<T>>>* promise =
+    new Promise<std::vector<Future<T>>>();
+  Future<std::vector<Future<T>>> future = promise->future();
   spawn(new internal::AwaitProcess<T>(futures, promise), true);
   return future;
 }
@@ -239,7 +324,7 @@ inline Future<std::list<Future<T>>> await(
 template <typename... Ts>
 Future<std::tuple<Future<Ts>...>> await(const Future<Ts>&... futures)
 {
-  std::list<Future<Nothing>> wrappers = {
+  std::vector<Future<Nothing>> wrappers = {
     futures.then([]() { return Nothing(); })...
   };
 

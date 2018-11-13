@@ -104,9 +104,30 @@ Offer devolve(const v1::Offer& offer)
 }
 
 
+OperationStatus devolve(const v1::OperationStatus& status)
+{
+  return devolve<OperationStatus>(status);
+}
+
+
 Resource devolve(const v1::Resource& resource)
 {
   return devolve<Resource>(resource);
+}
+
+
+ResourceProviderID devolve(const v1::ResourceProviderID& resourceProviderId)
+{
+  // NOTE: We do not use the common 'devolve' call for performance.
+  ResourceProviderID id;
+  id.set_value(resourceProviderId.value());
+  return id;
+}
+
+ResourceProviderInfo devolve(
+    const v1::ResourceProviderInfo& resourceProviderInfo)
+{
+  return devolve<ResourceProviderInfo>(resourceProviderInfo);
 }
 
 
@@ -166,9 +187,40 @@ executor::Event devolve(const v1::executor::Event& event)
 }
 
 
+mesos::resource_provider::Call devolve(const v1::resource_provider::Call& call)
+{
+  return devolve<mesos::resource_provider::Call>(call);
+}
+
+
+mesos::resource_provider::Event devolve(
+    const v1::resource_provider::Event& event)
+{
+  return devolve<mesos::resource_provider::Event>(event);
+}
+
+
 scheduler::Call devolve(const v1::scheduler::Call& call)
 {
-  return devolve<scheduler::Call>(call);
+  scheduler::Call _call = devolve<scheduler::Call>(call);
+
+  // Certain conversions require special handling.
+  if (call.type() == v1::scheduler::Call::SUBSCRIBE &&
+      call.has_subscribe()) {
+    // v1 Subscribe.suppressed_roles cannot be automatically converted
+    // because its tag is used by another field in the internal Subscribe.
+    *(_call.mutable_subscribe()->mutable_suppressed_roles()) =
+      call.subscribe().suppressed_roles();
+  }
+
+  if (call.type() == v1::scheduler::Call::ACKNOWLEDGE_OPERATION_STATUS &&
+      call.has_acknowledge_operation_status() &&
+      call.acknowledge_operation_status().has_agent_id()) {
+    *_call.mutable_acknowledge_operation_status()->mutable_slave_id() =
+      devolve(call.acknowledge_operation_status().agent_id());
+  }
+
+  return _call;
 }
 
 
@@ -181,6 +233,12 @@ scheduler::Event devolve(const v1::scheduler::Event& event)
 mesos::agent::Call devolve(const v1::agent::Call& call)
 {
   return devolve<mesos::agent::Call>(call);
+}
+
+
+mesos::agent::Response devolve(const v1::agent::Response& response)
+{
+  return devolve<mesos::agent::Response>(response);
 }
 
 

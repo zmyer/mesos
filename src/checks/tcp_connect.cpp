@@ -30,9 +30,15 @@
 #include <iostream>
 #include <string>
 
+#include <process/address.hpp>
+#include <process/network.hpp>
+
 #include <stout/flags.hpp>
 #include <stout/option.hpp>
 #include <stout/path.hpp>
+
+#include <stout/os/close.hpp>
+#include <stout/os/socket.hpp>
 
 using std::cerr;
 using std::cout;
@@ -47,8 +53,6 @@ using std::string;
 //
 // TODO(alexr): Add support for Windows, see MESOS-6117.
 //
-// TODO(alexr): Support IPv6, see MESOS-6120.
-//
 // NOTE: Consider using stout network abstractions instead of raw system
 // sockets. Once stout supports IPv6 migrating to it will buy us implicit
 // Windows and IPv6 compatibilities.
@@ -61,7 +65,7 @@ public:
   {
     add(&Flags::ip,
         "ip",
-        "IP of the target host. Only IPv4 is supported.");
+        "IP of the target host.");
 
     add(&Flags::port,
         "port",
@@ -77,36 +81,36 @@ public:
 // If the TCP handshake is successful, returns `EXIT_SUCCESS`.
 int testTCPConnect(const string& ip, int port)
 {
-  // Set up destination address.
-  struct sockaddr_in to;
-  memset(&to, 0, sizeof(to));
-  to.sin_family = AF_INET;
-  to.sin_port = htons(port);
-  if (inet_pton(AF_INET, ip.c_str(), &to.sin_addr) != 1) {
+  Try<net::IP> parse = net::IP::parse(ip);
+  if (parse.isError()){
     cerr << "Cannot convert '" << ip << "' into a network address" << endl;
     return EXIT_FAILURE;
   }
 
   // Create a TCP socket.
-  int socket = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (socket < 0) {
-    cerr << "Failed to create socket: " << strerror(errno) << endl;
+  Try<int_fd> socket = net::socket(parse->family(), SOCK_STREAM, 0);
+  if (socket.isError()) {
+    cerr << "Failed to create socket: " << socket.error() << endl;
     return EXIT_FAILURE;
   }
 
   // Try to connect to socket. If the connection succeeds,
   // zero is returned, indicating the remote port is open.
   cout << "Connecting to " << ip << ":" << port << endl;
-  if (connect(socket, reinterpret_cast<sockaddr*>(&to), sizeof(to)) < 0) {
-    cerr << "Connection failed: " << strerror(errno) << endl;
-    close(socket);
+  Try<Nothing, SocketError> connect = process::network::connect(
+      socket.get(),
+      process::network::inet::Address(parse.get(), port));
+
+  if (connect.isError()) {
+    cerr << connect.error().message << endl;
+    os::close(socket.get());
     return EXIT_FAILURE;
   }
 
   cout << "Successfully established TCP connection" << endl;
 
-  shutdown(socket, SHUT_RDWR);
-  close(socket);
+  shutdown(socket.get(), SHUT_RDWR);
+  os::close(socket.get());
 
   return EXIT_SUCCESS;
 }
@@ -118,18 +122,19 @@ int main(int argc, char *argv[])
 
   Try<flags::Warnings> load = flags.load(None(), argc, argv);
 
+  if (flags.help) {
+    cout << flags.usage() << endl;
+    return EXIT_SUCCESS;
+  }
+
   if (load.isError()) {
     cerr << flags.usage(load.error()) << endl;
     return EXIT_FAILURE;
   }
 
+  // Log any flag warnings.
   foreach (const flags::Warning& warning, load->warnings) {
     cerr << warning.message << endl;
-  }
-
-  if (flags.help) {
-    cout << flags.usage() << endl;
-    return EXIT_SUCCESS;
   }
 
   if (flags.ip.isNone()) {
@@ -142,5 +147,21 @@ int main(int argc, char *argv[])
     return EXIT_FAILURE;
   }
 
-  return testTCPConnect(flags.ip.get(), flags.port.get());
+#ifdef __WINDOWS__
+  if (!net::wsa_initialize()) {
+    cerr << "WSA failed to initialize" << endl;
+    return EXIT_FAILURE;
+  }
+#endif // __WINDOWS__
+
+  int result = testTCPConnect(flags.ip.get(), flags.port.get());
+
+#ifdef __WINDOWS__
+  if (!net::wsa_cleanup()) {
+    cerr << "Failed to finalize the WSA socket stack" << endl;
+    return EXIT_FAILURE;
+  }
+#endif // __WINDOWS__
+
+  return result;
 }

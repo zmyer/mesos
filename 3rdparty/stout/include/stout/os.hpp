@@ -46,16 +46,21 @@
 #include <stout/os/bootid.hpp>
 #include <stout/os/chdir.hpp>
 #include <stout/os/chroot.hpp>
+#include <stout/os/dup.hpp>
 #include <stout/os/exists.hpp>
 #include <stout/os/fcntl.hpp>
 #include <stout/os/getenv.hpp>
+#include <stout/os/int_fd.hpp>
 #include <stout/os/kill.hpp>
 #include <stout/os/ls.hpp>
+#include <stout/os/lseek.hpp>
+#include <stout/os/lsof.hpp>
 #include <stout/os/mkdir.hpp>
 #include <stout/os/mkdtemp.hpp>
 #include <stout/os/mktemp.hpp>
 #include <stout/os/os.hpp>
 #include <stout/os/pagesize.hpp>
+#include <stout/os/pipe.hpp>
 #include <stout/os/process.hpp>
 #include <stout/os/rename.hpp>
 #include <stout/os/rm.hpp>
@@ -159,6 +164,9 @@ inline void appendPaths(const std::string& newPaths)
 } // namespace libraries {
 
 
+#ifdef __WINDOWS__
+inline Try<std::string> sysname() = delete;
+#else
 // Return the operating system name (e.g. Linux).
 inline Try<std::string> sysname()
 {
@@ -167,8 +175,9 @@ inline Try<std::string> sysname()
     return Error(info.error());
   }
 
-  return info.get().sysname;
+  return info->sysname;
 }
+#endif // __WINDOWS__
 
 
 inline Try<std::list<Process>> processes()

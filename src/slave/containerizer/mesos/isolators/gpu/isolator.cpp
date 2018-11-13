@@ -16,8 +16,17 @@
 
 #include <stdint.h>
 
+#include <sys/mount.h>
+
+// This header include must be enclosed in an `extern "C"` block to
+// workaround a bug in glibc <= 2.12 (see MESOS-7378).
+//
+// TODO(neilc): Remove this when we no longer support glibc <= 2.12.
+extern "C" {
+#include <sys/sysmacros.h>
+}
+
 #include <algorithm>
-#include <list>
 #include <map>
 #include <set>
 #include <string>
@@ -57,6 +66,7 @@ using mesos::slave::ContainerClass;
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::ContainerLimitation;
+using mesos::slave::ContainerMountInfo;
 using mesos::slave::ContainerState;
 using mesos::slave::Isolator;
 
@@ -65,7 +75,6 @@ using process::Failure;
 using process::Future;
 using process::PID;
 
-using std::list;
 using std::map;
 using std::set;
 using std::string;
@@ -93,38 +102,48 @@ Try<Isolator*> NvidiaGpuIsolatorProcess::create(
     const Flags& flags,
     const NvidiaComponents& components)
 {
-  // Make sure both the 'cgroups/devices' isolator and the
-  // 'filesystem/linux' isolators are present and precede the GPU
-  // isolator.
+  // Make sure both the 'cgroups/devices' (or 'cgroups/all')
+  // and the 'filesystem/linux' isolators are present.
   vector<string> tokens = strings::tokenize(flags.isolation, ",");
 
   auto gpuIsolator =
     std::find(tokens.begin(), tokens.end(), "gpu/nvidia");
+
   auto devicesIsolator =
     std::find(tokens.begin(), tokens.end(), "cgroups/devices");
+
+  auto cgroupsAllIsolator =
+    std::find(tokens.begin(), tokens.end(), "cgroups/all");
+
   auto filesystemIsolator =
     std::find(tokens.begin(), tokens.end(), "filesystem/linux");
 
   CHECK(gpuIsolator != tokens.end());
 
-  if (devicesIsolator == tokens.end()) {
-    return Error("The 'cgroups/devices' isolator must be enabled in"
-                 " order to use the 'gpu/nvidia' isolator");
+  if (cgroupsAllIsolator != tokens.end()) {
+    // The reason that we need to check if `devices` cgroups subsystem is
+    // enabled is, when `cgroups/all` is specified in the `--isolation` agent
+    // flag, cgroups isolator will only load the enabled subsystems. So if
+    // `cgroups/all` is specified but `devices` is not enabled, cgroups isolator
+    // will not load `devices` subsystem in which case we should error out.
+    Try<bool> result = cgroups::enabled("devices");
+    if (result.isError()) {
+      return Error(
+          "Failed to check if the `devices` cgroups subsystem"
+          " is enabled by kernel: " + result.error());
+    } else if (!result.get()) {
+      return Error(
+          "The `devices` cgroups subsystem is not enabled by the kernel");
+    }
+  } else if (devicesIsolator == tokens.end()) {
+    return Error(
+        "The 'cgroups/devices' or 'cgroups/all' isolator must be"
+        " enabled in order to use the 'gpu/nvidia' isolator");
   }
 
   if (filesystemIsolator == tokens.end()) {
     return Error("The 'filesystem/linux' isolator must be enabled in"
                  " order to use the 'gpu/nvidia' isolator");
-  }
-
-  if (devicesIsolator > gpuIsolator) {
-    return Error("'cgroups/devices' must precede 'gpu/nvidia'"
-                 " in the --isolation flag");
-  }
-
-  if (filesystemIsolator > gpuIsolator) {
-    return Error("'filesystem/linux' must precede 'gpu/nvidia'"
-                 " in the --isolation flag");
   }
 
   // Retrieve the cgroups devices hierarchy.
@@ -156,6 +175,23 @@ Try<Isolator*> NvidiaGpuIsolatorProcess::create(
   entry.access.mknod = true;
 
   deviceEntries[Path("/dev/nvidiactl")] = entry;
+
+  // The `nvidia-uvm` module is not typically loaded by default on
+  // systems that have Nvidia GPU drivers installed. Instead,
+  // applications that require this module use `nvidia-modprobe` to
+  // load it dynamically on first use. This program both loads the
+  // `nvidia-uvm` kernel module and creates the corresponding
+  // `/dev/nvidia-uvm` device that it controls.
+  //
+  // We call `nvidia-modprobe` here to ensure that `/dev/nvidia-uvm`
+  // is properly created so we can inject it into any containers that
+  // may require it.
+  if (!os::exists("/dev/nvidia-uvm")) {
+    Try<string> modprobe = os::shell("nvidia-modprobe -u -c 0");
+    if (modprobe.isError()) {
+      return Error("Failed to load '/dev/nvidia-uvm': " + modprobe.error());
+    }
+  }
 
   device = os::stat::rdev("/dev/nvidia-uvm");
   if (device.isError()) {
@@ -202,11 +238,17 @@ bool NvidiaGpuIsolatorProcess::supportsNesting()
 }
 
 
+bool NvidiaGpuIsolatorProcess::supportsStandalone()
+{
+  return true;
+}
+
+
 Future<Nothing> NvidiaGpuIsolatorProcess::recover(
-    const list<ContainerState>& states,
+    const vector<ContainerState>& states,
     const hashset<ContainerID>& orphans)
 {
-  list<Future<Nothing>> futures;
+  vector<Future<Nothing>> futures;
 
   foreach (const ContainerState& state, states) {
     const ContainerID& containerId = state.container_id();
@@ -219,22 +261,7 @@ Future<Nothing> NvidiaGpuIsolatorProcess::recover(
 
     const string cgroup = path::join(flags.cgroups_root, containerId.value());
 
-    Try<bool> exists = cgroups::exists(hierarchy, cgroup);
-    if (exists.isError()) {
-      foreachvalue (Info* info, infos) {
-        delete info;
-      }
-
-      infos.clear();
-
-      return Failure(
-          "Failed to check the existence of the cgroup "
-          "'" + cgroup + "' in hierarchy '" + hierarchy + "' "
-          "for container " + stringify(containerId) +
-          ": " + exists.error());
-    }
-
-    if (!exists.get()) {
+    if (!cgroups::exists(hierarchy, cgroup)) {
       // This may occur if the executor has exited and the isolator
       // has destroyed the cgroup but the slave dies before noticing
       // this. This will be detected when the containerizer tries to
@@ -326,7 +353,7 @@ Future<Option<ContainerLaunchInfo>> NvidiaGpuIsolatorProcess::prepare(
     }
   }
 
-  return update(containerId, containerConfig.executor_info().resources())
+  return update(containerId, containerConfig.resources())
     .then(defer(PID<NvidiaGpuIsolatorProcess>(this),
                 &NvidiaGpuIsolatorProcess::_prepare,
                 containerConfig));
@@ -375,9 +402,10 @@ Future<Option<ContainerLaunchInfo>> NvidiaGpuIsolatorProcess::_prepare(
           " '" + target + "': " + mkdir.error());
     }
 
-    launchInfo.add_pre_exec_commands()->set_value(
-      "mount --no-mtab --rbind --read-only " +
-      volume.HOST_PATH() + " " + target);
+    ContainerMountInfo* mount = launchInfo.add_mounts();
+    mount->set_source(volume.HOST_PATH());
+    mount->set_target(target);
+    mount->set_flags(MS_RDONLY | MS_BIND | MS_REC);
   }
 
   return launchInfo;

@@ -253,11 +253,18 @@ template <typename Iterate, typename Body, typename T, typename R>
 class Loop : public std::enable_shared_from_this<Loop<Iterate, Body, T, R>>
 {
 public:
-  Loop(const Option<UPID>& pid, const Iterate& iterate, const Body& body)
-    : pid(pid), iterate(iterate), body(body) {}
-
-  Loop(const Option<UPID>& pid, Iterate&& iterate, Body&& body)
-    : pid(pid), iterate(std::move(iterate)), body(std::move(body)) {}
+  template <typename Iterate_, typename Body_>
+  static std::shared_ptr<Loop> create(
+      const Option<UPID>& pid,
+      Iterate_&& iterate,
+      Body_&& body)
+  {
+    return std::shared_ptr<Loop>(
+        new Loop(
+            pid,
+            std::forward<Iterate_>(iterate),
+            std::forward<Body_>(body)));
+  }
 
   std::shared_ptr<Loop> shared()
   {
@@ -312,6 +319,10 @@ public:
       dispatch(pid.get(), [self]() {
         self->run(self->iterate());
       });
+
+      // TODO(benh): Link with `pid` so that we can discard or abandon
+      // the promise in the event `pid` terminates and didn't discard
+      // us so that we can avoid any leaks (memory or otherwise).
     } else {
       run(iterate());
     }
@@ -418,6 +429,13 @@ public:
     }
   }
 
+protected:
+  Loop(const Option<UPID>& pid, const Iterate& iterate, const Body& body)
+    : pid(pid), iterate(iterate), body(body) {}
+
+  Loop(const Option<UPID>& pid, Iterate&& iterate, Body&& body)
+    : pid(pid), iterate(std::move(iterate)), body(std::move(body)) {}
+
 private:
   const Option<UPID> pid;
   Iterate iterate;
@@ -443,8 +461,10 @@ Future<V> loop(const Option<UPID>& pid, Iterate&& iterate, Body&& body)
     T,
     V>;
 
-  std::shared_ptr<Loop> loop(
-      new Loop(pid, std::forward<Iterate>(iterate), std::forward<Body>(body)));
+  std::shared_ptr<Loop> loop = Loop::create(
+      pid,
+      std::forward<Iterate>(iterate),
+      std::forward<Body>(body));
 
   return loop->start();
 }

@@ -16,127 +16,169 @@
 
 #include "checks/checker.hpp"
 
+#include <cstdint>
 #include <string>
+#include <vector>
+
+#include <glog/logging.h>
 
 #include <mesos/mesos.hpp>
+#include <mesos/type_utils.hpp>
 
+#include <process/future.hpp>
+
+#include <stout/exit.hpp>
+#include <stout/option.hpp>
+#include <stout/protobuf.hpp>
+#include <stout/stopwatch.hpp>
 #include <stout/strings.hpp>
+#include <stout/try.hpp>
+#include <stout/uuid.hpp>
+#include <stout/variant.hpp>
 
+#include "checks/checker_process.hpp"
+#include "checks/checks_runtime.hpp"
+
+#include "common/http.hpp"
+#include "common/status_utils.hpp"
 #include "common/validation.hpp"
 
+namespace http = process::http;
+
+using process::Future;
+using process::Owned;
+
 using std::string;
+using std::vector;
 
 namespace mesos {
 namespace internal {
 namespace checks {
 
-namespace validation {
 
-Option<Error> checkInfo(const CheckInfo& checkInfo)
-{
-  if (!checkInfo.has_type()) {
-    return Error("CheckInfo must specify 'type'");
-  }
+// Creates a valid instance of `CheckStatusInfo` with the `type` set in
+// accordance to the associated `CheckInfo`.
+static CheckStatusInfo createEmptyCheckStatusInfo(const CheckInfo& checkInfo) {
+  CheckStatusInfo checkStatusInfo;
+  checkStatusInfo.set_type(checkInfo.type());
 
   switch (checkInfo.type()) {
     case CheckInfo::COMMAND: {
-      if (!checkInfo.has_command()) {
-        return Error("Expecting 'command' to be set for command check");
-      }
-
-      const CommandInfo& command = checkInfo.command().command();
-
-      if (!command.has_value()) {
-        string commandType =
-          (command.shell() ? "'shell command'" : "'executable path'");
-
-        return Error("Command check must contain " + commandType);
-      }
-
-      Option<Error> error =
-        common::validation::validateCommandInfo(command);
-      if (error.isSome()) {
-        return Error(
-            "Check's `CommandInfo` is invalid: " + error->message);
-      }
-
-      // TODO(alexr): Make sure irrelevant fields, e.g., `uris` are not set.
-
+      checkStatusInfo.mutable_command();
       break;
     }
-
     case CheckInfo::HTTP: {
-      if (!checkInfo.has_http()) {
-        return Error("Expecting 'http' to be set for HTTP check");
-      }
-
-      const CheckInfo::Http& http = checkInfo.http();
-
-      if (http.has_path() && !strings::startsWith(http.path(), '/')) {
-        return Error(
-            "The path '" + http.path() +
-            "' of HTTP  check must start with '/'");
-      }
-
+      checkStatusInfo.mutable_http();
       break;
     }
-
+    case CheckInfo::TCP: {
+      checkStatusInfo.mutable_tcp();
+      break;
+    }
     case CheckInfo::UNKNOWN: {
-      return Error(
-          "'" + CheckInfo::Type_Name(checkInfo.type()) + "'"
-          " is not a valid check type");
+      LOG(FATAL) << "Received UNKNOWN check type";
+      break;
     }
   }
 
-  if (checkInfo.has_delay_seconds() && checkInfo.delay_seconds() < 0.0) {
-    return Error("Expecting 'delay_seconds' to be non-negative");
-  }
-
-  if (checkInfo.has_interval_seconds() && checkInfo.interval_seconds() < 0.0) {
-    return Error("Expecting 'interval_seconds' to be non-negative");
-  }
-
-  if (checkInfo.has_timeout_seconds() && checkInfo.timeout_seconds() < 0.0) {
-    return Error("Expecting 'timeout_seconds' to be non-negative");
-  }
-
-  return None();
+  return checkStatusInfo;
 }
 
 
-Option<Error> checkStatusInfo(const CheckStatusInfo& checkStatusInfo)
+Try<Owned<Checker>> Checker::create(
+    const CheckInfo& check,
+    const string& launcherDir,
+    const lambda::function<void(const CheckStatusInfo&)>& callback,
+    const TaskID& taskId,
+    Variant<runtime::Plain, runtime::Docker, runtime::Nested> runtime)
 {
-  if (!checkStatusInfo.has_type()) {
-    return Error("CheckStatusInfo must specify 'type'");
+  // Validate the `CheckInfo` protobuf.
+  Option<Error> error = common::validation::validateCheckInfo(check);
+  if (error.isSome()) {
+    return error.get();
   }
 
-  switch (checkStatusInfo.type()) {
-    case CheckInfo::COMMAND: {
-      if (!checkStatusInfo.has_command()) {
-        return Error(
-            "Expecting 'command' to be set for command check's status");
-      }
-      break;
-    }
-
-    case CheckInfo::HTTP: {
-      if (!checkStatusInfo.has_http()) {
-        return Error("Expecting 'http' to be set for HTTP check's status");
-      }
-      break;
-    }
-
-    case CheckInfo::UNKNOWN: {
-      return Error(
-          "'" + CheckInfo::Type_Name(checkStatusInfo.type()) + "'"
-          " is not a valid check's status type");
-    }
-  }
-
-  return None();
+  return Owned<Checker>(
+      new Checker(
+          check,
+          launcherDir,
+          callback,
+          taskId,
+          std::move(runtime)));
 }
 
-} // namespace validation {
+
+Checker::Checker(
+    const CheckInfo& _check,
+    const string& _launcherDir,
+    const lambda::function<void(const CheckStatusInfo&)>& _callback,
+    const TaskID& _taskId,
+    Variant<runtime::Plain, runtime::Docker, runtime::Nested> _runtime)
+  : check(_check),
+    callback(_callback),
+    taskId(_taskId),
+    name(CheckInfo::Type_Name(check.type()) + " check"),
+    previousCheckStatus(createEmptyCheckStatusInfo(_check))
+{
+  VLOG(1) << "Check configuration for task '" << taskId << "':"
+          << " '" << jsonify(JSON::Protobuf(check)) << "'";
+
+  process.reset(
+      new CheckerProcess(
+          _check,
+          _launcherDir,
+          std::bind(&Checker::processCheckResult, this, lambda::_1),
+          _taskId,
+          name,
+          std::move(_runtime),
+          None(),
+          false));
+
+  spawn(process.get());
+}
+
+
+Checker::~Checker()
+{
+  terminate(process.get());
+  wait(process.get());
+}
+
+
+void Checker::pause()
+{
+  dispatch(process.get(), &CheckerProcess::pause);
+}
+
+
+void Checker::resume()
+{
+  dispatch(process.get(), &CheckerProcess::resume);
+}
+
+
+void Checker::processCheckResult(const Try<CheckStatusInfo>& result) {
+  CheckStatusInfo checkStatusInfo;
+
+  if (result.isError()) {
+    LOG(WARNING) << name << " for task '" << taskId << "'"
+                 << " failed: " << result.error();
+
+    checkStatusInfo = createEmptyCheckStatusInfo(check);
+  } else {
+    checkStatusInfo = result.get();
+  }
+
+  // Trigger the callback if check info changes.
+  if (checkStatusInfo != previousCheckStatus) {
+    // We assume this is a local send, i.e., the checker library is not used
+    // in a binary external to the executor and hence can not exit before
+    // the data is sent to the executor.
+    callback(checkStatusInfo);
+
+    previousCheckStatus = checkStatusInfo;
+  }
+}
 
 } // namespace checks {
 } // namespace internal {

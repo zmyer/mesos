@@ -16,6 +16,9 @@
 
 #include "master/validation.hpp"
 
+#include <algorithm>
+#include <iterator>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -23,6 +26,8 @@
 
 #include <mesos/roles.hpp>
 #include <mesos/type_utils.hpp>
+
+#include <process/authenticator.hpp>
 
 #include <stout/foreach.hpp>
 #include <stout/hashmap.hpp>
@@ -39,6 +44,10 @@
 
 #include "master/master.hpp"
 
+using process::http::authentication::Principal;
+
+using std::pair;
+using std::set;
 using std::string;
 using std::vector;
 
@@ -51,9 +60,7 @@ namespace validation {
 namespace master {
 namespace call {
 
-Option<Error> validate(
-    const mesos::master::Call& call,
-    const Option<string>& principal)
+Option<Error> validate(const mesos::master::Call& call)
 {
   if (!call.IsInitialized()) {
     return Error("Not initialized: " + call.InitializationErrorString());
@@ -113,6 +120,9 @@ Option<Error> validate(
       return None();
 
     case mesos::master::Call::GET_EXECUTORS:
+      return None();
+
+    case mesos::master::Call::GET_OPERATIONS:
       return None();
 
     case mesos::master::Call::GET_TASKS:
@@ -178,6 +188,32 @@ Option<Error> validate(
       }
       return None();
 
+    case mesos::master::Call::GROW_VOLUME:
+      if (!call.has_grow_volume()) {
+        return Error("Expecting 'grow_volume' to be present");
+      }
+
+      if (!call.grow_volume().has_slave_id()) {
+        return Error(
+            "Expecting 'agent_id' to be present; only agent default resources "
+            "are supported right now");
+      }
+
+      return None();
+
+    case mesos::master::Call::SHRINK_VOLUME:
+      if (!call.has_shrink_volume()) {
+        return Error("Expecting 'shrink_volume' to be present");
+      }
+
+      if (!call.shrink_volume().has_slave_id()) {
+        return Error(
+            "Expecting 'agent_id' to be present; only agent default resources "
+            "are supported right now");
+      }
+
+      return None();
+
     case mesos::master::Call::GET_MAINTENANCE_STATUS:
       return None();
 
@@ -205,15 +241,37 @@ Option<Error> validate(
     case mesos::master::Call::GET_QUOTA:
       return None();
 
+    case mesos::master::Call::UPDATE_QUOTA:
+      if (!call.has_update_quota()) {
+        return Error("Expecting 'update_quota' to be present");
+      }
+      return None();
+
+    // TODO(bmahler): Add this to a deprecated call section
+    // at the bottom once deprecated by `UPDATE_QUOTA`.
     case mesos::master::Call::SET_QUOTA:
       if (!call.has_set_quota()) {
         return Error("Expecting 'set_quota' to be present");
       }
       return None();
 
+    // TODO(bmahler): Add this to a deprecated call section
+    // at the bottom once deprecated by `UPDATE_QUOTA`.
     case mesos::master::Call::REMOVE_QUOTA:
       if (!call.has_remove_quota()) {
         return Error("Expecting 'remove_quota' to be present");
+      }
+      return None();
+
+    case mesos::master::Call::TEARDOWN:
+      if (!call.has_teardown()) {
+        return Error("Expecting 'teardown' to be present");
+      }
+      return None();
+
+    case mesos::master::Call::MARK_AGENT_GONE:
+      if (!call.has_mark_agent_gone()) {
+        return Error("Expecting 'mark_agent_gone' to be present");
       }
       return None();
   }
@@ -222,6 +280,164 @@ Option<Error> validate(
 }
 
 } // namespace call {
+
+namespace message {
+
+static Option<Error> validateSlaveInfo(const SlaveInfo& slaveInfo)
+{
+  if (slaveInfo.has_id()) {
+    Option<Error> error = common::validation::validateSlaveID(slaveInfo.id());
+    if (error.isSome()) {
+      return error.get();
+    }
+  }
+
+  Option<Error> error = Resources::validate(slaveInfo.resources());
+  if (error.isSome()) {
+    return error.get();
+  }
+
+  return None();
+}
+
+
+Option<Error> registerSlave(const RegisterSlaveMessage& message)
+{
+  const SlaveInfo& slaveInfo = message.slave();
+
+  Option<Error> error = validateSlaveInfo(slaveInfo);
+  if (error.isSome()) {
+    return error.get();
+  }
+
+  if (!message.checkpointed_resources().empty()) {
+    if (!slaveInfo.has_checkpoint() || !slaveInfo.checkpoint()) {
+      return Error(
+          "Checkpointed resources provided when checkpointing is not enabled");
+    }
+  }
+
+  foreach (const Resource& resource, message.checkpointed_resources()) {
+    error = Resources::validate(resource);
+    if (error.isSome()) {
+      return error.get();
+    }
+  }
+
+  return None();
+}
+
+
+Option<Error> reregisterSlave(const ReregisterSlaveMessage& message)
+{
+  hashset<FrameworkID> frameworkIDs;
+  hashset<pair<FrameworkID, ExecutorID>> executorIDs;
+
+  const SlaveInfo& slaveInfo = message.slave();
+  Option<Error> error = validateSlaveInfo(slaveInfo);
+  if (error.isSome()) {
+    return error.get();
+  }
+
+  foreach (const Resource& resource, message.checkpointed_resources()) {
+    Option<Error> error = Resources::validate(resource);
+    if (error.isSome()) {
+      return error.get();
+    }
+  }
+
+  foreach (const FrameworkInfo& framework, message.frameworks()) {
+    Option<Error> error = validation::framework::validate(framework);
+    if (error.isSome()) {
+      return error.get();
+    }
+
+    if (frameworkIDs.contains(framework.id())) {
+      return Error("Framework has a duplicate FrameworkID: '" +
+                  stringify(framework.id()) + "'");
+    }
+
+    frameworkIDs.insert(framework.id());
+  }
+
+  foreach (const ExecutorInfo& executor, message.executor_infos()) {
+    Option<Error> error = validation::executor::validate(executor);
+    if (error.isSome()) {
+      return error.get();
+    }
+
+    // We don't use `internal::validateResources` here because that
+    // includes the `validateAllocatedToSingleRole` check, which is
+    // not valid for agent re-registration.
+    //
+    // TODO(neilc): Consider refactoring `internal::validateResources`
+    // to allow some but not all checks to be applied, or else inject
+    // allocation info into executor resources here.
+    error = Resources::validate(executor.resources());
+    if (error.isSome()) {
+      return error.get();
+    }
+
+    if (!frameworkIDs.contains(executor.framework_id())) {
+      return Error("Executor has an invalid FrameworkID '" +
+                   stringify(executor.framework_id()) + "'");
+    }
+
+    if (executor.has_executor_id()) {
+      auto id = std::make_pair(executor.framework_id(), executor.executor_id());
+      if (executorIDs.contains(id)) {
+        return Error("Framework '" + stringify(executor.framework_id()) +
+                     "' has a duplicate ExecutorID '" +
+                     stringify(executor.executor_id()) + "'");
+      }
+
+      executorIDs.insert(id);
+    }
+  }
+
+  foreach (const Task& task, message.tasks()) {
+    Option<Error> error = common::validation::validateTaskID(task.task_id());
+    if (error.isSome()) {
+      return Error("Task has an invalid TaskID: " + error->message);
+    }
+
+    if (task.slave_id() != slaveInfo.id()) {
+      return Error("Task has an invalid SlaveID '" +
+                   stringify(task.slave_id()) + "'");
+    }
+
+    if (!frameworkIDs.contains(task.framework_id())) {
+      return Error("Task has an invalid FrameworkID '" +
+                   stringify(task.framework_id()) + "'");
+    }
+
+    // Command Executors don't send the executor ID in the task because it
+    // is generated on the agent (see Slave::doReliableRegistration). Only
+    // running tasks ought to have executors.
+    if (task.has_executor_id() && task.state() == TASK_RUNNING) {
+      auto id = std::make_pair(task.framework_id(), task.executor_id());
+      if (!executorIDs.contains(id)) {
+        return Error("Task has an invalid ExecutorID '" +
+                     stringify(task.executor_id()) + "'");
+      }
+    }
+
+    // We don't use `resource::validate` here because the task's
+    // resources might not be in "post-reservation refinement" format.
+    //
+    // TODO(neilc): Consider refactoring `resource::validate` to allow
+    // some but not all checks to be applied, or else convert the
+    // task's resources into post-refinement format here.
+    error = Resources::validate(task.resources());
+    if (error.isSome()) {
+      return Error("Task uses invalid resources: " + error->message);
+    }
+  }
+
+  return None();
+}
+
+} // namespace message {
 } // namespace master {
 
 
@@ -307,7 +523,7 @@ namespace call {
 
 Option<Error> validate(
     const mesos::scheduler::Call& call,
-    const Option<string>& principal)
+    const Option<Principal>& principal)
 {
   if (!call.IsInitialized()) {
     return Error("Not initialized: " + call.InitializationErrorString());
@@ -331,10 +547,15 @@ Option<Error> validate(
     if (principal.isSome() &&
         frameworkInfo.has_principal() &&
         principal != frameworkInfo.principal()) {
+      // We assume that `principal->value.isSome()` is true. The master's HTTP
+      // handlers enforce this constraint, and V0 authenticators will only
+      // return principals of that form.
+      CHECK_SOME(principal->value);
+
       return Error(
-          "Authenticated principal '" + principal.get() + "' does not "
-          "match principal '" + frameworkInfo.principal() + "' set in "
-          "`FrameworkInfo`");
+          "Authenticated principal '" + stringify(principal.get()) +
+          "' does not match principal '" + frameworkInfo.principal() +
+          "' set in `FrameworkInfo`");
     }
 
     return None();
@@ -400,16 +621,50 @@ Option<Error> validate(
         return Error("Expecting 'acknowledge' to be present");
       }
 
-      Try<UUID> uuid = UUID::fromBytes(call.acknowledge().uuid());
+      Try<id::UUID> uuid = id::UUID::fromBytes(call.acknowledge().uuid());
       if (uuid.isError()) {
         return uuid.error();
       }
       return None();
     }
 
+    case mesos::scheduler::Call::ACKNOWLEDGE_OPERATION_STATUS: {
+      if (!call.has_acknowledge_operation_status()) {
+        return Error("Expecting 'acknowledge_operation_status' to be present");
+      }
+
+      const mesos::scheduler::Call::AcknowledgeOperationStatus& acknowledge =
+        call.acknowledge_operation_status();
+
+      Try<id::UUID> uuid = id::UUID::fromBytes(acknowledge.uuid());
+      if (uuid.isError()) {
+        return uuid.error();
+      }
+
+      // TODO(gkleiman): Revisit this once we introduce support for external
+      // resource providers.
+      if (!acknowledge.has_slave_id()) {
+        return Error("Expecting 'agent_id' to be present");
+      }
+
+      // TODO(gkleiman): Revisit this once agent supports sending status
+      // updates for operations affecting default resources (MESOS-8194).
+      if (!acknowledge.has_resource_provider_id()) {
+        return Error("Expecting 'resource_provider_id' to be present");
+      }
+
+      return None();
+    }
+
     case mesos::scheduler::Call::RECONCILE:
       if (!call.has_reconcile()) {
         return Error("Expecting 'reconcile' to be present");
+      }
+      return None();
+
+    case mesos::scheduler::Call::RECONCILE_OPERATIONS:
+      if (!call.has_reconcile_operations()) {
+        return Error("Expecting 'reconcile_operations' to be present");
       }
       return None();
 
@@ -437,19 +692,6 @@ Option<Error> validate(
 
 
 namespace resource {
-
-// Validates that the `gpus` resource is not fractional.
-// We rely on scalar resources only having 3 digits of precision.
-Option<Error> validateGpus(const RepeatedPtrField<Resource>& resources)
-{
-  double gpus = Resources(resources).gpus().getOrElse(0.0);
-  if (static_cast<long long>(gpus * 1000.0) % 1000 != 0) {
-    return Error("The 'gpus' resource must be an unsigned integer");
-  }
-
-  return None();
-}
-
 
 // Validates the ReservationInfos specified in the given resources (if
 // exist). Returns error if any ReservationInfo is found invalid or
@@ -528,7 +770,7 @@ Option<Error> validateUniquePersistenceID(
   Resources volumes = resources.persistentVolumes();
 
   foreach (const Resource& volume, volumes) {
-    const string& role = volume.role();
+    const string& role = Resources::reservationRole(volume);
     const string& id = volume.disk().persistence().id();
 
     if (persistenceIds.contains(role) &&
@@ -582,26 +824,96 @@ Option<Error> validatePersistentVolume(
 }
 
 
+// Validates that all the given resources are allocated to same role.
+Option<Error> validateAllocatedToSingleRole(const Resources& resources)
+{
+  Option<string> role;
+
+  foreach (const Resource& resource, resources) {
+    // Note that the master normalizes `Offer::Operation` resources
+    // to have allocation info set, so we can validate it here.
+    if (!resource.allocation_info().has_role()) {
+      return Error("The resources are not allocated to a role");
+    }
+
+    string _role = resource.allocation_info().role();
+
+    if (role.isNone()) {
+      role = _role;
+      continue;
+    }
+
+    if (_role != role.get()) {
+      return Error("The resources have multiple allocation roles"
+                   " ('" + _role + "' and '" + role.get() + "')"
+                   " but only one allocation role is allowed");
+    }
+  }
+
+  return None();
+}
+
+namespace internal {
+
+// Validates that all the given resources are from the same resource
+// provider. Resources that do not have resource provider ID are
+// assumed to be from the agent (default resource provider).
+Option<Error> validateSingleResourceProvider(
+    const RepeatedPtrField<Resource>& resources)
+{
+  hashset<Option<ResourceProviderID>> resourceProviderIds;
+
+  foreach (const Resource& resource, resources) {
+    resourceProviderIds.insert(resource.has_provider_id()
+      ? resource.provider_id()
+      : Option<ResourceProviderID>::none());
+  }
+
+  if (resourceProviderIds.size() != 1) {
+    if (resourceProviderIds.contains(None())) {
+      return Error("Some resources have a resource provider and some do not");
+    }
+
+    vector<ResourceProviderID> ids;
+    std::transform(
+        resourceProviderIds.begin(),
+        resourceProviderIds.end(),
+        std::back_inserter(ids),
+        [](const Option<ResourceProviderID>& id) {
+          return id.get();
+        });
+
+    return Error(
+        "The resources have multiple resource providers: " +
+        strings::join(", ", ids));
+  }
+
+  return None();
+}
+
+} // namespace internal {
+
+
 Option<Error> validate(const RepeatedPtrField<Resource>& resources)
 {
   Option<Error> error = Resources::validate(resources);
   if (error.isSome()) {
-    return Error("Invalid resources: " + error.get().message);
+    return Error("Invalid resources: " + error->message);
   }
 
-  error = validateGpus(resources);
+  error = common::validation::validateGpus(resources);
   if (error.isSome()) {
-    return Error("Invalid 'gpus' resource: " + error.get().message);
+    return Error("Invalid 'gpus' resource: " + error->message);
   }
 
   error = validateDiskInfo(resources);
   if (error.isSome()) {
-    return Error("Invalid DiskInfo: " + error.get().message);
+    return Error("Invalid DiskInfo: " + error->message);
   }
 
   error = validateDynamicReservationInfo(resources);
   if (error.isSome()) {
-    return Error("Invalid ReservationInfo: " + error.get().message);
+    return Error("Invalid ReservationInfo: " + error->message);
   }
 
   return None();
@@ -628,6 +940,20 @@ Option<Error> validateType(const ExecutorInfo& executor)
       if (executor.has_command()) {
         return Error(
             "'ExecutorInfo.command' must not be set for 'DEFAULT' executor");
+      }
+
+      if (executor.has_container()) {
+        if (executor.container().type() != ContainerInfo::MESOS) {
+          return Error(
+              "'ExecutorInfo.container.type' must be 'MESOS' for "
+              "'DEFAULT' executor");
+        }
+
+        if (executor.container().mesos().has_image()) {
+          return Error(
+              "'ExecutorInfo.container.mesos.image' must not be set for "
+              "'DEFAULT' executor");
+        }
       }
       break;
 
@@ -665,10 +991,10 @@ Option<Error> validateCompatibleExecutorInfo(
       slave->executors.at(framework->id()).at(executorId);
   }
 
-  if (executorInfo.isSome() && !(executor == executorInfo.get())) {
+  if (executorInfo.isSome() && executor != executorInfo.get()) {
     return Error(
         "ExecutorInfo is not compatible with existing ExecutorInfo"
-        " with same ExecutorID).\n"
+        " with same ExecutorID.\n"
         "------------------------------------------------------------\n"
         "Existing ExecutorInfo:\n" +
         stringify(executorInfo.get()) + "\n"
@@ -734,6 +1060,11 @@ Option<Error> validateResources(const ExecutorInfo& executor)
         "Executor uses duplicate persistence ID: " + error->message);
   }
 
+  error = resource::validateAllocatedToSingleRole(resources);
+  if (error.isSome()) {
+    return Error("Invalid executor resources: " + error->message);
+  }
+
   error = resource::validateRevocableAndNonRevocableResources(resources);
   if (error.isSome()) {
     return Error("Executor mixes revocable and non-revocable resources: " +
@@ -759,6 +1090,21 @@ Option<Error> validateCommandInfo(const ExecutorInfo& executor)
 }
 
 
+// Validates the `ContainerInfo` contained within a `ExecutorInfo`.
+Option<Error> validateContainerInfo(const ExecutorInfo& executor)
+{
+  if (executor.has_container()) {
+    Option<Error> error =
+      common::validation::validateContainerInfo(executor.container());
+    if (error.isSome()) {
+      return Error("Executor's `ContainerInfo` is invalid: " + error->message);
+    }
+  }
+
+  return None();
+}
+
+
 Option<Error> validate(
     const ExecutorInfo& executor,
     Framework* framework,
@@ -767,19 +1113,20 @@ Option<Error> validate(
   CHECK_NOTNULL(framework);
   CHECK_NOTNULL(slave);
 
-  vector<lambda::function<Option<Error>()>> validators = {
-    lambda::bind(internal::validateType, executor),
-    lambda::bind(internal::validateExecutorID, executor),
+  Option<Error> error = executor::validate(executor);
+  if (error.isSome()) {
+    return error;
+  }
+
+  const vector<lambda::function<Option<Error>()>> executorValidators = {
     lambda::bind(internal::validateFrameworkID, executor, framework),
-    lambda::bind(internal::validateShutdownGracePeriod, executor),
     lambda::bind(internal::validateResources, executor),
     lambda::bind(
         internal::validateCompatibleExecutorInfo, executor, framework, slave),
-    lambda::bind(internal::validateCommandInfo, executor)
   };
 
-  foreach (const lambda::function<Option<Error>()>& validator, validators) {
-    Option<Error> error = validator();
+  foreach (const auto& validator, executorValidators) {
+    error = validator();
     if (error.isSome()) {
       return error;
     }
@@ -789,6 +1136,28 @@ Option<Error> validate(
 }
 
 } // namespace internal {
+
+Option<Error> validate(const ExecutorInfo& executor)
+{
+  const vector<lambda::function<Option<Error>(const ExecutorInfo&)>>
+      executorValidators = {
+    internal::validateType,
+    internal::validateExecutorID,
+    internal::validateShutdownGracePeriod,
+    internal::validateCommandInfo,
+    internal::validateContainerInfo
+  };
+
+  foreach (const auto& validator, executorValidators) {
+    Option<Error> error = validator(executor);
+    if (error.isSome()) {
+      return error.get();
+    }
+  }
+
+  return None();
+}
+
 } // namespace executor {
 
 
@@ -852,10 +1221,22 @@ Option<Error> validateKillPolicy(const TaskInfo& task)
 }
 
 
+Option<Error> validateMaxCompletionTime(const TaskInfo& task)
+{
+  if (task.has_max_completion_time() &&
+      Nanoseconds(task.max_completion_time().nanoseconds()) <
+        Duration::zero()) {
+    return Error("Task's `max_completion_time` must be non-negative");
+  }
+
+  return None();
+}
+
+
 Option<Error> validateCheck(const TaskInfo& task)
 {
   if (task.has_check()) {
-    Option<Error> error = checks::validation::checkInfo(task.check());
+    Option<Error> error = common::validation::validateCheckInfo(task.check());
     if (error.isSome()) {
       return Error("Task uses invalid check: " + error->message);
     }
@@ -868,7 +1249,8 @@ Option<Error> validateCheck(const TaskInfo& task)
 Option<Error> validateHealthCheck(const TaskInfo& task)
 {
   if (task.has_health_check()) {
-    Option<Error> error = checks::validation::healthCheck(task.health_check());
+    Option<Error> error =
+      common::validation::validateHealthCheck(task.health_check());
     if (error.isSome()) {
       return Error("Task uses invalid health check: " + error->message);
     }
@@ -894,6 +1276,11 @@ Option<Error> validateResources(const TaskInfo& task)
   error = resource::validateUniquePersistenceID(resources);
   if (error.isSome()) {
     return Error("Task uses duplicate persistence ID: " + error->message);
+  }
+
+  error = resource::validateAllocatedToSingleRole(resources);
+  if (error.isSome()) {
+    return Error("Invalid task resources: " + error->message);
   }
 
   error = resource::validateRevocableAndNonRevocableResources(resources);
@@ -950,6 +1337,21 @@ Option<Error> validateCommandInfo(const TaskInfo& task)
 }
 
 
+// Validates the `ContainerInfo` contained within a `TaskInfo`.
+Option<Error> validateContainerInfo(const TaskInfo& task)
+{
+  if (task.has_container()) {
+    Option<Error> error =
+      common::validation::validateContainerInfo(task.container());
+    if (error.isSome()) {
+      return Error("Task's `ContainerInfo` is invalid: " + error->message);
+    }
+  }
+
+  return None();
+}
+
+
 // Validates task specific fields except its executor (if it exists).
 Option<Error> validateTask(
     const TaskInfo& task,
@@ -966,10 +1368,12 @@ Option<Error> validateTask(
     lambda::bind(internal::validateUniqueTaskID, task, framework),
     lambda::bind(internal::validateSlaveID, task, slave),
     lambda::bind(internal::validateKillPolicy, task),
+    lambda::bind(internal::validateMaxCompletionTime, task),
     lambda::bind(internal::validateCheck, task),
     lambda::bind(internal::validateHealthCheck, task),
     lambda::bind(internal::validateResources, task),
-    lambda::bind(internal::validateCommandInfo, task)
+    lambda::bind(internal::validateCommandInfo, task),
+    lambda::bind(internal::validateContainerInfo, task)
   };
 
   foreach (const lambda::function<Option<Error>()>& validator, validators) {
@@ -1043,7 +1447,7 @@ Option<Error> validateExecutor(
           " should not contain any shared resources");
     }
 
-    Option<double> cpus =  executorResources.cpus();
+    Option<double> cpus = executorResources.cpus();
     if (cpus.isNone() || cpus.get() < MIN_CPUS) {
       LOG(WARNING)
         << "Executor '" << task.executor().executor_id()
@@ -1061,7 +1465,7 @@ Option<Error> validateExecutor(
         << "Executor '" << task.executor().executor_id()
         << "' for task '" << task.task_id()
         << "' uses less memory ("
-        << (mem.isSome() ? stringify(mem.get().megabytes()) : "None")
+        << (mem.isSome() ? stringify(mem.get()) : "None")
         << ") than the minimum required (" << MIN_MEM
         << "). Please update your executor, as this will be mandatory "
         << "in future releases.";
@@ -1077,6 +1481,7 @@ Option<Error> validateExecutor(
   // NOTE: This is refactored into a separate function
   // so that it can be easily unit tested.
   error = task::internal::validateTaskAndExecutorResources(task);
+
   if (error.isSome()) {
     return error;
   }
@@ -1144,8 +1549,13 @@ Option<Error> validateTask(
   }
 
   if (task.has_container()) {
-    if (task.container().network_infos().size() > 0) {
-      return Error("NetworkInfos must not be set on the task");
+    if (!task.container().network_infos().empty()) {
+      if (task.has_health_check() &&
+          (task.health_check().type() == HealthCheck::HTTP ||
+           task.health_check().type() == HealthCheck::TCP)) {
+        return Error("HTTP and TCP health checks are not supported for "
+                     "nested containers not joining parent's network");
+      }
     }
 
     if (task.container().type() == ContainerInfo::DOCKER) {
@@ -1229,7 +1639,7 @@ Option<Error> validateExecutor(
   const Resources& executorResources = executor.resources();
 
   // Validate minimal cpus and memory resources of executor.
-  Option<double> cpus =  executorResources.cpus();
+  Option<double> cpus = executorResources.cpus();
   if (cpus.isNone() || cpus.get() < MIN_CPUS) {
     return Error(
       "Executor '" + stringify(executor.executor_id()) +
@@ -1243,7 +1653,7 @@ Option<Error> validateExecutor(
     return Error(
       "Executor '" + stringify(executor.executor_id()) +
       "' uses less memory (" +
-      (mem.isSome() ? stringify(mem.get().megabytes()) : "None") +
+      (mem.isSome() ? stringify(mem.get()) : "None") +
       ") than the minimum required (" + stringify(MIN_MEM) + ")");
   }
 
@@ -1362,7 +1772,7 @@ Try<SlaveID> getSlaveId(Master* master, const OfferID& offerId)
     return inverseOffer->slave_id();
   }
 
-  return Error("Offer id no longer valid");
+  return Error("Offer " + stringify(offerId) + " is no longer valid");
 }
 
 
@@ -1379,7 +1789,7 @@ Try<FrameworkID> getFrameworkId(Master* master, const OfferID& offerId)
     return inverseOffer->framework_id();
   }
 
-  return Error("Offer id no longer valid");
+  return Error("Offer " + stringify(offerId) + " is no longer valid");
 }
 
 
@@ -1455,6 +1865,39 @@ Option<Error> validateFramework(
 }
 
 
+// Validate that all offers in one operation must be
+// allocated to the same role.
+Option<Error> validateAllocationRole(
+    const RepeatedPtrField<OfferID>& offerIds,
+    Master* master)
+{
+  Option<string> role;
+  foreach (const OfferID& offerId, offerIds) {
+    Offer* offer = getOffer(master, offerId);
+    if (offer == nullptr) {
+      return Error("Offer " + stringify(offerId) + " is no longer valid");
+    }
+
+    CHECK(offer->has_allocation_info());
+
+    string _role = offer->allocation_info().role();
+    if (role.isNone()) {
+      role = _role;
+      continue;
+    }
+
+    if (_role != role.get()) {
+      return Error(
+          "Aggregated offers must be allocated to the same role. Offer " +
+          stringify(offerId) + " uses role '" + _role + " but another"
+          " is using role '" + role.get());
+    }
+  }
+
+  return None();
+}
+
+
 // Validates that all offers belong to the same valid slave.
 Option<Error> validateSlave(
     const RepeatedPtrField<OfferID>& offerIds,
@@ -1510,6 +1953,7 @@ Option<Error> validate(
     lambda::bind(validateUniqueOfferID, offerIds),
     lambda::bind(validateOfferIds, offerIds, master),
     lambda::bind(validateFramework, offerIds, master, framework),
+    lambda::bind(validateAllocationRole, offerIds, master),
     lambda::bind(validateSlave, offerIds, master)
   };
 
@@ -1554,20 +1998,30 @@ Option<Error> validateInverseOffers(
 
 namespace operation {
 
+// TODO(jieyu): Validate that resources in an operation is not empty.
+
+
 Option<Error> validate(
     const Offer::Operation::Reserve& reserve,
-    const Option<string>& principal,
-    const Option<string>& frameworkRole)
+    const Option<Principal>& principal,
+    const protobuf::slave::Capabilities& agentCapabilities,
+    const Option<FrameworkInfo>& frameworkInfo)
 {
-  if (frameworkRole.isSome() && frameworkRole.get() == "*") {
-    return Error(
-        "A reserve operation was attempted by a framework with role"
-        " '*', but frameworks with that role cannot reserve resources");
-  }
-
+  // NOTE: this ensures the reservation is not being made to the "*" role.
   Option<Error> error = resource::validate(reserve.resources());
   if (error.isSome()) {
-    return Error("Invalid resources: " + error.get().message);
+    return Error("Invalid resources: " + error->message);
+  }
+
+  error =
+    resource::internal::validateSingleResourceProvider(reserve.resources());
+  if (error.isSome()) {
+    return Error("Invalid resources: " + error->message);
+  }
+
+  Option<hashset<string>> frameworkRoles;
+  if (frameworkInfo.isSome()) {
+    frameworkRoles = protobuf::framework::getRoles(frameworkInfo.get());
   }
 
   foreach (const Resource& resource, reserve.resources()) {
@@ -1576,28 +2030,98 @@ Option<Error> validate(
           "Resource " + stringify(resource) + " is not dynamically reserved");
     }
 
+    if (!agentCapabilities.hierarchicalRole &&
+        strings::contains(Resources::reservationRole(resource), "/")) {
+      return Error(
+          "Resource " + stringify(resource) +
+          " with reservation for hierarchical role"
+          " '" + Resources::reservationRole(resource) + "'"
+          " cannot be reserved on an agent without HIERARCHICAL_ROLE"
+          " capability");
+    }
+
+    if (!agentCapabilities.reservationRefinement &&
+        Resources::hasRefinedReservations(resource)) {
+      return Error(
+          "Resource " + stringify(resource) +
+          " with reservation refinement cannot be reserved on"
+          " an agent without RESERVATION_REFINEMENT capability");
+    }
+
     if (principal.isSome()) {
-      if (!resource.reservation().has_principal()) {
+      // We assume that `principal->value.isSome()` is true. The master's HTTP
+      // handlers enforce this constraint, and V0 authenticators will only
+      // return principals of that form.
+      CHECK_SOME(principal->value);
+
+      const Resource::ReservationInfo& reservation =
+        *resource.reservations().rbegin();
+
+      if (!reservation.has_principal()) {
         return Error(
             "A reserve operation was attempted by principal '" +
-            principal.get() + "', but there is a reserved resource in the"
-            " request with no principal set in `ReservationInfo`");
+            stringify(principal.get()) + "', but there is a "
+            "reserved resource in the request with no principal set");
       }
 
-      if (resource.reservation().principal() != principal.get()) {
+      if (principal != reservation.principal()) {
         return Error(
-            "A reserve operation was attempted by principal '" +
-            principal.get() + "', but there is a reserved resource in the"
-            " request with principal '" + resource.reservation().principal() +
-            "' set in `ReservationInfo`");
+            "A reserve operation was attempted by authenticated principal '" +
+            stringify(principal.get()) + "', which does not match a "
+            "reserved resource in the request with principal '" +
+            reservation.principal() + "'");
       }
     }
 
-    if (frameworkRole.isSome() && resource.role() != frameworkRole.get()) {
-      return Error(
-          "A reserve operation was attempted for a resource with role"
-          " '" + resource.role() + "', but the framework can only reserve"
-          " resources with role '" + frameworkRole.get() + "'");
+    if (frameworkRoles.isSome()) {
+      // If information on the framework was passed we are dealing
+      // with a request over the framework API. In this case we expect
+      // that the reserved resources where allocated to the role, and
+      // that the allocation role and reservation role match the role
+      // of the framework.
+      if (!resource.allocation_info().has_role()) {
+        return Error(
+            "A reserve operation was attempted on unallocated resource"
+            " " + stringify(resource) + ", but frameworks can only"
+            " perform reservations on allocated resources");
+      }
+
+      if (resource.allocation_info().role() !=
+          Resources::reservationRole(resource)) {
+        return Error(
+            "A reserve operation was attempted for a resource with role"
+            " '" + Resources::reservationRole(resource) + "', but"
+            " the resource was allocated to role"
+            " '" + resource.allocation_info().role() + "'");
+      }
+
+      if (!frameworkRoles->contains(resource.allocation_info().role())) {
+        return Error(
+            "A reserve operation was attempted for a resource allocated"
+            " to role '" + resource.allocation_info().role() + "',"
+            " but the framework only has roles"
+            " '" + stringify(frameworkRoles.get()) + "'");
+      }
+
+      if (!frameworkRoles->contains(Resources::reservationRole(resource))) {
+        return Error(
+            "A reserve operation was attempted for a resource with role"
+            " '" + Resources::reservationRole(resource) + "',"
+            " but the framework can only reserve resources with roles"
+            " '" + stringify(frameworkRoles.get()) + "'");
+      }
+    } else {
+      // If no `FrameworkInfo` was passed we are dealing with a
+      // request via the operator HTTP API. In this case we expect
+      // that the reserved resources have no `AllocationInfo` set
+      // because operators can only reserve from the unallocated
+      // resources.
+      if (resource.has_allocation_info()) {
+        return Error(
+            "A reserve operation was attempted with an allocated resource,"
+            " but the operator API only allows reservations to be made to"
+            " unallocated resources");
+      }
     }
 
     // NOTE: This check would be covered by 'contains' since there
@@ -1610,21 +2134,39 @@ Option<Error> validate(
     }
   }
 
+  if (frameworkInfo.isSome()) {
+    // If the operation is being applied by a framework, we also
+    // ensure that across all the resources, they are allocated
+    // to a single role.
+    error = resource::validateAllocatedToSingleRole(reserve.resources());
+    if (error.isSome()) {
+      return Error("Invalid reservation resources: " + error->message);
+    }
+  }
+
   return None();
 }
 
 
-Option<Error> validate(const Offer::Operation::Unreserve& unreserve)
+Option<Error> validate(
+    const Offer::Operation::Unreserve& unreserve,
+    const Option<FrameworkInfo>& frameworkInfo)
 {
   Option<Error> error = resource::validate(unreserve.resources());
   if (error.isSome()) {
-    return Error("Invalid resources: " + error.get().message);
+    return Error("Invalid resources: " + error->message);
+  }
+
+  error =
+    resource::internal::validateSingleResourceProvider(unreserve.resources());
+  if (error.isSome()) {
+    return Error("Invalid resources: " + error->message);
   }
 
   // NOTE: We don't check that 'FrameworkInfo.principal' matches
   // 'Resource.ReservationInfo.principal' here because the authorization
   // depends on the "unreserve" ACL which specifies which 'principal' can
-  // unreserve which 'principal's resources. In the absense of an ACL, we allow
+  // unreserve which 'principal's resources. In the absence of an ACL, we allow
   // any 'principal' to unreserve any other 'principal's resources.
 
   foreach (const Resource& resource, unreserve.resources()) {
@@ -1649,17 +2191,23 @@ Option<Error> validate(const Offer::Operation::Unreserve& unreserve)
 Option<Error> validate(
     const Offer::Operation::Create& create,
     const Resources& checkpointedResources,
-    const Option<string>& principal,
+    const Option<Principal>& principal,
+    const protobuf::slave::Capabilities& agentCapabilities,
     const Option<FrameworkInfo>& frameworkInfo)
 {
   Option<Error> error = resource::validate(create.volumes());
   if (error.isSome()) {
-    return Error("Invalid resources: " + error.get().message);
+    return Error("Invalid resources: " + error->message);
+  }
+
+  error = resource::internal::validateSingleResourceProvider(create.volumes());
+  if (error.isSome()) {
+    return Error("Invalid resources: " + error->message);
   }
 
   error = resource::validatePersistentVolume(create.volumes());
   if (error.isSome()) {
-    return Error("Not a persistent volume: " + error.get().message);
+    return Error("Not a persistent volume: " + error->message);
   }
 
   error = resource::validateUniquePersistenceID(
@@ -1680,27 +2228,61 @@ Option<Error> validate(
       return Error(
           "Create volume operation for '" + stringify(volume) +
           "' has been attempted by framework '" +
-          stringify(frameworkInfo.get().id()) +
+          stringify(frameworkInfo->id()) +
           "' with no SHARED_RESOURCES capability");
     }
 
+    if (!agentCapabilities.hierarchicalRole &&
+        strings::contains(Resources::reservationRole(volume), "/")) {
+      return Error(
+          "Volume " + stringify(volume) +
+          " with reservation for hierarchical role"
+          " '" + Resources::reservationRole(volume) + "'"
+          " cannot be created on an agent without HIERARCHICAL_ROLE"
+          " capability");
+    }
+
+    if (!agentCapabilities.reservationRefinement &&
+        Resources::hasRefinedReservations(volume)) {
+      return Error(
+          "Volume " + stringify(volume) +
+          " with reservation refinement cannot be created on"
+          " an agent without RESERVATION_REFINEMENT capability");
+    }
+
     // Ensure that the provided principals match. If `principal` is `None`,
-    // we allow `volume.disk().persistence().principal()` to take any value.
+    // we allow `volume.disk.persistence.principal` to take any value.
     if (principal.isSome()) {
+      // We assume that `principal->value.isSome()` is true. The master's HTTP
+      // handlers enforce this constraint, and V0 authenticators will only
+      // return principals of that form.
+      CHECK_SOME(principal->value);
+
       if (!volume.disk().persistence().has_principal()) {
         return Error(
-            "Create volume operation has been attempted by principal '" +
-            principal.get() + "', but there is a volume in the operation with "
-            "no principal set in 'DiskInfo.Persistence'");
+            "Create volume operation attempted by principal '" +
+            stringify(principal.get()) + "', but there is a volume in the "
+            "operation with no principal set in 'disk.persistence'");
       }
 
-      if (volume.disk().persistence().principal() != principal.get()) {
+      if (principal != volume.disk().persistence().principal()) {
         return Error(
-            "Create volume operation has been attempted by principal '" +
-            principal.get() + "', but there is a volume in the operation with "
-            "principal '" + volume.disk().persistence().principal() +
-            "' set in 'DiskInfo.Persistence'");
+            "Create volume operation attempted by authenticated principal '" +
+            stringify(principal.get()) + "', which does not match "
+            "a volume in the operation with principal '" +
+            volume.disk().persistence().principal() +
+            "' set in 'disk.persistence'");
       }
+    }
+  }
+
+  if (frameworkInfo.isSome()) {
+    // If the operation is being applied by a framework, we also
+    // ensure that across all the resources, they are allocated
+    // to a single role.
+    error = resource::validateAllocatedToSingleRole(create.volumes());
+    if (error.isSome()) {
+      return Error("Invalid volume resources: " + error->message);
     }
   }
 
@@ -1712,20 +2294,50 @@ Option<Error> validate(
     const Offer::Operation::Destroy& destroy,
     const Resources& checkpointedResources,
     const hashmap<FrameworkID, Resources>& usedResources,
-    const hashmap<FrameworkID, hashmap<TaskID, TaskInfo>>& pendingTasks)
+    const hashmap<FrameworkID, hashmap<TaskID, TaskInfo>>& pendingTasks,
+    const Option<FrameworkInfo>& frameworkInfo)
 {
-  Option<Error> error = resource::validate(destroy.volumes());
+  // The operation can either contain allocated resources
+  // (in the case of a framework accepting offers), or
+  // unallocated resources (in the case of the operator
+  // endpoints). To ensure we can check for the presence
+  // of the volume in the resources in use by tasks and
+  // executors, we unallocate both the volume and the
+  // used resources before performing the contains check.
+  //
+  // TODO(bmahler): This lambda is copied in several places
+  // in the code, consider how best to pull this out.
+  auto unallocated = [](const Resources& resources) {
+    Resources result = resources;
+    result.unallocate();
+    return result;
+  };
+
+  Resources volumes = unallocated(destroy.volumes());
+
+  Option<Error> error = resource::validate(volumes);
   if (error.isSome()) {
-    return Error("Invalid resources: " + error.get().message);
+    return Error("Invalid resources: " + error->message);
   }
 
-  error = resource::validatePersistentVolume(destroy.volumes());
+  error = resource::internal::validateSingleResourceProvider(volumes);
   if (error.isSome()) {
-    return Error("Not a persistent volume: " + error.get().message);
+    return Error("Invalid resources: " + error->message);
   }
 
-  if (!checkpointedResources.contains(destroy.volumes())) {
-    return Error("Persistent volumes not found");
+  error = resource::validatePersistentVolume(volumes);
+  if (error.isSome()) {
+    return Error("Not a persistent volume: " + error->message);
+  }
+
+  foreach (const Resource volume, volumes) {
+    if (Resources::hasResourceProvider(volume)) {
+      continue;
+    }
+
+    if (!checkpointedResources.contains(volume)) {
+      return Error("Persistent volumes not found");
+    }
   }
 
   // Ensure the volumes being destroyed are not in use currently.
@@ -1733,8 +2345,8 @@ Option<Error> validate(
   // it is not possible for a non-shared resource to appear in an offer
   // if it is already in use.
   foreachvalue (const Resources& resources, usedResources) {
-    foreach (const Resource& volume, destroy.volumes()) {
-      if (resources.contains(volume)) {
+    foreach (const Resource& volume, volumes) {
+      if (unallocated(resources).contains(volume)) {
         return Error("Persistent volumes in use");
       }
     }
@@ -1754,11 +2366,188 @@ Option<Error> validate(
       }
 
       foreach (const Resource& volume, destroy.volumes()) {
-        if (resources.contains(volume)) {
+        if (unallocated(resources).contains(volume)) {
           return Error("Persistent volume in pending tasks");
         }
       }
     }
+  }
+
+  return None();
+}
+
+
+Option<Error> validate(
+    const Offer::Operation::GrowVolume& growVolume,
+    const protobuf::slave::Capabilities& agentCapabilities)
+{
+  Option<Error> error = Resources::validate(growVolume.volume());
+  if (error.isSome()) {
+    return Error(
+        "Invalid resource in the 'GrowVolume.volume' field: " +
+        error->message);
+  }
+
+  error = Resources::validate(growVolume.addition());
+  if (error.isSome()) {
+    return Error(
+        "Invalid resource in the 'GrowVolume.addition' field: " +
+        error->message);
+  }
+
+  Value::Scalar zero;
+  zero.set_value(0);
+
+  // The `Scalar` comparison contains a fixed-point conversion.
+  if (growVolume.addition().scalar() <= zero) {
+    return Error(
+        "The size of 'GrowVolume.addition' field must be greater than zero");
+  }
+
+  if (Resources::hasResourceProvider(growVolume.volume())) {
+    return Error("Growing a volume from a resource provider is not supported");
+  }
+
+  error = resource::validatePersistentVolume(Resources(growVolume.volume()));
+  if (error.isSome()) {
+    return Error(
+        "Invalid persistent volume in the 'GrowVolume.volume' field: " +
+        error->message);
+  }
+
+  if (growVolume.volume().has_shared()) {
+    return Error("Growing a shared persistent volume is not supported");
+  }
+
+  // TODO(zhitao): Move this to a helper function
+  // `Resources::stripPersistentVolume`.
+  Resource stripped = growVolume.volume();
+
+  if (stripped.disk().has_source()) {
+    // PATH/MOUNT disk.
+    stripped.mutable_disk()->clear_persistence();
+    stripped.mutable_disk()->clear_volume();
+  } else {
+    // ROOT disk.
+    stripped.clear_disk();
+  }
+
+  if ((Resources(stripped) + growVolume.addition()).size() != 1) {
+    return Error(
+        "Incompatible resources in the 'GrowVolume.volume' and "
+        "'GrowVolume.addition' fields");
+  }
+
+  if (!agentCapabilities.resizeVolume) {
+    return Error(
+        "Volume " + stringify(growVolume.volume()) +
+        " cannot be grown on an agent without RESIZE_VOLUME capability");
+  }
+
+  return None();
+}
+
+
+Option<Error> validate(
+    const Offer::Operation::ShrinkVolume& shrinkVolume,
+    const protobuf::slave::Capabilities& agentCapabilities)
+{
+  Option<Error> error = Resources::validate(shrinkVolume.volume());
+  if (error.isSome()) {
+    return Error(
+        "Invalid resource in the 'ShrinkVolume.volume' field: " +
+        error->message);
+  }
+
+  Value::Scalar zero;
+  zero.set_value(0);
+
+  // The `Scalar` comparison contains a fixed-point conversion.
+  if (shrinkVolume.subtract() <= zero) {
+    return Error(
+        "Value of 'ShrinkVolume.subtract' must be greater than zero");
+  }
+
+  if (shrinkVolume.volume().scalar() <= shrinkVolume.subtract()) {
+    return Error(
+        "Value of 'ShrinkVolume.subtract' must be smaller than the size "
+        "of 'ShrinkVolume.volume'");
+  }
+
+  if (Resources::hasResourceProvider(shrinkVolume.volume())) {
+    return Error(
+        "Shrinking a volume from a resource provider is not supported");
+  }
+
+  if (shrinkVolume.volume().disk().source().type() ==
+      Resource::DiskInfo::Source::MOUNT) {
+    return Error(
+        "Shrinking a volume on a MOUNT disk is not supported");
+  }
+
+  error = resource::validatePersistentVolume(Resources(shrinkVolume.volume()));
+  if (error.isSome()) {
+    return Error(
+        "Invalid persistent volume in the 'ShrinkVolume.volume' field: " +
+        error->message);
+  }
+
+  if (shrinkVolume.volume().has_shared()) {
+    return Error("Shrinking a shared persistent volume is not supported");
+  }
+
+  if (!agentCapabilities.resizeVolume) {
+    return Error(
+        "Volume " + stringify(shrinkVolume.volume()) +
+        " cannot be shrunk on an agent without RESIZE_VOLUME capability");
+  }
+
+  return None();
+}
+
+
+Option<Error> validate(const Offer::Operation::CreateDisk& createDisk)
+{
+  const Resource& source = createDisk.source();
+
+  Option<Error> error = resource::validate(Resources(source));
+  if (error.isSome()) {
+    return Error("Invalid resource: " + error->message);
+  }
+
+  if (!Resources::hasResourceProvider(source)) {
+    return Error("'source' is not managed by a resource provider");
+  }
+
+  if (!Resources::isDisk(source, Resource::DiskInfo::Source::RAW)) {
+    return Error("'source' is not a RAW disk resource");
+  }
+
+  if (createDisk.target_type() != Resource::DiskInfo::Source::MOUNT &&
+      createDisk.target_type() != Resource::DiskInfo::Source::BLOCK) {
+    return Error("'target_type' is neither MOUNT or BLOCK");
+  }
+
+  return None();
+}
+
+
+Option<Error> validate(const Offer::Operation::DestroyDisk& destroyDisk)
+{
+  const Resource& source = destroyDisk.source();
+
+  Option<Error> error = resource::validate(Resources(source));
+  if (error.isSome()) {
+    return Error("Invalid resource: " + error->message);
+  }
+
+  if (!Resources::hasResourceProvider(source)) {
+    return Error("'source' is not managed by a resource provider");
+  }
+
+  if (!Resources::isDisk(source, Resource::DiskInfo::Source::MOUNT) &&
+      !Resources::isDisk(source, Resource::DiskInfo::Source::BLOCK)) {
+    return Error("'source' is neither a MOUNT or BLOCK disk resource");
   }
 
   return None();

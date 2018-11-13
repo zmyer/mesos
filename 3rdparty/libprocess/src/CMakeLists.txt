@@ -14,109 +14,108 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# OpenSSL: Cryptography and SSL/TLS Toolkit.
+# https://www.openssl.org
+############################################
+if (ENABLE_SSL)
+  find_package(OpenSSL REQUIRED)
+endif ()
+
+
 # SOURCE FILES FOR THE PROCESS LIBRARY.
 #######################################
-
-if (WIN32)
-  set(PROCESS_SRC
-    ${PROCESS_SRC}
-    subprocess_windows.cpp
-    )
-else (WIN32)
-  set(PROCESS_SRC
-    ${PROCESS_SRC}
-    subprocess_posix.cpp
-    )
-endif (WIN32)
-
 set(PROCESS_SRC
-  ${PROCESS_SRC}
-  authenticator_manager.cpp
-  authenticator_manager.hpp
   authenticator.cpp
+  authenticator_manager.cpp
   clock.cpp
-  config.hpp
-  decoder.hpp
-  encoder.hpp
-  event_loop.hpp
   firewall.cpp
-  gate.hpp
+  grpc.cpp
+  gtest_constants.cpp
   help.cpp
   http.cpp
+  http_proxy.cpp
   io.cpp
   latch.cpp
   logging.cpp
+  memory_profiler.cpp
   metrics/metrics.cpp
   mime.cpp
   pid.cpp
-  poll_socket.cpp
-  poll_socket.hpp
-  profiler.cpp
   process.cpp
-  process_reference.hpp
+  profiler.cpp
   reap.cpp
   socket.cpp
   subprocess.cpp
-  time.cpp
-  timeseries.cpp
-  )
+  time.cpp)
+
+
+if (WIN32)
+  list(APPEND PROCESS_SRC
+    windows/subprocess.cpp)
+else ()
+  list(APPEND PROCESS_SRC
+    posix/subprocess.cpp)
+endif ()
 
 if (ENABLE_LIBEVENT)
-  set(PROCESS_SRC
-    ${PROCESS_SRC}
-    libevent.hpp
-    libevent.cpp
-    libevent_poll.cpp)
-else (ENABLE_LIBEVENT)
-  set(PROCESS_SRC
-    ${PROCESS_SRC}
-    libev.hpp
-    libev.cpp
-    libev_poll.cpp
-    )
-endif (ENABLE_LIBEVENT)
+  list(APPEND PROCESS_SRC
+    posix/libevent/libevent.cpp
+    posix/libevent/libevent_poll.cpp)
+elseif (WIN32)
+  list(APPEND PROCESS_SRC
+    windows/event_loop.cpp
+    windows/libwinio.cpp)
+else ()
+  list(APPEND PROCESS_SRC
+    posix/libev/libev.cpp
+    posix/libev/libev_poll.cpp)
+endif ()
 
-# INCLUDE DIRECTIVES FOR PROCESS LIBRARY (generates, e.g., -I/path/to/thing
-# on Linux).
-###########################################################################
-include_directories(SYSTEM ${PROCESS_3RDPARTY_INCLUDE_DIRS})
-include_directories(${PROCESS_INCLUDE_DIRS})
+if (WIN32 AND NOT ENABLE_LIBEVENT)
+  list(APPEND PROCESS_SRC
+    windows/io.cpp
+    windows/poll_socket.cpp)
+else ()
+  list(APPEND PROCESS_SRC
+    posix/io.cpp
+    posix/poll_socket.cpp)
+endif ()
 
-# LINKING LIBRARIES BY DIRECTORY (might generate, e.g., -L/path/to/thing on
-# Linux).
-###########################################################################
-link_directories(${PROCESS_LIB_DIRS})
+if (ENABLE_SSL)
+  list(APPEND PROCESS_SRC
+    jwt.cpp
+    jwt_authenticator.cpp
+    openssl.cpp
+    ssl/utilities.cpp)
 
-# THE PROCESS LIBRARY (generates, e.g., libprocess.so, etc., on Linux).
-#######################################################################
-if (WIN32)
-  add_library(${PROCESS_TARGET} STATIC ${PROCESS_SRC})
-else (WIN32)
-  add_library(${PROCESS_TARGET} SHARED ${PROCESS_SRC})
+  if (ENABLE_LIBEVENT)
+    list(APPEND PROCESS_SRC
+      posix/libevent/libevent_ssl_socket.cpp)
+  endif ()
+endif ()
 
-  set_target_properties(
-    ${PROCESS_TARGET} PROPERTIES
-    POSITION_INDEPENDENT_CODE TRUE
-    )
-endif (WIN32)
+add_library(process ${PROCESS_SRC})
 
-GROUP_STOUT_HEADERS()
-GROUP_PROCESS_HEADERS()
+target_link_libraries(
+  process PUBLIC
+  stout
+  http_parser
+  grpc
+  $<$<BOOL:${ENABLE_SSL}>:OpenSSL::SSL>
+  $<$<BOOL:${ENABLE_SSL}>:OpenSSL::Crypto>)
 
-GROUP_SOURCE(
-  "src"
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "*.[ch]*")
+target_link_libraries(
+  process PRIVATE
+  concurrentqueue
+  $<IF:$<BOOL:${ENABLE_LIBEVENT}>,libevent,$<$<NOT:$<PLATFORM_ID:Windows>>:libev>>)
 
-set_target_properties(
-  ${PROCESS_TARGET} PROPERTIES
-  VERSION ${PROCESS_PACKAGE_VERSION}
-  SOVERSION ${PROCESS_PACKAGE_SOVERSION}
-  )
+target_compile_definitions(
+  process PRIVATE
+  $<$<AND:$<PLATFORM_ID:Windows>,$<NOT:$<BOOL:${ENABLE_LIBEVENT}>>>:ENABLE_LIBWINIO>
+  $<$<BOOL:${ENABLE_LOCK_FREE_RUN_QUEUE}>:LOCK_FREE_RUN_QUEUE>
+  $<$<BOOL:${ENABLE_LOCK_FREE_EVENT_QUEUE}>:LOCK_FREE_EVENT_QUEUE>
+  $<$<BOOL:${ENABLE_LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE}>:LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE>
+  $<$<PLATFORM_ID:LINUX>:LIBPROCESS_ALLOW_JEMALLOC>)
 
-add_dependencies(${PROCESS_TARGET} ${PROCESS_DEPENDENCIES})
-
-# ADD LINKER FLAGS (generates, e.g., -lglog on Linux).
-######################################################
-target_link_libraries(${PROCESS_TARGET} ${PROCESS_LIBS})
+target_include_directories(process PUBLIC ../include)
+target_include_directories(process PRIVATE .)

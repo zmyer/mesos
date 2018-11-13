@@ -339,13 +339,13 @@ public class V1TestFramework {
 
     Credential.Builder credentialBuilder = null;
 
-    if (System.getenv("DEFAULT_PRINCIPAL") != null) {
-      frameworkBuilder.setPrincipal(System.getenv("DEFAULT_PRINCIPAL"));
+    if (System.getenv("MESOS_EXAMPLE_PRINCIPAL") != null) {
+      frameworkBuilder.setPrincipal(System.getenv("MESOS_EXAMPLE_PRINCIPAL"));
 
-      if (System.getenv("DEFAULT_SECRET") != null) {
+      if (System.getenv("MESOS_EXAMPLE_SECRET") != null) {
         credentialBuilder = Credential.newBuilder()
-          .setPrincipal(System.getenv("DEFAULT_PRINCIPAL"))
-          .setSecret(System.getenv("DEFAULT_SECRET"));
+          .setPrincipal(System.getenv("MESOS_EXAMPLE_PRINCIPAL"))
+          .setSecret(System.getenv("MESOS_EXAMPLE_SECRET"));
       }
     }
 
@@ -378,6 +378,18 @@ public class V1TestFramework {
     } finally {
       lock.unlock();
     }
+
+    // NOTE: Copied from src/examples/java/TestFramework.java:
+    // For this test to pass reliably on some platforms, this sleep is
+    // required to ensure that the SchedulerDriver teardown is complete
+    // before the JVM starts running native object destructors after
+    // System.exit() is called. 500ms proved successful in test runs,
+    // but on a heavily loaded machine it might not.
+
+    // TODO(greg): Ideally, we would inspect the status of the driver
+    // and its associated tasks via the Java API and wait until their
+    // teardown is complete to exit.
+    Thread.sleep(500);
 
     System.exit(0);
   }

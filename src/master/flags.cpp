@@ -124,11 +124,11 @@ mesos::internal::master::Flags::Flags()
   add(&Flags::agent_reregister_timeout,
       "agent_reregister_timeout",
       flags::DeprecatedName("slave_reregister_timeout"),
-      "The timeout within which an agent is expected to re-register.\n"
-      "Agents re-register when they become disconnected from the master\n"
+      "The timeout within which an agent is expected to reregister.\n"
+      "Agents reregister when they become disconnected from the master\n"
       "or when a new master is elected as the leader. Agents that do not\n"
-      "re-register within the timeout will be marked unreachable in the\n"
-      "registry; if/when the agent re-registers with the master, any\n"
+      "reregister within the timeout will be marked unreachable in the\n"
+      "registry; if/when the agent reregisters with the master, any\n"
       "non-partition-aware tasks running on the agent will be terminated.\n"
       "NOTE: This value has to be at least " +
         stringify(MIN_AGENT_REREGISTER_TIMEOUT) + ".",
@@ -171,23 +171,23 @@ mesos::internal::master::Flags::Flags()
   add(&Flags::whitelist,
       "whitelist",
       "Path to a file which contains a list of agents (one per line) to\n"
-      "advertise offers for. The file is watched, and periodically re-read to\n"
-      "refresh the agent whitelist. By default there is no whitelist / all\n"
-      "machines are accepted. Path could be of the form\n"
+      "advertise offers for. The file is watched and periodically re-read to\n"
+      "refresh the agent whitelist. By default there is no whitelist: all\n"
+      "machines are accepted. Path can be of the form\n"
       "`file:///path/to/file` or `/path/to/file`.\n");
 
-  add(&Flags::user_sorter,
-      "user_sorter",
-      "Policy to use for allocating resources\n"
-      "between users. May be one of:\n"
-      "  dominant_resource_fairness (drf)",
+  add(&Flags::role_sorter,
+      "role_sorter",
+      flags::DeprecatedName("user_sorter"),
+      "Policy to use for allocating resources between roles when\n"
+      "allocating up to quota guarantees as well as when allocating\n"
+      "up to quota limits. May be one of: [drf, random]",
       "drf");
 
   add(&Flags::framework_sorter,
       "framework_sorter",
-      "Policy to use for allocating resources\n"
-      "between a given user's frameworks. Options\n"
-      "are the same as for user_allocator.",
+      "Policy to use for allocating resources between a given role's\n"
+      "frameworks. Options are the same as for `--user_sorter`.",
       "drf");
 
   add(&Flags::allocation_interval,
@@ -230,6 +230,16 @@ mesos::internal::master::Flags::Flags()
       "If `true`, only authenticated agents are allowed to register.\n"
       "If `false`, unauthenticated agents are also allowed to register.",
       false);
+
+  // TODO(bmahler): Ideally, we remove this v0-style authentication
+  // in favor of just using HTTP authentication at the libprocess
+  // layer.
+  add(&Flags::authentication_v0_timeout,
+      "authentication_v0_timeout",
+      "The timeout within which an authentication is expected\n"
+      "to complete against a v0 framework or agent. This does not\n"
+      "apply to the v0 or v1 HTTP APIs.",
+      DEFAULT_AUTHENTICATION_V0_TIMEOUT);
 
   // TODO(zhitao): Remove deprecated `--authenticate_http` flag name after
   // the deprecation cycle which started with Mesos 1.0.
@@ -359,7 +369,7 @@ mesos::internal::master::Flags::Flags()
       "  \"aggregate_default_qps\": 33.3\n"
       "}");
 
-#ifdef WITH_NETWORK_ISOLATOR
+#ifdef ENABLE_PORT_MAPPING_ISOLATOR
   add(&Flags::max_executors_per_agent,
       "max_executors_per_agent",
       flags::DeprecatedName("max_executors_per_slave"),
@@ -367,7 +377,7 @@ mesos::internal::master::Flags::Flags()
       "monitoring/isolation technique imposes an implicit resource\n"
       "acquisition on each executor (# ephemeral ports), as a result\n"
       "one can only run a certain number of executors on each agent.");
-#endif // WITH_NETWORK_ISOLATOR
+#endif // ENABLE_PORT_MAPPING_ISOLATOR
 
   // TODO(karya): When we have optimistic offers, this will only
   // benefit frameworks that accidentally lose an offer.
@@ -433,7 +443,7 @@ mesos::internal::master::Flags::Flags()
       "modules_dir",
       "Directory path of the module manifest files.\n"
       "The manifest files are processed in alphabetical order.\n"
-      "(See --modules for more information on module manifest files)\n"
+      "(See --modules for more information on module manifest files).\n"
       "Cannot be used in conjunction with --modules.\n");
 
   add(&Flags::authenticators,
@@ -460,6 +470,35 @@ mesos::internal::master::Flags::Flags()
       "  http://www.mail-archive.com/dev@mesos.apache.org/msg35631.html\n"
       "  https://issues.apache.org/jira/browse/MESOS-5377");
 
+  add(&Flags::filter_gpu_resources,
+      "filter_gpu_resources",
+      "When set to true, this flag will cause the mesos master to\n"
+      "filter all offers from agents with GPU resources by only sending\n"
+      "them to frameworks that opt into the `GPU_RESOURCES` framework\n"
+      "capability. When set to false, this flag will cause the master\n"
+      "to not filter offers from agents with GPU resources, and\n"
+      "indiscriminately send them to all frameworks whether they set\n"
+      "the `GPU_RESOURCES` capability or not. This flag is meant as a\n"
+      "temporary workaround towards the eventual deprecation of the\n"
+      "`GPU_RESOURCES` capability. Please see the following for more\n"
+      "information:\n"
+      "  https://www.mail-archive.com/dev@mesos.apache.org/msg37571.html\n"
+      "  https://issues.apache.org/jira/browse/MESOS-7576",
+      true);
+
+  add(&Flags::min_allocatable_resources,
+      "min_allocatable_resources",
+      "One or more sets of resources that define the minimum allocatable\n"
+      "resources for the allocator. The allocator will only offer resources\n"
+      "that contain at least one of the specified sets. The resources in\n"
+      "each set should be delimited by semicolons, and the sets should be\n"
+      "delimited by the pipe character.\n"
+      "(Example: `disk:1|cpu:1;mem:32` configures the allocator to only offer\n"
+      "resources if they contain a disk resource of at least 1 megabyte, or\n"
+      "if they contain both 1 cpu and 32 megabytes of memory.)\n",
+      "cpus:" + stringify(MIN_CPUS) +
+        "|mem:" + stringify((double)MIN_MEM.bytes() / Bytes::MEGABYTES));
+
   add(&Flags::hooks,
       "hooks",
       "A comma-separated list of hook modules to be\n"
@@ -470,7 +509,7 @@ mesos::internal::master::Flags::Flags()
       flags::DeprecatedName("slave_ping_timeout"),
       "The timeout within which an agent is expected to respond to a\n"
       "ping from the master. Agents that do not respond within\n"
-      "max_agent_ping_timeouts ping retries will be asked to shutdown.\n"
+      "max_agent_ping_timeouts ping retries will be marked unreachable.\n"
       "NOTE: The total ping timeout (`agent_ping_timeout` multiplied by\n"
       "`max_agent_ping_timeouts`) should be greater than the ZooKeeper\n"
       "session timeout to prevent useless re-registration attempts.\n",
@@ -489,7 +528,7 @@ mesos::internal::master::Flags::Flags()
       flags::DeprecatedName("max_slave_ping_timeouts"),
       "The number of times an agent can fail to respond to a\n"
       "ping from the master. Agents that do not respond within\n"
-      "`max_agent_ping_timeouts` ping retries will be asked to shutdown.\n",
+      "`max_agent_ping_timeouts` ping retries will be marked unreachable.\n",
       DEFAULT_MAX_AGENT_PING_TIMEOUTS,
       [](size_t value) -> Option<Error> {
         if (value < 1) {
@@ -509,25 +548,25 @@ mesos::internal::master::Flags::Flags()
       "different than the default `" + string(DEFAULT_AUTHORIZER) + "`, the\n"
       "ACLs passed through the `--acls` flag will be ignored.\n"
       "\n"
-      "Currently there's no support for multiple authorizers.",
+      "Currently there is no support for multiple authorizers.",
       DEFAULT_AUTHORIZER);
 
   add(&Flags::http_authenticators,
       "http_authenticators",
       "HTTP authenticator implementation to use when handling requests to\n"
-      "authenticated endpoints. Use the default\n"
-      "`" + string(DEFAULT_HTTP_AUTHENTICATOR) + "`, or load an alternate\n"
-      "HTTP authenticator module using `--modules`.\n"
+      "authenticated endpoints. Use the default "
+      "`" + string(DEFAULT_BASIC_HTTP_AUTHENTICATOR) + "`, or load an\n"
+      "alternate HTTP authenticator module using `--modules`.\n"
       "\n"
       "Currently there is no support for multiple HTTP authenticators.",
-      DEFAULT_HTTP_AUTHENTICATOR);
+      DEFAULT_BASIC_HTTP_AUTHENTICATOR);
 
   add(&Flags::http_framework_authenticators,
       "http_framework_authenticators",
       "HTTP authenticator implementation to use when authenticating HTTP\n"
       "frameworks. Use the \n"
-      "`" + string(DEFAULT_HTTP_AUTHENTICATOR) + "` authenticator or load an\n"
-      "alternate authenticator module using `--modules`.\n"
+      "`" + string(DEFAULT_BASIC_HTTP_AUTHENTICATOR) + "` authenticator or\n"
+      "load an alternate authenticator module using `--modules`.\n"
       "Must be used in conjunction with `--http_authenticate_frameworks`.\n"
       "\n"
       "Currently there is no support for multiple HTTP framework\n"
@@ -577,19 +616,114 @@ mesos::internal::master::Flags::Flags()
       "Maximum length of time to store information in the registry about\n"
       "agents that are not currently connected to the cluster. This\n"
       "information allows frameworks to determine the status of unreachable\n"
-      "and removed agents. Note that the registry always stores information\n"
-      "on all connected agents. If there are more than\n"
-      "`registry_max_agent_count` partitioned or removed agents, agent\n"
+      "and gone agents. Note that the registry always stores\n"
+      "information on all connected agents. If there are more than\n"
+      "`registry_max_agent_count` partitioned/gone agents, agent\n"
       "information may be discarded from the registry sooner than indicated\n"
       "by this parameter.",
       DEFAULT_REGISTRY_MAX_AGENT_AGE);
 
   add(&Flags::registry_max_agent_count,
       "registry_max_agent_count",
-      "Maximum number of disconnected agents to store in the registry.\n"
-      "This informtion allows frameworks to determine the status of\n"
-      "disconnected agents. Note that the registry always stores\n"
+      "Maximum number of partitioned/gone agents to store in the\n"
+      "registry. This information allows frameworks to determine the status\n"
+      "of disconnected agents. Note that the registry always stores\n"
       "information about all connected agents. See also the\n"
       "`registry_max_agent_age` flag.",
       DEFAULT_REGISTRY_MAX_AGENT_COUNT);
+
+  add(&Flags::ip,
+      "ip",
+      "IP address to listen on. This cannot be used in conjunction\n"
+      "with `--ip_discovery_command`.");
+
+  add(&Flags::port, "port", "Port to listen on.", MasterInfo().port());
+
+  add(&Flags::advertise_ip,
+      "advertise_ip",
+      "IP address advertised to reach this Mesos master.\n"
+      "The master does not bind using this IP address.\n"
+      "However, this IP address may be used to access this master.");
+
+  add(&Flags::advertise_port,
+      "advertise_port",
+      "Port advertised to reach Mesos master (along with\n"
+      "`advertise_ip`). The master does not bind to this port.\n"
+      "However, this port (along with `advertise_ip`) may be used to\n"
+      "access this master.");
+
+  // TODO(bevers): Switch the default to `true` after gathering some
+  // real-world experience.
+  add(&Flags::memory_profiling,
+      "memory_profiling",
+      "This setting controls whether the memory profiling functionality of\n"
+      "libprocess should be exposed when jemalloc is detected.\n"
+      "NOTE: Even if set to true, memory profiling will not work unless\n"
+      "jemalloc is loaded into the address space of the binary, either by\n"
+      "linking against it at compile-time or using `LD_PRELOAD`.",
+      false);
+
+  add(&Flags::zk,
+      "zk",
+      "ZooKeeper URL (used for leader election amongst masters).\n"
+      "May be one of:\n"
+      "  `zk://host1:port1,host2:port2,.../path`\n"
+      "  `zk://username:password@host1:port1,host2:port2,.../path`\n"
+      "  `file:///path/to/file` (where file contains one of the above)\n"
+      "NOTE: Not required if master is run in standalone mode (non-HA).");
+
+  add(&Flags::ip_discovery_command,
+      "ip_discovery_command",
+      "Optional IP discovery binary: if set, it is expected to emit\n"
+      "the IP address which the master will try to bind to.\n"
+      "Cannot be used in conjunction with `--ip`.");
+
+  add(&Flags::require_agent_domain,
+      "require_agent_domain",
+      "If true, only agents with a configured domain can register.\n",
+      false);
+
+  add(&Flags::publish_per_framework_metrics,
+      "publish_per_framework_metrics",
+      "If true, an extensive set of metrics for each active framework will\n"
+      "be published. These metrics are useful for understanding cluster\n"
+      "behavior, but can be overwhelming for very large numbers of\n"
+      "frameworks.",
+      true);
+
+  add(&Flags::domain,
+      "domain",
+      "Domain that the master belongs to. Mesos currently only supports\n"
+      "fault domains, which identify groups of hosts with similar failure\n"
+      "characteristics. A fault domain consists of a region and a zone.\n"
+      "All masters in the same Mesos cluster must be in the same region\n"
+      "(they can be in different zones). This value can be specified as\n"
+      "either a JSON-formatted string or a file path containing JSON.\n"
+      "\n"
+      "Example:\n"
+      "{\n"
+      "  \"fault_domain\":\n"
+      "    {\n"
+      "      \"region\":\n"
+      "        {\n"
+      "          \"name\": \"aws-us-east-1\"\n"
+      "        },\n"
+      "      \"zone\":\n"
+      "        {\n"
+      "          \"name\": \"aws-us-east-1a\"\n"
+      "        }\n"
+      "    }\n"
+      "}",
+      [](const Option<DomainInfo>& domain) -> Option<Error> {
+        if (domain.isSome()) {
+          // Don't let the user specify a domain without a fault
+          // domain. This is allowed by the protobuf spec (for forward
+          // compatibility with possible future changes), but is not a
+          // useful configuration right now.
+          if (!domain->has_fault_domain()) {
+            return Error("`domain` must define `fault_domain`");
+          }
+        }
+        return None();
+      });
 }

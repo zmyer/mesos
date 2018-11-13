@@ -30,16 +30,19 @@ class NamespacesPidIsolatorProcess : public MesosIsolatorProcess
 public:
   static Try<mesos::slave::Isolator*> create(const Flags& flags);
 
-  virtual ~NamespacesPidIsolatorProcess() {}
+  ~NamespacesPidIsolatorProcess() override {}
 
-  virtual bool supportsNesting();
+  bool supportsNesting() override;
+  bool supportsStandalone() override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
 private:
-  NamespacesPidIsolatorProcess();
+  NamespacesPidIsolatorProcess(const Flags& flags);
+
+  const Flags flags;
 };
 
 } // namespace slave {

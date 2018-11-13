@@ -23,6 +23,8 @@
 #include <mesos/scheduler.hpp>
 #include <mesos/type_utils.hpp>
 
+#include <mesos/authorizer/acls.hpp>
+
 #include <stout/check.hpp>
 #include <stout/exit.hpp>
 #include <stout/flags.hpp>
@@ -30,10 +32,15 @@
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
+#include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
+
+#include <stout/os/realpath.hpp>
 
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
+
+#include "examples/flags.hpp"
 
 using namespace mesos;
 
@@ -51,6 +58,10 @@ using mesos::Resources;
 const int32_t CPUS_PER_TASK = 1;
 const int32_t MEM_PER_TASK = 128;
 
+constexpr char EXECUTOR_BINARY[] = "test-executor";
+constexpr char EXECUTOR_NAME[] = "Test Executor (C++)";
+constexpr char FRAMEWORK_NAME[] = "Test Framework (C++)";
+
 class TestScheduler : public Scheduler
 {
 public:
@@ -65,36 +76,37 @@ public:
       tasksFinished(0),
       totalTasks(5) {}
 
-  virtual ~TestScheduler() {}
+  ~TestScheduler() override {}
 
-  virtual void registered(SchedulerDriver*,
+  void registered(SchedulerDriver*,
                           const FrameworkID&,
-                          const MasterInfo&)
+                          const MasterInfo&) override
   {
     cout << "Registered!" << endl;
   }
 
-  virtual void reregistered(SchedulerDriver*, const MasterInfo& masterInfo) {}
+  void reregistered(SchedulerDriver*, const MasterInfo& masterInfo) override {}
 
-  virtual void disconnected(SchedulerDriver* driver) {}
+  void disconnected(SchedulerDriver* driver) override {}
 
-  virtual void resourceOffers(SchedulerDriver* driver,
-                              const vector<Offer>& offers)
+  void resourceOffers(SchedulerDriver* driver,
+                              const vector<Offer>& offers) override
   {
     foreach (const Offer& offer, offers) {
       cout << "Received offer " << offer.id() << " with " << offer.resources()
            << endl;
 
-      static const Resources TASK_RESOURCES = Resources::parse(
+      Resources taskResources = Resources::parse(
           "cpus:" + stringify(CPUS_PER_TASK) +
           ";mem:" + stringify(MEM_PER_TASK)).get();
+      taskResources.allocate(role);
 
       Resources remaining = offer.resources();
 
       // Launch tasks.
       vector<TaskInfo> tasks;
       while (tasksLaunched < totalTasks &&
-             remaining.flatten().contains(TASK_RESOURCES)) {
+             remaining.toUnreserved().contains(taskResources)) {
         int taskId = tasksLaunched++;
 
         cout << "Launching task " << taskId << " using offer "
@@ -106,9 +118,17 @@ public:
         task.mutable_slave_id()->MergeFrom(offer.slave_id());
         task.mutable_executor()->MergeFrom(executor);
 
-        Try<Resources> flattened = TASK_RESOURCES.flatten(role);
-        CHECK_SOME(flattened);
-        Option<Resources> resources = remaining.find(flattened.get());
+        Option<Resources> resources = [&]() {
+          if (role == "*") {
+            return remaining.find(taskResources);
+          }
+
+          Resource::ReservationInfo reservation;
+          reservation.set_type(Resource::ReservationInfo::STATIC);
+          reservation.set_role(role);
+
+          return remaining.find(taskResources.pushReservation(reservation));
+        }();
 
         CHECK_SOME(resources);
         task.mutable_resources()->MergeFrom(resources.get());
@@ -121,10 +141,10 @@ public:
     }
   }
 
-  virtual void offerRescinded(SchedulerDriver* driver,
-                              const OfferID& offerId) {}
+  void offerRescinded(SchedulerDriver* driver, const OfferID& offerId) override
+  {}
 
-  virtual void statusUpdate(SchedulerDriver* driver, const TaskStatus& status)
+  void statusUpdate(SchedulerDriver* driver, const TaskStatus& status) override
   {
     int taskId = lexical_cast<int>(status.task_id().value());
 
@@ -141,8 +161,7 @@ public:
            << " is in unexpected state " << status.state()
            << " with reason " << status.reason()
            << " from source " << status.source()
-           << " with message '" << status.message() << "'"
-           << endl;
+           << " with message '" << status.message() << "'" << endl;
       driver->abort();
     }
 
@@ -155,19 +174,23 @@ public:
     }
   }
 
-  virtual void frameworkMessage(SchedulerDriver* driver,
-                                const ExecutorID& executorId,
-                                const SlaveID& slaveId,
-                                const string& data) {}
+  void frameworkMessage(
+      SchedulerDriver* driver,
+      const ExecutorID& executorId,
+      const SlaveID& slaveId,
+      const string& data) override
+  {}
 
-  virtual void slaveLost(SchedulerDriver* driver, const SlaveID& sid) {}
+  void slaveLost(SchedulerDriver* driver, const SlaveID& sid) override {}
 
-  virtual void executorLost(SchedulerDriver* driver,
-                            const ExecutorID& executorID,
-                            const SlaveID& slaveID,
-                            int status) {}
+  void executorLost(
+      SchedulerDriver* driver,
+      const ExecutorID& executorID,
+      const SlaveID& slaveID,
+      int status) override
+  {}
 
-  virtual void error(SchedulerDriver* driver, const string& message)
+  void error(SchedulerDriver* driver, const string& message) override
   {
     cout << message << endl;
   }
@@ -191,18 +214,7 @@ void usage(const char* argv0, const flags::FlagsBase& flags)
 }
 
 
-class Flags : public virtual mesos::internal::logging::Flags
-{
-public:
-  Flags()
-  {
-    add(&Flags::role, "role", "Role to use when registering", "*");
-    add(&Flags::master, "master", "ip:port of master to connect");
-  }
-
-  string role;
-  Option<string> master;
-};
+class Flags : public virtual mesos::internal::examples::Flags {};
 
 
 int main(int argc, char** argv)
@@ -211,28 +223,27 @@ int main(int argc, char** argv)
   string uri;
   Option<string> value = os::getenv("MESOS_HELPER_DIR");
   if (value.isSome()) {
-    uri = path::join(value.get(), "test-executor");
+    uri = path::join(value.get(), EXECUTOR_BINARY);
   } else {
-    uri = path::join(
-        os::realpath(Path(argv[0]).dirname()).get(),
-        "test-executor");
+    uri =
+      path::join(os::realpath(Path(argv[0]).dirname()).get(), EXECUTOR_BINARY);
   }
 
   Flags flags;
 
-  Try<flags::Warnings> load = flags.load(None(), argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_EXAMPLE_", argc, argv);
 
-  if (load.isError()) {
-    cerr << load.error() << endl;
-    usage(argv[0], flags);
-    exit(EXIT_FAILURE);
-  } else if (flags.master.isNone()) {
-    cerr << "Missing --master" << endl;
-    usage(argv[0], flags);
-    exit(EXIT_FAILURE);
+  if (flags.help) {
+    cout << flags.usage() << endl;
+    return EXIT_SUCCESS;
   }
 
-  internal::logging::initialize(argv[0], flags, true); // Catch signals.
+  if (load.isError()) {
+    cerr << flags.usage(load.error()) << endl;
+    return EXIT_FAILURE;
+  }
+
+  internal::logging::initialize(argv[0], true, flags); // Catch signals.
 
   // Log any flag warnings (after logging is initialized).
   foreach (const flags::Warning& warning, load->warnings) {
@@ -242,19 +253,18 @@ int main(int argc, char** argv)
   ExecutorInfo executor;
   executor.mutable_executor_id()->set_value("default");
   executor.mutable_command()->set_value(uri);
-  executor.set_name("Test Executor (C++)");
-  executor.set_source("cpp_test");
+  executor.set_name(EXECUTOR_NAME);
 
   FrameworkInfo framework;
   framework.set_user(""); // Have Mesos fill in the current user.
-  framework.set_name("Test Framework (C++)");
-  framework.set_role(flags.role);
-
-  value = os::getenv("MESOS_CHECKPOINT");
-  if (value.isSome()) {
-    framework.set_checkpoint(
-        numify<bool>(value.get()).get());
-  }
+  framework.set_principal(flags.principal);
+  framework.set_name(FRAMEWORK_NAME);
+  framework.add_roles(flags.role);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::MULTI_ROLE);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+  framework.set_checkpoint(flags.checkpoint);
 
   bool implicitAcknowledgements = true;
   if (os::getenv("MESOS_EXPLICIT_ACKNOWLEDGEMENTS").isSome()) {
@@ -263,44 +273,44 @@ int main(int argc, char** argv)
     implicitAcknowledgements = false;
   }
 
+  if (flags.master == "local") {
+    // Configure master.
+    os::setenv("MESOS_ROLES", flags.role);
+    os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", stringify(flags.authenticate));
+
+    ACLs acls;
+    ACL::RegisterFramework* acl = acls.add_register_frameworks();
+    acl->mutable_principals()->set_type(ACL::Entity::ANY);
+    acl->mutable_roles()->add_values(flags.role);
+    os::setenv("MESOS_ACLS", stringify(JSON::protobuf(acls)));
+
+    // Configure agent.
+    os::setenv("MESOS_DEFAULT_ROLE", flags.role);
+  }
+
   MesosSchedulerDriver* driver;
   TestScheduler scheduler(implicitAcknowledgements, executor, flags.role);
 
-  if (os::getenv("MESOS_AUTHENTICATE_FRAMEWORKS").isSome()) {
+  if (flags.authenticate) {
     cout << "Enabling authentication for the framework" << endl;
 
-    value = os::getenv("DEFAULT_PRINCIPAL");
-    if (value.isNone()) {
-      EXIT(EXIT_FAILURE)
-        << "Expecting authentication principal in the environment";
-    }
-
     Credential credential;
-    credential.set_principal(value.get());
-
-    framework.set_principal(value.get());
-
-    value = os::getenv("DEFAULT_SECRET");
-    if (value.isNone()) {
-      EXIT(EXIT_FAILURE)
-        << "Expecting authentication secret in the environment";
+    credential.set_principal(flags.principal);
+    if (flags.secret.isSome()) {
+      credential.set_secret(flags.secret.get());
     }
-
-    credential.set_secret(value.get());
 
     driver = new MesosSchedulerDriver(
         &scheduler,
         framework,
-        flags.master.get(),
+        flags.master,
         implicitAcknowledgements,
         credential);
   } else {
-    framework.set_principal("test-framework-cpp");
-
     driver = new MesosSchedulerDriver(
         &scheduler,
         framework,
-        flags.master.get(),
+        flags.master,
         implicitAcknowledgements);
   }
 

@@ -57,14 +57,14 @@ namespace tests {
 class MountBackendTest : public TemporaryDirectoryTest
 {
 protected:
-  virtual void TearDown()
+  void TearDown() override
   {
     Try<fs::MountInfoTable> mountTable = fs::MountInfoTable::read();
     ASSERT_SOME(mountTable);
 
     // TODO(xujyan): Make sandbox a plain string instead of an option.
     ASSERT_SOME(sandbox);
-    foreach (const fs::MountInfoTable::Entry& entry, mountTable.get().entries) {
+    foreach (const fs::MountInfoTable::Entry& entry, mountTable->entries) {
       if (strings::startsWith(entry.target, sandbox.get())) {
         fs::unmount(entry.target, MNT_DETACH);
       }

@@ -57,26 +57,33 @@ public:
       const Flags& flags,
       bool local);
 
-  virtual ~IOSwitchboard();
+  ~IOSwitchboard() override;
 
-  virtual bool supportsNesting();
+  bool supportsNesting() override;
+  bool supportsStandalone() override;
 
-  virtual process::Future<Nothing> recover(
-    const std::list<mesos::slave::ContainerState>& states,
-    const hashset<ContainerID>& orphans);
+  process::Future<Nothing> recover(
+    const std::vector<mesos::slave::ContainerState>& states,
+    const hashset<ContainerID>& orphans) override;
 
-  virtual process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
+  process::Future<Option<mesos::slave::ContainerLaunchInfo>> prepare(
       const ContainerID& containerId,
-      const mesos::slave::ContainerConfig& containerConfig);
+      const mesos::slave::ContainerConfig& containerConfig) override;
 
-  virtual process::Future<mesos::slave::ContainerLimitation> watch(
-    const ContainerID& containerId);
+  process::Future<mesos::slave::ContainerLimitation> watch(
+    const ContainerID& containerId) override;
 
-  virtual process::Future<Nothing> cleanup(
-      const ContainerID& containerId);
+  process::Future<Nothing> cleanup(
+      const ContainerID& containerId) override;
 
+  // Connect to the `IOSwitchboard` associated with `containerId`.
   process::Future<process::http::Connection> connect(
-      const ContainerID& containerId);
+      const ContainerID& containerId) const;
+
+  // Transfer ownership of a `ContainerIO` struct for a given
+  // container out of the `IOSwitchboard` and into the caller.
+  process::Future<Option<mesos::slave::ContainerIO>> extractContainerIO(
+      const ContainerID& containerID);
 
   // Helper function that returns `true` if `IOSwitchboardServer`
   // needs to be enabled for the given `ContainerConfig`. It must
@@ -104,7 +111,13 @@ private:
   process::Future<Option<mesos::slave::ContainerLaunchInfo>> _prepare(
       const ContainerID& containerId,
       const mesos::slave::ContainerConfig& containerConfig,
-      const mesos::slave::ContainerLogger::SubprocessInfo& loggerInfo);
+      const mesos::slave::ContainerIO& loggerIO);
+
+  process::Future<process::http::Connection> _connect(
+      const ContainerID& containerId) const;
+
+  process::Future<Option<mesos::slave::ContainerIO>> _extractContainerIO(
+      const ContainerID& containerID);
 
 #ifndef __WINDOWS__
   void reaped(
@@ -116,6 +129,15 @@ private:
   bool local;
   process::Owned<mesos::slave::ContainerLogger> logger;
   hashmap<ContainerID, process::Owned<Info>> infos;
+
+  // We use a separate hashmap to hold the `ContainerIO` for each
+  // container because we need to maintain this information even in
+  // the case were we only instantiate the logger and never spawn an
+  // `IOSwitchbaordProcess`. Also, the lifetime of the `ContainerIO`
+  // is shorter lived than the `Info` struct, as it should be removed
+  // from this hash as soon as ownership is transferred out of the
+  // `IOSwitchboard` via a call to `extractContainerIO()`.
+  hashmap<ContainerID, mesos::slave::ContainerIO> containerIOs;
 };
 
 

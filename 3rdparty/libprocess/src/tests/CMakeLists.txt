@@ -17,80 +17,122 @@
 # PROCESS TESTS.
 ################
 set(PROCESS_TESTS_SRC
-  ${PROCESS_TESTS_SRC}
   main.cpp
+  after_tests.cpp
   collect_tests.cpp
+  count_down_latch_tests.cpp
   decoder_tests.cpp
   encoder_tests.cpp
   future_tests.cpp
+  grpc_tests.cpp
   http_tests.cpp
+  io_tests.cpp
   limiter_tests.cpp
   loop_tests.cpp
   metrics_tests.cpp
+  mpsc_linked_queue_tests.cpp
   mutex_tests.cpp
   owned_tests.cpp
   process_tests.cpp
+  profiler_tests.cpp
   queue_tests.cpp
+  rwlock_tests.cpp
   sequence_tests.cpp
   shared_tests.cpp
   socket_tests.cpp
+  state_machine_tests.cpp
   statistics_tests.cpp
   subprocess_tests.cpp
   system_tests.cpp
   time_tests.cpp
-  timeseries_tests.cpp
-  )
+  timeseries_tests.cpp)
 
 if (NOT WIN32)
-  set(PROCESS_TESTS_SRC
-    ${PROCESS_TESTS_SRC}
-    io_tests.cpp
-    reap_tests.cpp
-    )
-endif (NOT WIN32)
+  # TODO(andschwa): See MESOS-5818.
+  list(APPEND PROCESS_TESTS_SRC
+    reap_tests.cpp)
+endif ()
 
+set(GRPC_TESTS_PROTOS
+  grpc_tests.grpc.pb.cc
+  grpc_tests.grpc.pb.h
+  grpc_tests.pb.cc
+  grpc_tests.pb.h)
 
-# ADDITIONAL CPP FLAGS FOR PROCESS TEST BINARY (e.g., -DBUILD_DIR=...).
-#######################################################################
-add_definitions("-DBUILD_DIR=\"${CMAKE_CURRENT_BINARY_DIR}\"")
+list(APPEND PROCESS_TESTS_SRC
+  ${GRPC_TESTS_PROTOS})
 
-# INCLUDE DIRECTIVES FOR PROCESS TEST BINARY (generates, e.g., -I/path/to/thing
-# on Linux).
-###############################################################################
-include_directories(${PROCESS_TEST_INCLUDE_DIRS})
+add_custom_command(
+  OUTPUT ${GRPC_TESTS_PROTOS}
+  COMMAND protoc
+    -I${CMAKE_CURRENT_SOURCE_DIR}
+    --cpp_out=${CMAKE_CURRENT_BINARY_DIR}
+    --grpc_out=${CMAKE_CURRENT_BINARY_DIR}
+    --plugin=protoc-gen-grpc=$<TARGET_FILE:grpc_cpp_plugin>
+    ${CMAKE_CURRENT_SOURCE_DIR}/grpc_tests.proto
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/grpc_tests.proto)
 
-# LINKING LIBRARIES BY DIRECTORY (might generate, e.g., -L/path/to/thing on
-# Linux).
-###########################################################################
-link_directories(${PROCESS_TEST_LIB_DIRS})
+if (ENABLE_SSL)
+  list(APPEND PROCESS_TESTS_SRC
+    jwt_tests.cpp
+    ssl_tests.cpp)
+endif ()
 
-# THE PROCESS TEST EXECUTABLE (generates, e.g., libprocess-tests, etc., on Linux).
-###############################################################################
-add_executable(${PROCESS_TESTS_TARGET} ${PROCESS_TESTS_SRC})
+add_library(process-interface INTERFACE)
+target_link_libraries(process-interface INTERFACE process googletest)
+target_include_directories(process-interface INTERFACE ..)
 
-GROUP_STOUT_HEADERS()
-GROUP_PROCESS_HEADERS()
+add_executable(libprocess-tests EXCLUDE_FROM_ALL ${PROCESS_TESTS_SRC})
+target_link_libraries(libprocess-tests PRIVATE process-interface)
 
-GROUP_SOURCE(
-  "tests"
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "*.[ch]*")
+# NOTE: This is for the generated gRPC headers.
+target_include_directories(libprocess-tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
-# ADD LINKER FLAGS (generates, e.g., -lglog on Linux).
-######################################################
-target_link_libraries(${PROCESS_TESTS_TARGET} ${PROCESS_TEST_LIBS})
+if (CMAKE_GENERATOR MATCHES "Visual Studio")
+  target_compile_definitions(
+    libprocess-tests PRIVATE
+    BUILD_DIR="${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>")
+else ()
+  target_compile_definitions(
+    libprocess-tests PRIVATE
+    BUILD_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+endif ()
 
-# ADD BINARY DEPENDENCIES (tells CMake what to compile/build first).
-####################################################################
-add_dependencies(${PROCESS_TESTS_TARGET} ${PROCESS_TEST_DEPENDENCIES})
+add_executable(test-linkee EXCLUDE_FROM_ALL test_linkee.cpp)
+target_link_libraries(test-linkee PRIVATE process-interface)
+add_dependencies(libprocess-tests test-linkee)
 
-# ADDITIONAL EXECUTABLE(s).
-###########################
-add_executable(test-linkee test_linkee.cpp)
-target_link_libraries(test-linkee ${PROCESS_TEST_LIBS})
-add_dependencies(${PROCESS_TESTS_TARGET} test-linkee)
+if (WIN32)
+  add_executable(test-echo EXCLUDE_FROM_ALL test_echo.cpp)
+  add_dependencies(libprocess-tests test-echo)
+endif ()
 
-# ADD TEST TARGET (runs when you do, e.g., `make check`).
-#########################################################
-add_test(NAME ProcessTests COMMAND ${PROCESS_TESTS_TARGET})
+if (ENABLE_SSL)
+  add_executable(ssl-client EXCLUDE_FROM_ALL ssl_client.cpp)
+  target_link_libraries(ssl-client PRIVATE process-interface)
+  add_dependencies(libprocess-tests ssl-client)
+endif ()
+
+add_test(NAME ProcessTests COMMAND libprocess-tests)
+
+# LIBPROCESS BENCHMARK TESTS.
+#############################
+add_custom_command(
+  OUTPUT benchmarks.pb.h benchmarks.pb.cc
+  COMMAND protoc
+    -I${CMAKE_CURRENT_SOURCE_DIR}
+    --cpp_out=${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks.proto
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks.proto)
+
+add_executable(benchmarks
+  EXCLUDE_FROM_ALL
+  benchmarks.cpp
+  benchmarks.pb.cc)
+target_link_libraries(benchmarks PRIVATE process-interface)
+target_include_directories(benchmarks PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# Add dependency of `libprocess-tests` on `benchmarks`. This is done
+# to make sure that `benchmarks` is built as part of the `tests`
+# target; there is no actual compile or runtime dependency.
+add_dependencies(libprocess-tests benchmarks)

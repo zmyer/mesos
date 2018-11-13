@@ -81,7 +81,7 @@ public:
       const FrameworkID& frameworkId,
       const MasterInfo& masterInfo) = 0;
 
-  // Invoked when the scheduler re-registers with a newly elected
+  // Invoked when the scheduler reregisters with a newly elected
   // Mesos master. This is only called when the scheduler has
   // previously been registered. MasterInfo containing the updated
   // information about the elected master is provided as an argument.
@@ -231,13 +231,16 @@ public:
   // those that are not used by the launched tasks or their executors)
   // will be considered declined. Note that this includes resources
   // used by tasks that the framework attempted to launch but failed
-  // (with TASK_ERROR) due to a malformed task description. The
-  // specified filters are applied on all unused resources (see
-  // mesos.proto for a description of Filters). Available resources
-  // are aggregated when multiple offers are provided. Note that all
-  // offers must belong to the same slave. Invoking this function with
-  // an empty collection of tasks declines offers in their entirety
-  // (see Scheduler::declineOffer).
+  // (with TASK_ERROR) due to a malformed task description.
+  //
+  // The specified filters are applied on all unused resources (see
+  // mesos.proto for a description of Filters). Note that the default
+  // argument includes a 5-second `refuse_offers` filter.
+  //
+  // Available resources are aggregated when multiple offers are provided.
+  // Note that all offers must belong to the same slave. Invoking this
+  // function with an empty collection of tasks declines offers in their
+  // entirety (see Scheduler::declineOffer).
   virtual Status launchTasks(
       const std::vector<OfferID>& offerIds,
       const std::vector<TaskInfo>& tasks,
@@ -401,55 +404,55 @@ public:
   // MesosSchedulerDriver::start was invoked successfully (possibly
   // via MesosSchedulerDriver::run) and MesosSchedulerDriver::stop has
   // not been invoked.
-  virtual ~MesosSchedulerDriver();
+  ~MesosSchedulerDriver() override;
 
   // See SchedulerDriver for descriptions of these.
-  virtual Status start();
-  virtual Status stop(bool failover = false);
-  virtual Status abort();
-  virtual Status join();
-  virtual Status run();
+  Status start() override;
+  Status stop(bool failover = false) override;
+  Status abort() override;
+  Status join() override;
+  Status run() override;
 
-  virtual Status requestResources(
-      const std::vector<Request>& requests);
+  Status requestResources(
+      const std::vector<Request>& requests) override;
 
   // TODO(nnielsen): launchTasks using single offer is deprecated.
   // Use launchTasks with offer list instead.
-  virtual Status launchTasks(
+  Status launchTasks(
       const OfferID& offerId,
       const std::vector<TaskInfo>& tasks,
-      const Filters& filters = Filters());
+      const Filters& filters = Filters()) override;
 
-  virtual Status launchTasks(
+  Status launchTasks(
       const std::vector<OfferID>& offerIds,
       const std::vector<TaskInfo>& tasks,
-      const Filters& filters = Filters());
+      const Filters& filters = Filters()) override;
 
-  virtual Status killTask(const TaskID& taskId);
+  Status killTask(const TaskID& taskId) override;
 
-  virtual Status acceptOffers(
+  Status acceptOffers(
       const std::vector<OfferID>& offerIds,
       const std::vector<Offer::Operation>& operations,
-      const Filters& filters = Filters());
+      const Filters& filters = Filters()) override;
 
-  virtual Status declineOffer(
+  Status declineOffer(
       const OfferID& offerId,
-      const Filters& filters = Filters());
+      const Filters& filters = Filters()) override;
 
-  virtual Status reviveOffers();
+  Status reviveOffers() override;
 
-  virtual Status suppressOffers();
+  Status suppressOffers() override;
 
-  virtual Status acknowledgeStatusUpdate(
-      const TaskStatus& status);
+  Status acknowledgeStatusUpdate(
+      const TaskStatus& status) override;
 
-  virtual Status sendFrameworkMessage(
+  Status sendFrameworkMessage(
       const ExecutorID& executorId,
       const SlaveID& slaveId,
-      const std::string& data);
+      const std::string& data) override;
 
-  virtual Status reconcileTasks(
-      const std::vector<TaskStatus>& statuses);
+  Status reconcileTasks(
+      const std::vector<TaskStatus>& statuses) override;
 
 protected:
   // Used to detect (i.e., choose) the master.

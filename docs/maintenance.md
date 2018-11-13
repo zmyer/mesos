@@ -120,9 +120,9 @@ The operator can then post the schedule to the master's
 [/maintenance/schedule](endpoints/master/maintenance/schedule.md) endpoint:
 
 ```
-curl http://localhost:5050/maintenance/schedule
-  -H "Content-type: application/json"
-  -X POST
+curl http://localhost:5050/maintenance/schedule \
+  -H "Content-type: application/json" \
+  -X POST \
   -d @schedule.json
 ```
 
@@ -234,9 +234,9 @@ For example, to start maintenance on two machines:
 ```
 
 ```
-curl http://localhost:5050/machine/down
-  -H "Content-type: application/json"
-  -X POST
+curl http://localhost:5050/machine/down \
+  -H "Content-type: application/json" \
+  -X POST \
   -d @machines.json
 ```
 
@@ -264,7 +264,7 @@ failed and the operator intends to remove it from the cluster; starting
 maintenance on the machine prevents the machine from being accidentally rebooted
 and rejoining the Mesos cluster.
 
-The operator must explicitly transition a machine from Draining to Deactived
+The operator must explicitly transition a machine from Draining to Down
 mode. That is, Mesos will keep a machine in Draining mode even if the
 unavailability window arrives or passes.  This means that the operation of the
 machine is not disrupted in any way and offers (with unavailability information)
@@ -275,7 +275,7 @@ told to shutdown.  These agents are removed from the master, which means that a
 `TASK_LOST` status update will be sent for every task running on each of those
 agents. The scheduler driver's `slaveLost` callback will also be invoked for
 each of the removed agents. Any agents on machines in maintenance are also
-prevented from re-registering with the master in the future (until maintenance
+prevented from reregistering with the master in the future (until maintenance
 is completed and the machine is brought back up).
 
 ### Completing maintenance
@@ -293,9 +293,9 @@ The operator posts a list of machines to the master's [/machine/up](endpoints/ma
 ```
 
 ```
-curl http://localhost:5050/machine/up
-  -H "Content-type: application/json"
-  -X POST
+curl http://localhost:5050/machine/up \
+  -H "Content-type: application/json" \
+  -X POST \
   -d @machines.json
 ```
 

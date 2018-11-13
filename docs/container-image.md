@@ -8,7 +8,7 @@ layout: documentation
 
 ## Motivation
 
-Mesos currently supports several [containerizers](containerizer.md),
+Mesos currently supports several [containerizers](containerizers.md),
 notably the Mesos containerizer and the Docker containerizer. Mesos
 containerizer uses native OS features directly to provide isolation
 between containers, while Docker containerizer delegates container
@@ -195,7 +195,7 @@ Operators can either specify the flag as an absolute path pointing to
 the docker config file (need to manually configure
 `.docker/config.json` or `.dockercfg` on each agent), or specify the
 flag as a JSON-formatted string. See [configuration
-documentation](configuration.md) for detail. For example:
+documentation](configuration/agent.md) for detail. For example:
 
     --docker_config=file:///home/vagrant/.docker/config.json
 
@@ -226,17 +226,29 @@ example, the operator can put a `busybox:latest.tar` (the result of
 `/tmp/mesos/images/docker` and launch the agent by specifying
 `--docker_registry=/tmp/mesos/images/docker`. Then the framework can
 launch a Docker container by specifying `busybox:latest` as the name
-of the Docker image.
+of the Docker image. This flag can also point to an HDFS URI
+(*experimental* in Mesos 1.7) (e.g., `hdfs://localhost:8020/archives/`)
+to fetch images from HDFS if the `hadoop` command is available on the
+agent.
 
 If the `--switch_user` flag is set on the agent and the framework
 specifies a user (either `CommandInfo.user` or `FrameworkInfo.user`),
 we expect that user exists in the container image and its uid and gids
-matches that on the host. User namespace and capabilities are not
-supported yet.
+matches that on the host. User namespace is not supported yet. If the
+user is not specified, `root` will be used by default. The operator or
+the framework can limit the
+[capabilities](http://man7.org/linux/man-pages/man7/capabilities.7.html)
+of the container by using the
+[linux/capabilities](isolators/linux-capabilities.md) isolator.
 
-Only host network is supported. We will add bridge network support
-soon using CNI support in Mesos
-([MESOS-4641](https://issues.apache.org/jira/browse/MESOS-4641)).
+Currently, we support `host`, `bridge` and user defined networks
+([reference](https://docs.docker.com/engine/userguide/networking/)).
+`none` is not supported yet. We support the above networking modes in
+[Mesos Containerizer](mesos-containerizer.md) using the
+[CNI](https://github.com/containernetworking/cni) (Container Network
+Interface) standard. Please refer to the [network/cni](cni.md)
+isolator document for more details about how to configure the network
+for the container.
 
 ### More agent flags
 
@@ -285,8 +297,33 @@ is `/tmp/mesos/store/appc`.
 ## Provisioner Backends
 
 A provisioner backend takes a set of filesystem layers and stacks them
-into a root filesystem. The following backends are supported
-currently.
+into a root filesystem. Currently, we support the following backends:
+`copy`, `bind`, `overlay` and `aufs`. Mesos will validate if the
+selected backend works with the underlying filesystem (the filesystem
+used by the image store `--docker_store_dir` or `--appc_store_dir`)
+using the following logic table:
+
+    +---------+--------------+------------------------------------------+
+    | Backend | Suggested on | Disabled on                              |
+    +---------+--------------+------------------------------------------+
+    | aufs    | ext4 xfs     | btrfs aufs eCryptfs                      |
+    | overlay | ext4 xfs*    | btrfs aufs overlay overlay2 zfs eCryptfs |
+    | bind    |              | N/A(`--sandbox_directory' must exist)    |
+    | copy    |              | N/A                                      |
+    +---------+--------------+------------------------------------------+
+
+NOTE: `xfs` support on `overlay` is enabled only when `d_type=true`. Use
+`xfs_info` to verify that the `xfs` ftype option is set to 1. To format
+an xfs filesystem for `overlay`, use the flag `-n ftype=1` with `mkfs.xfs`.
+
+The provisioner backend can be specified through the agent flag
+`--image_provisioner_backend`. If not set, Mesos will select the best
+backend automatically for the users/operators. The selection logic is
+as following:
+
+    1. Use `overlay` backend if the overlayfs is available.
+    2. Use `aufs` backend if the aufs is available and overlayfs is not supported.
+    3. Use `copy` backend if none of above is selected.
 
 ### Copy
 
@@ -360,6 +397,46 @@ and mount it under the sandbox directory. The executor can perform
 `pivot_root` or `chroot` itself to enter the container root
 filesystem.
 
+## Garbage Collect Unused Container Images
+
+Experimental support of garbage-collecting unused container images was added at
+Mesos 1.5. This can be either configured automatically via a new agent flag
+`--image_gc_config`, or manually invoked through agent's
+[v1 Operator HTTP API](operator-http-api.md#prune_images). This can be used
+to avoid unbounded disk space usage of image stores.
+
+This is implemented with a simple mark-and-sweep logic. When image GC happens,
+we check all layers and images referenced by active running containers and avoid
+removing them from the image store. As a pre-requisite, if there are active
+containers launched before Mesos 1.5.0, we cannot determine what images can be
+safely garbage collected, so agent will refuse to invoke image GC. To garbage
+collect container images, users are expected to drain all containers launched
+before Mesos 1.5.0.
+
+**NOTE**: currently, the image GC is only supported for docker store in Mesos
+Containerizer.
+
+### Automatic Image GC through Agent Flag
+
+To enable automatic image GC, use the new agent flag `--image_gc_config`:
+
+    --image_gc_config=file:///home/vagrant/image-gc-config.json
+
+or as a JSON object,
+
+    --image_gc_config="{ \
+      \"image_disk_headroom\": 0.1, \
+      \"image_disk_watch_interval\": { \
+        \"nano_seconds\": 3600 \
+        }, \
+      \"excluded_images\": \[ \] \
+    }"
+
+
+### Manual Image GC through HTTP API
+See `PRUNE_IMAGES` section in
+[v1 Operator HTTP API](operator-http-api.md#prune_images) for manual image GC
+through the agent HTTP API.
 
 ## References
 

@@ -17,8 +17,6 @@
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
-
 #include <mesos/resources.hpp>
 #include <mesos/scheduler.hpp>
 #include <mesos/type_utils.hpp>
@@ -34,6 +32,10 @@
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 
+#include "examples/flags.hpp"
+
+#include "logging/logging.hpp"
+
 using namespace mesos;
 
 using std::string;
@@ -41,6 +43,9 @@ using std::vector;
 
 const int32_t CPUS_PER_TASK = 1;
 const int32_t MEM_PER_TASK = 128;
+
+constexpr char FRAMEWORK_NAME[] = "Dynamic Reservation Framework (C++)";
+
 
 // The framework reserves resources to run at most one task at a time
 // on each agent; the resources are reserved when they are offered to
@@ -60,32 +65,39 @@ public:
       totalTasks(5),
       principal(_principal)
   {
+    taskResources = Resources::parse(
+        "cpus:" + stringify(CPUS_PER_TASK) +
+        ";mem:" + stringify(MEM_PER_TASK)).get();
+
+    taskResources.allocate(role);
+
+    reservationInfo.set_type(Resource::ReservationInfo::DYNAMIC);
+    reservationInfo.set_role(role);
     reservationInfo.set_principal(principal);
 
-    Try<Resources> flattened = TASK_RESOURCES.flatten(role, reservationInfo);
-    CHECK_SOME(flattened);
-    taskResources = flattened.get();
+    // The task will run on reserved resources.
+    taskResources = taskResources.pushReservation(reservationInfo);
   }
 
-  virtual ~DynamicReservationScheduler() {}
+  ~DynamicReservationScheduler() override {}
 
-  virtual void registered(SchedulerDriver*,
+  void registered(SchedulerDriver*,
                           const FrameworkID&,
-                          const MasterInfo&)
+                          const MasterInfo&) override
   {
     LOG(INFO) << "Registered!";
   }
 
-  virtual void reregistered(SchedulerDriver*, const MasterInfo& masterInfo) {}
+  void reregistered(SchedulerDriver*, const MasterInfo& masterInfo) override {}
 
-  virtual void disconnected(SchedulerDriver* driver) {}
+  void disconnected(SchedulerDriver* driver) override {}
 
-  virtual void resourceOffers(SchedulerDriver* driver,
-                              const vector<Offer>& offers)
+  void resourceOffers(SchedulerDriver* driver,
+                              const vector<Offer>& offers) override
   {
     foreach (const Offer& offer, offers) {
-      LOG(INFO) << "Received offer " << offer.id() << " with "
-                << offer.resources();
+      LOG(INFO) << "Received offer " << offer.id() << " from agent "
+                << offer.slave_id() << " with " << offer.resources();
 
       // If the framework got this offer for the first time, the state is
       // `State::INIT`; framework will reserve it (sending RESERVE operation
@@ -111,13 +123,16 @@ public:
           // the task'll be dispatched when reserved resources are re-offered
           // to this framework.
           Resources resources = offer.resources();
-          Resources unreserved = resources.unreserved();
-          if (!unreserved.contains(TASK_RESOURCES)) {
+          Offer::Operation reserve = RESERVE(taskResources);
+
+          Try<Resources> apply = resources.apply(reserve);
+          if (apply.isError()) {
             LOG(INFO) << "Failed to reserve resources for task in offer "
-                      << stringify(offer.id());
+                      << stringify(offer.id()) << ": " << apply.error();
             break;
           }
-          driver->acceptOffers({offer.id()}, {RESERVE(taskResources)}, filters);
+
+          driver->acceptOffers({offer.id()}, {reserve}, filters);
           states[offer.slave_id()] = State::RESERVING;
           break;
         }
@@ -135,7 +150,9 @@ public:
           Resources resources = offer.resources();
           Resources reserved = resources.reserved(role);
 
-          CHECK(reserved.contains(taskResources));
+          CHECK(reserved.contains(taskResources))
+            << "Reserved " << reserved << " does not contain taskResources "
+            << taskResources << " states " << stringify(states);
 
           // If all tasks were launched, unreserve those resources.
           if (tasksLaunched == totalTasks) {
@@ -196,10 +213,10 @@ public:
     }
   }
 
-  virtual void offerRescinded(SchedulerDriver* driver,
-                              const OfferID& offerId) {}
+  void offerRescinded(SchedulerDriver* driver,
+                              const OfferID& offerId) override {}
 
-  virtual void statusUpdate(SchedulerDriver* driver, const TaskStatus& status)
+  void statusUpdate(SchedulerDriver* driver, const TaskStatus& status) override
   {
     const string& taskId = status.task_id().value();
 
@@ -230,19 +247,19 @@ public:
     }
   }
 
-  virtual void frameworkMessage(SchedulerDriver* driver,
+  void frameworkMessage(SchedulerDriver* driver,
                                 const ExecutorID& executorId,
                                 const SlaveID& slaveId,
-                                const string& data) {}
+                                const string& data) override {}
 
-  virtual void slaveLost(SchedulerDriver* driver, const SlaveID& slaveId) {}
+  void slaveLost(SchedulerDriver* driver, const SlaveID& slaveId) override {}
 
-  virtual void executorLost(SchedulerDriver* driver,
+  void executorLost(SchedulerDriver* driver,
                             const ExecutorID& executorId,
                             const SlaveID& slaveId,
-                            int status) {}
+                            int status) override {}
 
-  virtual void error(SchedulerDriver* driver, const string& message)
+  void error(SchedulerDriver* driver, const string& message) override
   {
     LOG(ERROR) << message;
   }
@@ -293,9 +310,7 @@ private:
   Resource::ReservationInfo reservationInfo;
   Resources taskResources;
 
-  static const Resources TASK_RESOURCES;
-
-  Offer::Operation RESERVE(Resources resources)
+  Offer::Operation RESERVE(const Resources& resources)
   {
     Offer::Operation operation;
     operation.set_type(Offer::Operation::RESERVE);
@@ -303,7 +318,7 @@ private:
     return operation;
   }
 
-  Offer::Operation UNRESERVE(Resources resources)
+  Offer::Operation UNRESERVE(const Resources& resources)
   {
     Offer::Operation operation;
     operation.set_type(Offer::Operation::UNRESERVE);
@@ -313,92 +328,98 @@ private:
 };
 
 
-const Resources DynamicReservationScheduler::TASK_RESOURCES = Resources::parse(
-    "cpus:" + stringify(CPUS_PER_TASK) +
-    ";mem:" + stringify(MEM_PER_TASK)).get();
-
-
-class Flags : public virtual flags::FlagsBase
+class Flags : public virtual mesos::internal::examples::Flags
 {
 public:
   Flags()
   {
-    add(&Flags::master,
-        "master",
-        "The master to connect to. May be one of:\n"
-        "  master@addr:port (The PID of the master)\n"
-        "  zk://host1:port1,host2:port2,.../path\n"
-        "  zk://username:password@host1:port1,host2:port2,.../path\n"
-        "  file://path/to/file (where file contains one of the above)");
-
-    add(&Flags::role,
-        "role",
-        "Role to use when registering");
-
-    add(&Flags::principal,
-        "principal",
-        "The principal used to identify this framework",
-        "test");
-
     add(&Flags::command,
         "command",
         "The command to run for each task.",
         "echo hello");
   }
 
-  Option<string> master;
-  Option<string> role;
-  string principal;
   string command;
 };
+
 
 int main(int argc, char** argv)
 {
   Flags flags;
+  Try<flags::Warnings> load = flags.load("MESOS_EXAMPLE_", argc, argv);
 
-  Try<flags::Warnings> load = flags.load(None(), argc, argv);
-  if (load.isError()) {
-    EXIT(EXIT_FAILURE) << flags.usage(load.error());
-  } else if (flags.master.isNone()) {
-    EXIT(EXIT_FAILURE) << flags.usage("Missing --master");
-  } else if (flags.role.isNone()) {
-    EXIT(EXIT_FAILURE) << flags.usage("Missing --role");
-  } else if (flags.role.get() == "*") {
-    EXIT(EXIT_FAILURE)
-      << flags.usage("Role is incorrect; the default '*' role cannot be used");
+  if (flags.help) {
+    std::cout << flags.usage() << std::endl;
+    return EXIT_SUCCESS;
   }
+
+  if (load.isError()) {
+    std::cerr << flags.usage(load.error()) << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  internal::logging::initialize(argv[0], false);
 
   // Log any flag warnings.
   foreach (const flags::Warning& warning, load->warnings) {
     LOG(WARNING) << warning.message;
   }
 
+  if (flags.role == "*") {
+    EXIT(EXIT_FAILURE) << flags.usage(
+        "Role is incorrect; the default '*' role cannot be used");
+  }
+
   FrameworkInfo framework;
   framework.set_user(""); // Mesos'll fill in the current user.
-  framework.set_name("Dynamic Reservation Framework (C++)");
-  framework.set_role(flags.role.get());
   framework.set_principal(flags.principal);
+  framework.set_name(FRAMEWORK_NAME);
+  framework.set_checkpoint(flags.checkpoint);
+  framework.add_roles(flags.role);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::MULTI_ROLE);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
 
   DynamicReservationScheduler scheduler(
       flags.command,
-      flags.role.get(),
+      flags.role,
       flags.principal);
 
-  if (flags.master.get() == "local") {
+  if (flags.master == "local") {
     // Configure master.
-    os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", "false");
+    os::setenv("MESOS_ROLES", flags.role);
+    os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", stringify(flags.authenticate));
 
     ACLs acls;
     ACL::RegisterFramework* acl = acls.add_register_frameworks();
     acl->mutable_principals()->set_type(ACL::Entity::ANY);
-    acl->mutable_roles()->add_values(flags.role.get());
+    acl->mutable_roles()->add_values(flags.role);
     os::setenv("MESOS_ACLS", stringify(JSON::protobuf(acls)));
   }
 
-  MesosSchedulerDriver* driver = new MesosSchedulerDriver(
-      &scheduler,
-      framework,
-      flags.master.get());
+  MesosSchedulerDriver* driver;
+
+  if (flags.authenticate) {
+    LOG(INFO) << "Enabling authentication for the framework";
+
+    Credential credential;
+    credential.set_principal(flags.principal);
+    if (flags.secret.isSome()) {
+      credential.set_secret(flags.secret.get());
+    }
+
+    driver = new MesosSchedulerDriver(
+        &scheduler,
+        framework,
+        flags.master,
+        credential);
+  } else {
+    driver = new MesosSchedulerDriver(
+        &scheduler,
+        framework,
+        flags.master);
+  }
 
   int status = driver->run() == DRIVER_STOPPED ? 0 : 1;
 

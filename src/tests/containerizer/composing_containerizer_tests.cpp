@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <map>
+#include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -39,6 +41,8 @@ using namespace mesos::internal::slave;
 
 using namespace process;
 
+using std::map;
+using std::string;
 using std::vector;
 
 using testing::_;
@@ -59,8 +63,7 @@ class ComposingContainerizerTest : public MesosTest {};
 // underlying containerizer's destroy (because it's not sure
 // if the containerizer can handle the type of container being
 // launched). If the launch is not supported by the 1st containerizer,
-// the composing containerizer should stop the launch loop and
-// set the value of destroy future to true.
+// the composing containerizer should stop the launch.
 TEST_F(ComposingContainerizerTest, DestroyDuringUnsupportedLaunchLoop)
 {
   vector<Containerizer*> containerizers;
@@ -76,37 +79,31 @@ TEST_F(ComposingContainerizerTest, DestroyDuringUnsupportedLaunchLoop)
   containerId.set_value("container");
   TaskInfo taskInfo;
   ExecutorInfo executorInfo;
-  SlaveID slaveId;
-  std::map<std::string, std::string> environment;
+  map<string, string> environment;
 
-  Promise<bool> launchPromise;
+  Promise<Containerizer::LaunchResult> launchPromise;
 
-  EXPECT_CALL(*mockContainerizer1, launch(_, _, _, _, _, _, _, _))
+  EXPECT_CALL(*mockContainerizer1, launch(_, _, _, _))
     .WillOnce(Return(launchPromise.future()));
 
   Future<Nothing> destroy;
-  Promise<bool> destroyPromise;
+  Promise<Option<ContainerTermination>> destroyPromise;
   EXPECT_CALL(*mockContainerizer1, destroy(_))
     .WillOnce(DoAll(FutureSatisfy(&destroy),
                     Return(destroyPromise.future())));
 
-  Future<bool> launched = containerizer.launch(
+  Future<Containerizer::LaunchResult> launched = containerizer.launch(
       containerId,
-      taskInfo,
-      executorInfo,
-      "dir",
-      "user",
-      slaveId,
+      createContainerConfig(taskInfo, executorInfo, "dir", "user"),
       environment,
-      false);
-
-  Resources resources = Resources::parse("cpus:1;mem:256").get();
+      None());
 
   EXPECT_TRUE(launched.isPending());
 
-  Future<bool> destroyed = containerizer.destroy(containerId);
+  Future<Option<ContainerTermination>> destroyed =
+    containerizer.destroy(containerId);
 
-  EXPECT_CALL(*mockContainerizer2, launch(_, _, _, _, _, _, _, _))
+  EXPECT_CALL(*mockContainerizer2, launch(_, _, _, _))
     .Times(0);
 
   // We make sure the destroy is being called on the first containerizer.
@@ -114,14 +111,16 @@ TEST_F(ComposingContainerizerTest, DestroyDuringUnsupportedLaunchLoop)
   // container is already destroyed.
   AWAIT_READY(destroy);
 
-  launchPromise.set(false);
-  destroyPromise.set(false);
+  launchPromise.set(Containerizer::LaunchResult::NOT_SUPPORTED);
+  destroyPromise.set(Option<ContainerTermination>::none());
 
-  // `launched` should be a failure and `destroyed` should be true
-  // because the launch was stopped from being tried on the 2nd
-  // containerizer because of the destroy.
+  // `launched` should be a failure and `destroyed` should be `None`
+  // because there was no container in `RUNNING` or `LAUNCHING` state
+  // at the moment `destroy()` was called.
   AWAIT_FAILED(launched);
-  AWAIT_EXPECT_EQ(true, destroyed);
+
+  AWAIT_READY(destroyed);
+  EXPECT_NONE(destroyed.get());
 }
 
 
@@ -129,8 +128,9 @@ TEST_F(ComposingContainerizerTest, DestroyDuringUnsupportedLaunchLoop)
 // launch loop. The composing containerizer still calls the
 // underlying containerizer's destroy (because it's not sure
 // if the containerizer can handle the type of container being
-// launched). If the launch is successful the destroy future
-// value depends on the containerizer's destroy.
+// launched). If the launch is successful, the composing
+// containerizer's destroy future value depends on the underlying
+// containerizer's destroy.
 TEST_F(ComposingContainerizerTest, DestroyDuringSupportedLaunchLoop)
 {
   vector<Containerizer*> containerizers;
@@ -146,37 +146,31 @@ TEST_F(ComposingContainerizerTest, DestroyDuringSupportedLaunchLoop)
   containerId.set_value("container");
   TaskInfo taskInfo;
   ExecutorInfo executorInfo;
-  SlaveID slaveId;
-  std::map<std::string, std::string> environment;
+  map<string, string> environment;
 
-  Promise<bool> launchPromise;
+  Promise<Containerizer::LaunchResult> launchPromise;
 
-  EXPECT_CALL(*mockContainerizer1, launch(_, _, _, _, _, _, _, _))
+  EXPECT_CALL(*mockContainerizer1, launch(_, _, _, _))
     .WillOnce(Return(launchPromise.future()));
 
   Future<Nothing> destroy;
-  Promise<bool> destroyPromise;
+  Promise<Option<ContainerTermination>> destroyPromise;
   EXPECT_CALL(*mockContainerizer1, destroy(_))
     .WillOnce(DoAll(FutureSatisfy(&destroy),
                     Return(destroyPromise.future())));
 
-  Future<bool> launched = containerizer.launch(
+  Future<Containerizer::LaunchResult> launched = containerizer.launch(
       containerId,
-      taskInfo,
-      executorInfo,
-      "dir",
-      "user",
-      slaveId,
+      createContainerConfig(taskInfo, executorInfo, "dir", "user"),
       environment,
-      false);
-
-  Resources resources = Resources::parse("cpus:1;mem:256").get();
+      None());
 
   EXPECT_TRUE(launched.isPending());
 
-  Future<bool> destroyed = containerizer.destroy(containerId);
+  Future<Option<ContainerTermination>> destroyed =
+    containerizer.destroy(containerId);
 
-  EXPECT_CALL(*mockContainerizer2, launch(_, _, _, _, _, _, _, _))
+  EXPECT_CALL(*mockContainerizer2, launch(_, _, _, _))
     .Times(0);
 
   // We make sure the destroy is being called on the first containerizer.
@@ -184,13 +178,15 @@ TEST_F(ComposingContainerizerTest, DestroyDuringSupportedLaunchLoop)
   // container is already destroyed.
   AWAIT_READY(destroy);
 
-  launchPromise.set(true);
-  destroyPromise.set(false);
+  launchPromise.set(Containerizer::LaunchResult::SUCCESS);
+  destroyPromise.set(Option<ContainerTermination>(ContainerTermination()));
 
-  // `launched` should return true and `destroyed` should return false
-  // because the launch succeeded and `destroyPromise` was set to false.
-  AWAIT_EXPECT_EQ(true, launched);
-  AWAIT_EXPECT_EQ(false, destroyed);
+  // `launched` should return `SUCCESS` and `destroyed` should return `Some`,
+  // because both operations succeeded.
+  AWAIT_EXPECT_EQ(Containerizer::LaunchResult::SUCCESS, launched);
+
+  AWAIT_READY(destroyed);
+  EXPECT_SOME(destroyed.get());
 }
 
 
@@ -198,8 +194,9 @@ TEST_F(ComposingContainerizerTest, DestroyDuringSupportedLaunchLoop)
 // launch loop. The composing containerizer still calls the
 // underlying containerizer's destroy (because it's not sure
 // if the containerizer can handle the type of container being
-// launched). If the launch is not supported by any containerizers
-// both the launch and destroy futures should be false.
+// launched). If the launch is not supported by any containerizers,
+// then the launch future should be `NOT_SUPPORTED` and the destroy
+// future should be `None`.
 TEST_F(ComposingContainerizerTest, DestroyAfterLaunchLoop)
 {
   vector<Containerizer*> containerizers;
@@ -212,46 +209,42 @@ TEST_F(ComposingContainerizerTest, DestroyAfterLaunchLoop)
   containerId.set_value("container");
   TaskInfo taskInfo;
   ExecutorInfo executorInfo;
-  SlaveID slaveId;
-  std::map<std::string, std::string> environment;
+  map<string, string> environment;
 
-  Promise<bool> launchPromise;
+  Promise<Containerizer::LaunchResult> launchPromise;
 
-  EXPECT_CALL(*mockContainerizer1, launch(_, _, _, _, _, _, _, _))
+  EXPECT_CALL(*mockContainerizer1, launch(_, _, _, _))
     .WillOnce(Return(launchPromise.future()));
 
   Future<Nothing> destroy;
-  Promise<bool> destroyPromise;
+  Promise<Option<ContainerTermination>> destroyPromise;
   EXPECT_CALL(*mockContainerizer1, destroy(_))
     .WillOnce(DoAll(FutureSatisfy(&destroy),
                     Return(destroyPromise.future())));
 
-  Future<bool> launched = containerizer.launch(
+  Future<Containerizer::LaunchResult> launched = containerizer.launch(
       containerId,
-      taskInfo,
-      executorInfo,
-      "dir",
-      "user",
-      slaveId,
+      createContainerConfig(taskInfo, executorInfo, "dir", "user"),
       environment,
-      false);
-
-  Resources resources = Resources::parse("cpus:1;mem:256").get();
+      None());
 
   EXPECT_TRUE(launched.isPending());
 
-  Future<bool> destroyed = containerizer.destroy(containerId);
+  Future<Option<ContainerTermination>> destroyed =
+    containerizer.destroy(containerId);
 
   // We make sure the destroy is being called on the containerizer.
   AWAIT_READY(destroy);
 
-  launchPromise.set(false);
-  destroyPromise.set(false);
+  launchPromise.set(Containerizer::LaunchResult::NOT_SUPPORTED);
+  destroyPromise.set(Option<ContainerTermination>::none());
 
-  // `launch` should return false and `destroyed` should return false
+  // `launch` should return false and `destroyed` should return `None`
   // because none of the containerizers support the launch.
-  AWAIT_EXPECT_EQ(false, launched);
-  AWAIT_EXPECT_EQ(false, destroyed);
+  AWAIT_EXPECT_EQ(Containerizer::LaunchResult::NOT_SUPPORTED, launched);
+
+  AWAIT_READY(destroyed);
+  EXPECT_NONE(destroyed.get());
 }
 
 
@@ -270,9 +263,13 @@ TEST_F(ComposingContainerizerTest, DestroyUnknownContainer)
   ComposingContainerizer containerizer(containerizers);
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
-  AWAIT_EXPECT_FALSE(containerizer.destroy(containerId));
+  Future<Option<ContainerTermination>> destroyed =
+    containerizer.destroy(containerId);
+
+  AWAIT_READY(destroyed);
+  EXPECT_NONE(destroyed.get());
 }
 
 
@@ -291,7 +288,7 @@ TEST_F(ComposingContainerizerTest, WaitUnknownContainer)
   ComposingContainerizer containerizer(containerizers);
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   Future<Option<ContainerTermination>> wait = containerizer.wait(containerId);
 

@@ -19,6 +19,10 @@
 // libraries may import <inttypes.h> before we import <picojson.h>.
 // Hence, we undefine the flag here to prevent the redefinition error.
 #undef __STDC_FORMAT_MACROS
+// We also need to define `PICOJSON_USE_INT64`, since we're
+// unconditionally using the `picojson::value::get<uint64_t>()` and
+// `picojson::value::is<uint64_t>()` functions below.
+#define PICOJSON_USE_INT64
 #include <picojson.h>
 #define __STDC_FORMAT_MACROS
 
@@ -30,8 +34,6 @@
 #include <type_traits>
 #include <vector>
 
-#include <boost/type_traits/is_arithmetic.hpp>
-#include <boost/utility/enable_if.hpp>
 #include <boost/variant.hpp>
 
 #include <stout/check.hpp>
@@ -42,6 +44,9 @@
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
 #include <stout/unreachable.hpp>
+
+// TODO(benh): Replace the use of boost::variant here with our wrapper
+// `Variant`.
 
 namespace JSON {
 
@@ -140,7 +145,7 @@ struct Number
 private:
   friend struct Value;
   friend struct Comparator;
-  friend std::ostream& operator<<(std::ostream& stream, const Number& number);
+  friend void json(NumberWriter* writer, const Number& number);
 
   union {
     double value;
@@ -152,6 +157,11 @@ private:
 
 struct Object
 {
+  Object() = default;
+
+  Object(std::initializer_list<std::pair<const std::string, Value>> values_)
+    : values(values_) {}
+
   // Returns the JSON value (specified by the type) given a "path"
   // into the structure, for example:
   //
@@ -187,6 +197,9 @@ struct Object
 
 struct Array
 {
+  Array() = default;
+  Array(std::initializer_list<Value> values_) : values(values_) {}
+
   std::vector<Value> values;
 };
 
@@ -220,15 +233,13 @@ struct Null {};
 
 namespace internal {
 
-// Only Object and Array require recursive_wrapper, not sure
-// if there is a reason to wrap the others or not.
 // Null needs to be first so that it is the default value.
-typedef boost::variant<boost::recursive_wrapper<Null>,
-                       boost::recursive_wrapper<String>,
-                       boost::recursive_wrapper<Number>,
+typedef boost::variant<Null,
+                       String,
+                       Number,
                        boost::recursive_wrapper<Object>,
                        boost::recursive_wrapper<Array>,
-                       boost::recursive_wrapper<Boolean>> Variant;
+                       Boolean> Variant;
 
 } // namespace internal {
 
@@ -249,7 +260,7 @@ struct Value : internal::Variant
   template <typename T>
   Value(
       const T& value,
-      typename boost::enable_if<boost::is_arithmetic<T>, int>::type = 0)
+      typename std::enable_if<std::is_arithmetic<T>::value, int>::type = 0)
     : internal::Variant(Number(value)) {}
 
   // Non-arithmetic types are passed to the default constructor of
@@ -257,14 +268,23 @@ struct Value : internal::Variant
   template <typename T>
   Value(
       const T& value,
-      typename boost::disable_if<boost::is_arithmetic<T>, int>::type = 0)
+      typename std::enable_if<!std::is_arithmetic<T>::value, int>::type = 0)
     : internal::Variant(value) {}
 
   template <typename T>
   bool is() const;
 
   template <typename T>
-  const T& as() const;
+  const T& as() const &;
+
+  template <typename T>
+  T& as() &;
+
+  template <typename T>
+  T&& as() &&;
+
+  template <typename T>
+  const T&& as() const &&;
 
   // Returns true if and only if 'other' is contained by 'this'.
   // 'Other' is contained by 'this' if the following conditions are
@@ -330,14 +350,42 @@ inline bool Value::is<Value>() const
 
 
 template <typename T>
-const T& Value::as() const
+const T& Value::as() const &
 {
-  return *CHECK_NOTNULL(boost::get<T>(this));
+  return boost::get<T>(*this);
+}
+
+
+template <typename T>
+T& Value::as() &
+{
+  return boost::get<T>(*this);
+}
+
+
+template <typename T>
+T&& Value::as() &&
+{
+  return std::move(boost::get<T>(*this));
+}
+
+
+template <typename T>
+const T&& Value::as() const &&
+{
+  return std::move(boost::get<T>(*this));
 }
 
 
 template <>
-inline const Value& Value::as<Value>() const
+inline const Value& Value::as<Value>() const &
+{
+  return *this;
+}
+
+
+template <>
+inline Value& Value::as<Value>() &
 {
   return *this;
 }
@@ -659,104 +707,270 @@ inline bool operator!=(const Value& lhs, const Value& rhs)
   return !(lhs == rhs);
 }
 
+// The following are implementation of `json` customization points in order to
+// use `JSON::*` objects with `jsonify`. This also means that `JSON::*` objects
+// can be used within other `json` customization points.
+//
+// For example, we can use `jsonify` directly like this:
+//
+//   std::cout << jsonify(JSON::Boolean(true));
+//
+// or, for a user-defined class like this:
+//
+//   struct S
+//   {
+//     std::string name;
+//     JSON::Value payload;
+//   };
+//
+//   void json(ObjectWriter* writer, const S& s)
+//   {
+//     writer->field("name", s.name);
+//     writer->field("payload", s.payload);  // Printing out a `JSON::Value`!
+//   }
+//
+//   S s{"mpark", JSON::Boolean(true)};
+//   std::cout << jsonify(s);  // prints: {"name":"mpark","payload",true}
 
-inline std::ostream& operator<<(std::ostream& stream, const String& string)
+inline void json(BooleanWriter* writer, const Boolean& boolean)
 {
-  return stream << jsonify(string.value);
+  json(writer, boolean.value);
 }
 
 
-inline std::ostream& operator<<(std::ostream& stream, const Number& number)
+inline void json(StringWriter* writer, const String& string)
+{
+  json(writer, string.value);
+}
+
+
+inline void json(NumberWriter* writer, const Number& number)
 {
   switch (number.type) {
     case Number::FLOATING:
-      stream << jsonify(number.value);
+      json(writer, number.value);
       break;
     case Number::SIGNED_INTEGER:
-      stream << jsonify(number.signed_integer);
+      json(writer, number.signed_integer);
       break;
     case Number::UNSIGNED_INTEGER:
-      stream << jsonify(number.unsigned_integer);
+      json(writer, number.unsigned_integer);
       break;
   }
-  return stream;
 }
 
 
-// TODO(mpark): Extend `jsonify` to be usable for this implementation.
-inline std::ostream& operator<<(std::ostream& stream, const Object& object)
+inline void json(ObjectWriter* writer, const Object& object)
 {
-  stream << "{";
-  auto iterator = object.values.begin();
-  while (iterator != object.values.end()) {
-    stream << jsonify(iterator->first) << ":" << iterator->second;
-    if (++iterator != object.values.end()) {
-      stream << ",";
-    }
-  }
-  stream << "}";
-  return stream;
+  json(writer, object.values);
 }
 
 
-// TODO(mpark): Extend `jsonify` to be usable for this implementation.
-inline std::ostream& operator<<(std::ostream& stream, const Array& array)
+inline void json(ArrayWriter* writer, const Array& array)
 {
-  stream << "[";
-  auto iterator = array.values.begin();
-  while (iterator != array.values.end()) {
-    stream << *iterator;
-    if (++iterator != array.values.end()) {
-      stream << ",";
+  json(writer, array.values);
+}
+
+
+inline void json(NullWriter*, const Null&)
+{
+  // Do nothing here since `NullWriter` will always just print `null`.
+}
+
+
+// Since `JSON::Value` is a `boost::variant`, we don't know what type of writer
+// is required until we visit it. Therefore, we need an implementation of `json`
+// which takes a `WriterProxy&&` directly, and constructs the correct writer
+// after visitation.
+//
+// We'd prefer to implement this function similar to the below:
+//
+//    void json(WriterProxy&& writer, const Value& value)
+//    {
+//      struct {
+//        void operator()(const Number& value) const {
+//          json(std::move(writer), value);
+//        }
+//        void operator()(const String& value) const {
+//          json(std::move(writer), value);
+//        }
+//        /* ... */
+//      } visitor;
+//      boost::apply_visitor(visitor, value);
+//    }
+//
+// But, `json` is invoked with `WriterProxy` and something like `JSON::Boolean`.
+// The version sketched above would be ambiguous with the
+// `void json(BooleanWriter*, const Boolean&)` version because both overloads
+// involve a single implicit conversion. The `JSON::Boolean` overload has
+// a conversion from `WriterProxy` to `BoolWriter*` and the `JSON::Value`
+// overload has a conversion from `JSON::Boolean` to `JSON::Value`. In order to
+// prefer the overloads such as the one for `JSON::Boolean`, we disallow the
+// implicit conversion to `JSON::Value` by declaring as a template.
+//
+// TODO(mpark): Properly introduce a notion of deferred choice of writers.
+// For example, when trying to print a `variant<int, string>` as the value,
+// we could take something like a `Writer<Number, String>` which can be turned
+// into either a `NumberWriter*` or `StringWriter*`.
+template <
+    typename T,
+    typename std::enable_if<std::is_same<T, Value>::value, int>::type = 0>
+void json(WriterProxy&& writer, const T& value)
+{
+  struct
+  {
+    using result_type = void;
+
+    void operator()(const Boolean& value) const
+    {
+      json(std::move(writer_), value);
     }
-  }
-  stream << "]";
-  return stream;
+    void operator()(const String& value) const
+    {
+      json(std::move(writer_), value);
+    }
+    void operator()(const Number& value) const
+    {
+      json(std::move(writer_), value);
+    }
+    void operator()(const Object& value) const
+    {
+      json(std::move(writer_), value);
+    }
+    void operator()(const Array& value) const
+    {
+      json(std::move(writer_), value);
+    }
+    void operator()(const Null& value) const
+    {
+      json(std::move(writer_), value);
+    }
+
+    WriterProxy&& writer_;
+  } visitor{std::move(writer)};
+  boost::apply_visitor(visitor, value);
 }
 
 
 inline std::ostream& operator<<(std::ostream& stream, const Boolean& boolean)
 {
-  return stream << jsonify(boolean.value);
+  return stream << jsonify(boolean);
 }
 
 
-inline std::ostream& operator<<(std::ostream& stream, const Null&)
+inline std::ostream& operator<<(std::ostream& stream, const String& string)
 {
-  return stream << "null";
+  return stream << jsonify(string);
+}
+
+
+inline std::ostream& operator<<(std::ostream& stream, const Number& number)
+{
+  return stream << jsonify(number);
+}
+
+
+inline std::ostream& operator<<(std::ostream& stream, const Object& object)
+{
+  return stream << jsonify(object);
+}
+
+
+inline std::ostream& operator<<(std::ostream& stream, const Array& array)
+{
+  return stream << jsonify(array);
+}
+
+
+inline std::ostream& operator<<(std::ostream& stream, const Null& null)
+{
+  return stream << jsonify(null);
 }
 
 namespace internal {
 
-inline Value convert(const picojson::value& value)
-{
-  if (value.is<picojson::null>()) {
-    return Null();
-  } else if (value.is<bool>()) {
-    return Boolean(value.get<bool>());
-  } else if (value.is<picojson::value::object>()) {
-    Object object;
-    foreachpair (const std::string& name,
-                 const picojson::value& v,
-                 value.get<picojson::value::object>()) {
-      object.values[name] = convert(v);
-    }
-    return object;
-  } else if (value.is<picojson::value::array>()) {
-    Array array;
-    foreach (const picojson::value& v, value.get<picojson::value::array>()) {
-      array.values.push_back(convert(v));
-    }
-    return array;
-  } else if (value.is<int64_t>()) {
-    return Number(value.get<int64_t>());
-  } else if (value.is<double>()) {
-    return Number(value.get<double>());
-  } else if (value.is<std::string>()) {
-    return String(value.get<std::string>());
+// "Depth" is counted downwards to stay closer to the analogous
+// implementation in PicoJSON.
+constexpr size_t STOUT_JSON_MAX_DEPTH = 200;
+
+// Our implementation of picojson's parsing context that allows
+// us to parse directly into our JSON::Value.
+//
+// https://github.com/kazuho/picojson/blob/v1.3.0/picojson.h#L820-L870
+class ParseContext {
+public:
+  ParseContext(Value* _value, size_t _depth = STOUT_JSON_MAX_DEPTH)
+    : value(_value), depth(_depth) {}
+
+  ParseContext(const ParseContext&) = delete;
+  ParseContext &operator=(const ParseContext&) = delete;
+
+  bool set_null() { *value = Null(); return true; }
+  bool set_bool(bool b) { *value = Boolean(b); return true; }
+  bool set_int64(int64_t i) { *value = Number(i); return true; }
+
+  bool set_number(double f) {
+    // We take a trip through picojson::value here because it
+    // is where the validation takes place (i.e. it throws):
+    //   https://github.com/kazuho/picojson/issues/94
+    //   https://github.com/kazuho/picojson/blob/v1.3.0/picojson.h#L195-L208
+    picojson::value v(f);
+    *value = Number(v.get<double>());
+    return true;
   }
-  return Null();
-}
+
+  template <typename Iter>
+  bool parse_string(picojson::input<Iter>& in) {
+    *value = String();
+    return picojson::_parse_string(value->as<String>().value, in);
+  }
+
+  bool parse_array_start() {
+    if (depth <= 0) {
+      return false;
+    }
+    --depth;
+    *value = Array();
+    return true;
+  }
+
+  template <typename Iter>
+  bool parse_array_item(picojson::input<Iter>& in, size_t) {
+    Array& array = value->as<Array>();
+    array.values.push_back(Value());
+    ParseContext context(&array.values.back(), depth);
+    return picojson::_parse(context, in);
+  }
+
+  bool parse_array_stop(size_t) {
+    ++depth;
+    return true;
+  }
+
+  bool parse_object_start() {
+    if (depth <= 0) {
+      return false;
+    }
+    --depth;
+    *value = Object();
+    return true;
+  }
+
+  template <typename Iter>
+  bool parse_object_item(picojson::input<Iter>& in, const std::string& key) {
+    Object& object = value->as<Object>();
+    ParseContext context(&object.values[key], depth);
+    return picojson::_parse(context, in);
+  }
+
+  bool parse_object_stop() {
+    ++depth;
+    return true;
+  }
+
+  Value* value;
+  size_t depth;
+};
 
 } // namespace internal {
 
@@ -764,19 +978,33 @@ inline Value convert(const picojson::value& value)
 inline Try<Value> parse(const std::string& s)
 {
   const char* parseBegin = s.c_str();
-  picojson::value value;
+  Value value;
   std::string error;
 
   // Because PicoJson supports repeated parsing of multiple objects/arrays in a
   // stream, it will quietly ignore trailing non-whitespace characters. We would
   // rather throw an error, however, so use `last_char` to check for this.
+  //
+  // TODO(alexr): Address cases when `s` is empty or consists only of whitespace
+  // characters.
   const char* lastVisibleChar =
     parseBegin + s.find_last_not_of(strings::WHITESPACE);
 
-  // Parse the string, returning a pointer to the character
-  // immediately following the last one parsed.
-  const char* parseEnd =
-    picojson::parse(value, parseBegin, parseBegin + s.size(), &error);
+  // Parse the string, returning a pointer to the character immediately
+  // following the last one parsed. Convert exceptions to `Error`s.
+  //
+  // TODO(alexr): Remove `try-catch` wrapper once picojson stops throwing
+  // on parsing, see https://github.com/kazuho/picojson/issues/94
+  const char* parseEnd;
+  try {
+    internal::ParseContext context(&value);
+    parseEnd =
+      picojson::_parse(context, parseBegin, parseBegin + s.size(), &error);
+  } catch (const std::overflow_error&) {
+    return Error("Value out of range");
+  } catch (...) {
+    return Error("Unknown JSON parse error");
+  }
 
   if (!error.empty()) {
     return Error(error);
@@ -786,7 +1014,11 @@ inline Try<Value> parse(const std::string& s)
         + s.substr(parseEnd - parseBegin, lastVisibleChar + 1 - parseEnd));
   }
 
-  return internal::convert(value);
+  // TODO(bmahler): Newer compilers (clang-3.9 and gcc-5.1) can
+  // perform a move into the resultant Try with optimization on.
+  // Consider removing the `std::move` when we require these
+  // compilers.
+  return std::move(value);
 }
 
 
@@ -799,11 +1031,11 @@ Try<T> parse(const std::string& s)
     return Error(value.error());
   }
 
-  if (!value.get().is<T>()) {
+  if (!value->is<T>()) {
     return Error("Unexpected JSON type parsed");
   }
 
-  return value.get().as<T>();
+  return std::move(value->as<T>());
 }
 
 

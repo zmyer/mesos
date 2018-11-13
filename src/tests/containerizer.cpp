@@ -31,12 +31,14 @@ using process::http::Connection;
 using std::map;
 using std::shared_ptr;
 using std::string;
+using std::vector;
 
 using testing::_;
 using testing::Invoke;
 using testing::Return;
 
 using mesos::slave::ContainerClass;
+using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerTermination;
 
 using mesos::v1::executor::Mesos;
@@ -69,7 +71,7 @@ public:
     }
   }
 
-  virtual ~TestContainerizerProcess()
+  ~TestContainerizerProcess() override
   {
     foreachvalue (const Owned<ExecutorData>& data, executors) {
       if (data->driver.get() != nullptr) {
@@ -85,132 +87,83 @@ public:
     return Nothing();
   }
 
-  Future<bool> launch(
+  Future<slave::Containerizer::LaunchResult> launch(
       const ContainerID& containerId,
-      const Option<TaskInfo>& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const string& directory,
-      const Option<string>& user,
-      const SlaveID& slaveId,
+      const ContainerConfig& containerConfig,
       const map<string, string>& environment,
-      bool checkpoint)
+      const Option<string>& pidCheckpointPath)
   {
     CHECK(!terminatedContainers.contains(containerId))
       << "Failed to launch nested container " << containerId
-      << " for executor '" << executorInfo.executor_id() << "'"
-      << " of framework " << executorInfo.framework_id()
+      << " for executor '" << containerConfig.executor_info().executor_id()
+      << "' of framework " << containerConfig.executor_info().framework_id()
       << " because this ContainerID is being re-used with"
       << " a previously terminated container";
 
     CHECK(!containers_.contains(containerId))
       << "Failed to launch container " << containerId
-      << " for executor '" << executorInfo.executor_id() << "'"
-      << " of framework " << executorInfo.framework_id()
+      << " for executor '" << containerConfig.executor_info().executor_id()
+      << "' of framework " << containerConfig.executor_info().framework_id()
       << " because it is already launched";
 
-    CHECK(executors.contains(executorInfo.executor_id()))
-      << "Failed to launch executor '" << executorInfo.executor_id() << "'"
-      << " of framework " << executorInfo.framework_id()
-      << " because it is unknown to the containerizer";
-
     containers_[containerId] = Owned<ContainerData>(new ContainerData());
-    containers_.at(containerId)->executorId = executorInfo.executor_id();
-    containers_.at(containerId)->frameworkId = executorInfo.framework_id();
 
-    // We need to synchronize all reads and writes to the environment
-    // as this is global state.
-    //
-    // TODO(jmlvanre): Even this is not sufficient, as other aspects
-    // of the code may read an environment variable while we are
-    // manipulating it. The better solution is to pass the environment
-    // variables into the fork, or to set them on the command line.
-    // See MESOS-3475.
-    static std::mutex mutex;
-
-    synchronized(mutex) {
-      // Since the constructor for `MesosExecutorDriver` reads
-      // environment variables to load flags, even it needs to
-      // be within this synchronization section.
-      //
-      // Prepare additional environment variables for the executor.
-      // TODO(benh): Need to get flags passed into the TestContainerizer
-      // in order to properly use here.
-      slave::Flags flags;
-      flags.recovery_timeout = Duration::zero();
-
-      // We need to save the original set of environment variables so we
-      // can reset the environment after calling 'driver->start()' below.
-      hashmap<string, string> original = os::environment();
-
-      foreachpair (const string& name, const string& variable, environment) {
-        os::setenv(name, variable);
-      }
-
-      // TODO(benh): Can this be removed and done exclusively in the
-      // 'executorEnvironment()' function? There are other places in the
-      // code where we do this as well and it's likely we can do this once
-      // in 'executorEnvironment()'.
-      foreach (const Environment::Variable& variable,
-               executorInfo.command().environment().variables()) {
-        os::setenv(variable.name(), variable.value());
-      }
-
-      os::setenv("MESOS_LOCAL", "1");
-
-      const Owned<ExecutorData>& executorData =
-        executors.at(executorInfo.executor_id());
-
-      if (executorData->executor != nullptr) {
-        executorData->driver = Owned<MesosExecutorDriver>(
-            new MesosExecutorDriver(executorData->executor));
-        executorData->driver->start();
-      } else {
-        shared_ptr<v1::MockHTTPExecutor> executor =
-          executorData->v1ExecutorMock;
-        executorData->v1Library = Owned<v1::executor::TestMesos>(
-          new v1::executor::TestMesos(ContentType::PROTOBUF, executor));
-      }
-
-      os::unsetenv("MESOS_LOCAL");
-
-      // Unset the environment variables we set by resetting them to their
-      // original values and also removing any that were not part of the
-      // original environment.
-      foreachpair (const string& name, const string& value, original) {
-        os::setenv(name, value);
-      }
-
-      foreachkey (const string& name, environment) {
-        if (!original.contains(name)) {
-          os::unsetenv(name);
-        }
-      }
+    if (containerId.has_parent()) {
+      // Launching a nested container via the test containerizer is a
+      // no-op for now.
+      return slave::Containerizer::LaunchResult::SUCCESS;
     }
 
-    return true;
-  }
+    CHECK(executors.contains(containerConfig.executor_info().executor_id()))
+      << "Failed to launch executor '"
+      << containerConfig.executor_info().executor_id()
+      << "' of framework " << containerConfig.executor_info().framework_id()
+      << " because it is unknown to the containerizer";
 
-  Future<bool> launch(
-      const ContainerID& containerId,
-      const CommandInfo& commandInfo,
-      const Option<ContainerInfo>& containerInfo,
-      const Option<string>& user,
-      const SlaveID& slaveId,
-      const Option<ContainerClass>& containerClass)
-  {
-    CHECK(!terminatedContainers.contains(containerId))
-      << "Failed to launch nested container " << containerId
-      << " because this ContainerID is being re-used with"
-      << " a previously terminated container";
+    containers_.at(containerId)->executorId =
+      containerConfig.executor_info().executor_id();
 
-    CHECK(!containers_.contains(containerId))
-      << "Failed to launch nested container " << containerId
-      << " because it is already launched";
+    containers_.at(containerId)->frameworkId =
+      containerConfig.executor_info().framework_id();
 
-    containers_[containerId] = Owned<ContainerData>(new ContainerData());
+    // Assemble the environment for the executor.
+    //
+    // NOTE: Since in this case the executor will live in the same OS process,
+    // pass the environment into the executor driver (library) c-tor directly
+    // instead of manipulating `setenv`/`getenv` to avoid concurrent
+    // modification of the environment.
+    map<string, string> fullEnvironment = os::environment();
 
-    // No-op for now.
-    return true;
+    fullEnvironment.insert(environment.begin(), environment.end());
+
+    // TODO(benh): Can this be removed and done exclusively in the
+    // 'executorEnvironment()' function? There are other places in the
+    // code where we do this as well and it's likely we can do this once
+    // in 'executorEnvironment()'.
+    foreach (const Environment::Variable& variable,
+             containerConfig.executor_info()
+               .command().environment().variables()) {
+      fullEnvironment.emplace(variable.name(), variable.value());
+    }
+
+    fullEnvironment.emplace("MESOS_LOCAL", "1");
+
+    const Owned<ExecutorData>& executorData =
+      executors.at(containerConfig.executor_info().executor_id());
+
+    if (executorData->executor != nullptr) {
+      executorData->driver = Owned<MesosExecutorDriver>(
+          new MesosExecutorDriver(executorData->executor, fullEnvironment));
+      executorData->driver->start();
+    } else {
+      shared_ptr<v1::MockHTTPExecutor> executor =
+        executorData->v1ExecutorMock;
+      executorData->v1Library = Owned<v1::executor::TestMesos>(
+          new v1::executor::TestMesos(
+              ContentType::PROTOBUF, executor, fullEnvironment));
+    }
+
+    return slave::Containerizer::LaunchResult::SUCCESS;
   }
 
   Future<Nothing> update(
@@ -219,7 +172,6 @@ public:
   {
     return Nothing();
   }
-
 
   Future<Connection> attach(
       const ContainerID& containerId)
@@ -256,11 +208,11 @@ public:
       .then(Option<ContainerTermination>::some);
   }
 
-  Future<bool> destroy(
+  Future<Option<mesos::slave::ContainerTermination>> destroy(
       const ContainerID& containerId)
   {
     if (!containers_.contains(containerId)) {
-      return false;
+      return None();
     }
 
     const Owned<ContainerData>& containerData = containers_.at(containerId);
@@ -288,12 +240,12 @@ public:
     containers_.erase(containerId);
     terminatedContainers[containerId] = termination;
 
-    return true;
+    return termination;
   }
 
   // Additional destroy method for testing because we won't know the
   // ContainerID created for each container.
-  Future<bool> destroy(
+  Future<Option<mesos::slave::ContainerTermination>> destroy(
       const FrameworkID& frameworkId,
       const ExecutorID& executorId)
   {
@@ -312,15 +264,26 @@ public:
       LOG(WARNING) << "Ignoring destroy of unknown container"
                    << " for executor '" << executorId << "'"
                    << " of framework " << frameworkId;
-      return false;
+      return None();
     }
 
     return destroy(containerId.get());
   }
 
+  Future<bool> kill(const ContainerID& containerId, int /* signal */)
+  {
+    return destroy(containerId)
+      .then([]() { return true; });
+  }
+
   Future<hashset<ContainerID>> containers()
   {
     return containers_.keys();
+  }
+
+  Future<Nothing> pruneImages(const vector<Image>& excludedImages)
+  {
+    return Nothing();
   }
 
 private:
@@ -433,30 +396,8 @@ void TestContainerizer::setup()
   EXPECT_CALL(*this, update(_, _))
     .WillRepeatedly(Invoke(this, &TestContainerizer::_update));
 
-  Future<bool> (TestContainerizer::*_launch)(
-      const ContainerID& containerId,
-      const Option<TaskInfo>& taskInfo,
-      const ExecutorInfo& executorInfo,
-      const string& directory,
-      const Option<string>& user,
-      const SlaveID& slaveId,
-      const map<string, string>& environment,
-      bool checkpoint) =
-    &TestContainerizer::_launch;
-
-  EXPECT_CALL(*this, launch(_, _, _, _, _, _, _, _))
-    .WillRepeatedly(Invoke(this, _launch));
-
-  Future<bool> (TestContainerizer::*_launchNested)(
-      const ContainerID& containerId,
-      const CommandInfo& commandInfo,
-      const Option<ContainerInfo>& containerInfo,
-      const Option<string>& user,
-      const SlaveID& slaveId,
-      const Option<ContainerClass>&) = &TestContainerizer::_launch;
-
-  EXPECT_CALL(*this, launch(_, _, _, _, _, _))
-    .WillRepeatedly(Invoke(this, _launchNested));
+  EXPECT_CALL(*this, launch(_, _, _, _))
+    .WillRepeatedly(Invoke(this, &TestContainerizer::_launch));
 
   EXPECT_CALL(*this, attach(_))
     .WillRepeatedly(Invoke(this, &TestContainerizer::_attach));
@@ -466,6 +407,12 @@ void TestContainerizer::setup()
 
   EXPECT_CALL(*this, destroy(_))
     .WillRepeatedly(Invoke(this, &TestContainerizer::_destroy));
+
+  EXPECT_CALL(*this, kill(_, _))
+    .WillRepeatedly(Invoke(this, &TestContainerizer::_kill));
+
+  EXPECT_CALL(*this, pruneImages(_))
+    .WillRepeatedly(Invoke(this, &TestContainerizer::_pruneImages));
 }
 
 
@@ -479,68 +426,19 @@ Future<Nothing> TestContainerizer::_recover(
 }
 
 
-Future<bool> TestContainerizer::_launch(
+Future<slave::Containerizer::LaunchResult> TestContainerizer::_launch(
     const ContainerID& containerId,
-    const Option<TaskInfo>& taskInfo,
-    const ExecutorInfo& executorInfo,
-    const string& directory,
-    const Option<string>& user,
-    const SlaveID& slaveId,
+    const ContainerConfig& containerConfig,
     const map<string, string>& environment,
-    bool checkpoint)
+    const Option<string>& pidCheckpointPath)
 {
-  // Need to disambiguate for the compiler.
-  Future<bool> (TestContainerizerProcess::*launch)(
-      const ContainerID&,
-      const Option<TaskInfo>&,
-      const ExecutorInfo&,
-      const string&,
-      const Option<string>&,
-      const SlaveID&,
-      const map<string, string>&,
-      bool) = &TestContainerizerProcess::launch;
-
   return process::dispatch(
       process.get(),
-      launch,
+      &TestContainerizerProcess::launch,
       containerId,
-      taskInfo,
-      executorInfo,
-      directory,
-      user,
-      slaveId,
+      containerConfig,
       environment,
-      checkpoint);
-}
-
-
-Future<bool> TestContainerizer::_launch(
-    const ContainerID& containerId,
-    const CommandInfo& commandInfo,
-    const Option<ContainerInfo>& containerInfo,
-    const Option<string>& user,
-    const SlaveID& slaveId,
-    const Option<ContainerClass>& containerClass)
-{
-  // Need to disambiguate for the compiler.
-  Future<bool> (TestContainerizerProcess::*launch)(
-      const ContainerID&,
-      const CommandInfo&,
-      const Option<ContainerInfo>&,
-      const Option<string>&,
-      const SlaveID&,
-      const Option<ContainerClass>& containerClass) =
-        &TestContainerizerProcess::launch;
-
-  return process::dispatch(
-      process.get(),
-      launch,
-      containerId,
-      commandInfo,
-      containerInfo,
-      user,
-      slaveId,
-      containerClass);
+      pidCheckpointPath);
 }
 
 
@@ -596,12 +494,13 @@ Future<Option<mesos::slave::ContainerTermination>> TestContainerizer::_wait(
 }
 
 
-Future<bool> TestContainerizer::_destroy(
+Future<Option<mesos::slave::ContainerTermination>> TestContainerizer::_destroy(
     const ContainerID& containerId)
 {
   // Need to disambiguate for the compiler.
-  Future<bool> (TestContainerizerProcess::*destroy)(
-      const ContainerID&) = &TestContainerizerProcess::destroy;
+  Future<Option<mesos::slave::ContainerTermination>> (
+      TestContainerizerProcess::*destroy)(const ContainerID&) =
+        &TestContainerizerProcess::destroy;
 
   return process::dispatch(
       process.get(),
@@ -610,14 +509,27 @@ Future<bool> TestContainerizer::_destroy(
 }
 
 
-Future<bool> TestContainerizer::destroy(
+Future<bool> TestContainerizer::_kill(
+    const ContainerID& containerId,
+    int signal)
+{
+  return process::dispatch(
+      process.get(),
+      &TestContainerizerProcess::kill,
+      containerId,
+      signal);
+}
+
+
+Future<Option<mesos::slave::ContainerTermination>> TestContainerizer::destroy(
     const FrameworkID& frameworkId,
     const ExecutorID& executorId)
 {
   // Need to disambiguate for the compiler.
-  Future<bool> (TestContainerizerProcess::*destroy)(
-      const FrameworkID&,
-      const ExecutorID&) = &TestContainerizerProcess::destroy;
+  Future<Option<mesos::slave::ContainerTermination>> (
+      TestContainerizerProcess::*destroy)(
+          const FrameworkID&, const ExecutorID&) =
+            &TestContainerizerProcess::destroy;
 
   return process::dispatch(
       process.get(),
@@ -632,6 +544,16 @@ Future<hashset<ContainerID>> TestContainerizer::containers()
   return process::dispatch(
       process.get(),
       &TestContainerizerProcess::containers);
+}
+
+
+Future<Nothing> TestContainerizer::_pruneImages(
+    const vector<Image>& excludedImages)
+{
+  return process::dispatch(
+      process.get(),
+      &TestContainerizerProcess::pruneImages,
+      excludedImages);
 }
 
 } // namespace tests {

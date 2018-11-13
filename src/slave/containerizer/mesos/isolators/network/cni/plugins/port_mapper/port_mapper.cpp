@@ -17,6 +17,8 @@
 #include <stout/os.hpp>
 #include <stout/protobuf.hpp>
 
+#include <stout/os/which.hpp>
+
 #include <process/collect.hpp>
 #include <process/dispatch.hpp>
 #include <process/io.hpp>
@@ -30,7 +32,6 @@ using std::cerr;
 using std::endl;
 using std::map;
 using std::string;
-using std::tuple;
 using std::vector;
 
 using process::Failure;
@@ -141,13 +142,20 @@ Try<Owned<PortMapper>, PluginError> PortMapper::create(const string& _cniConfig)
 
   // While the 'args' field is optional in the CNI spec it is critical
   // to the port-mapper plugin to learn of any port-mappings that the
-  // framework might have requested for this container.
+  // framework might have requested for this container when this plugin
+  // is called in the Mesos context. However, to make the port-mapper
+  // plugin more generic rather than Mesos specific, we will create a
+  // fake 'args` field if it is not filled by the caller.
   Result<JSON::Object> args = cniConfig->find<JSON::Object>("args");
-  if (!args.isSome()) {
+  if (args.isError()) {
     return PluginError(
-        "Failed to get the required field 'args': " +
-        (args.isError() ? args.error() : "Not found"),
-        ERROR_BAD_ARGS);
+        "Failed to get the field 'args': " + args.error(), ERROR_BAD_ARGS);
+  } else if (args.isNone()) {
+    JSON::Object _args;
+    JSON::Object mesos;
+    mesos.values["network_info"] = JSON::Object();
+    _args.values["org.apache.mesos"] = mesos;
+    args = _args;
   }
 
   // NOTE: We can't directly use `find` to check for 'network_info'
@@ -302,7 +310,7 @@ Try<Nothing> PortMapper::addPortMapping(
       # Check if the `chain` exists in the iptable. If it does not
       # exist go ahead and install the chain in the iptables NAT
       # table.
-      iptables -w -t nat --list %s
+      iptables -w -n -t nat --list %s
       if [ $? -ne 0 ]; then
         # NOTE: When we create the chain, there is a possibility of a
         # race due to which a container launch can fail. This can
@@ -334,7 +342,7 @@ Try<Nothing> PortMapper::addPortMapping(
 
       # Within the `chain` go ahead and install the DNAT rule, if it
       # does not exist.
-      (iptables -w -t nat -C %s || iptables -t nat -A %s))~",
+      (iptables -w -t nat -C %s || iptables -w -t nat -A %s))~",
       chain,
       chain,
       chain,
@@ -352,16 +360,38 @@ Try<Nothing> PortMapper::addPortMapping(
 
 Try<Nothing> PortMapper::delPortMapping()
 {
+  // The iptables command searches for the DNAT rules with tag
+  // "container_id: <CNI_CONTAINERID>", and if it exists goes ahead
+  // and deletes it.
+  //
+  // NOTE: We use a temp file here, instead of letting `sed` directly
+  // executing the iptables commands because otherwise, it is possible
+  // that the port mapping cleanup command will cause iptables to
+  // deadlock if there are a lot of entires in the iptables, because
+  // the `sed` won't process the next line while executing `iptables
+  // -w -t nat -D ...`. But the executing of `iptables -w -t nat -D
+  // ...` might get stuck if the first command `iptables -w -t nat -S
+  // <TAG>` didn't finish (because the xtables lock is not released).
+  // The first command might not finish if it has a lot of output,
+  // filling the pipe that `sed` hasn't had a chance to process yet.
+  // See details in MESOS-9127.
   string script = strings::format(
       R"~(
       #!/bin/sh
-      exec 1>&2
       set -x
+      set -e
 
-      # The iptables command searches for the DNAT rules with tag
-      # "container_id: <CNI_CONTAINERID>", and if it exists goes ahead
-      # and deletes it.
-      iptables -w -t nat -S %s | sed "/%s/ s/-A/iptables -w -t nat -D/e")~",
+      FILE=$(mktemp)
+
+      cleanup() {
+        rm -f "$FILE"
+      }
+
+      trap cleanup EXIT
+
+      iptables -w -t nat -S %s | sed -n "/%s/ s/-A/iptables -w -t nat -D/p" > $FILE
+      sh $FILE
+      )~",
       chain,
       getIptablesRuleTag()).get();
 
@@ -406,7 +436,7 @@ Try<string, PluginError> PortMapper::handleAddCommand()
 
   // The IP from `delegateResult->ip4().ip()` is in CIDR notation. We
   // need to strip out the netmask.
-  Try<net::IPNetwork> ip = net::IPNetwork::parse(
+  Try<net::IP::Network> ip = net::IP::Network::parse(
       delegateResult->ip4().ip(),
       AF_INET);
 
@@ -491,7 +521,7 @@ Try<Option<string>, PluginError> PortMapper::execute()
 
 Result<spec::NetworkInfo> PortMapper::delegate(const string& command)
 {
-  map<std::string, std::string> environment;
+  map<string, string> environment;
 
   environment["CNI_COMMAND"] = command;
   environment["CNI_IFNAME"] = cniIfName;
@@ -560,7 +590,7 @@ Result<spec::NetworkInfo> PortMapper::delegate(const string& command)
         (result.isDiscarded() ? "discarded" : result.failure()));
   }
 
-  Future<Option<int>> status = std::get<0>(result.get());
+  const Future<Option<int>>& status = std::get<0>(result.get());
   if (!status.isReady()) {
     return Error(
         "Failed to get the exit status of the delegate CNI plugin '" +
@@ -575,7 +605,7 @@ Result<spec::NetworkInfo> PortMapper::delegate(const string& command)
   }
 
   // CNI plugin will print result or error to stdout.
-  Future<string> output = std::get<1>(result.get());
+  const Future<string>& output = std::get<1>(result.get());
   if (!output.isReady()) {
     return Error(
         "Failed to read stdout from the delegate CNI plugin '" +
@@ -586,7 +616,7 @@ Result<spec::NetworkInfo> PortMapper::delegate(const string& command)
   // We are reading stderr of the plugin since any log messages from
   // the CNI plugin would be thrown on stderr. This can be useful for
   // debugging issues when the plugin throws a `spec::Error`.
-  Future<string> err = std::get<2>(result.get());
+  const Future<string>& err = std::get<2>(result.get());
   if (!err.isReady()) {
     return Error(
         "Failed to read STDERR from the delegate CNI plugin '" +

@@ -17,24 +17,86 @@
 #ifndef __CHECKER_HPP__
 #define __CHECKER_HPP__
 
+#include <string>
+#include <vector>
+
 #include <mesos/mesos.hpp>
 
+#include <process/http.hpp>
+#include <process/owned.hpp>
+
 #include <stout/error.hpp>
+#include <stout/lambda.hpp>
 #include <stout/option.hpp>
+#include <stout/try.hpp>
+#include <stout/variant.hpp>
+
+#include "checks/checks_runtime.hpp"
+#include "checks/checks_types.hpp"
 
 namespace mesos {
 namespace internal {
 namespace checks {
 
-namespace validation {
+class CheckerProcess;
 
-// TODO(alexr): A better place for these functions would be something like
-// "mesos_validation.cpp", since they validate API protobufs which are not
-// solely related to this library.
-Option<Error> checkInfo(const CheckInfo& checkInfo);
-Option<Error> checkStatusInfo(const CheckStatusInfo& checkStatusInfo);
 
-} // namespace validation {
+class Checker
+{
+public:
+  /**
+   * Attempts to create a `Checker` object. In case of success, checking
+   * starts immediately after initialization.
+   *
+   * The check performed is based off the check type and the given runtime.
+   *
+   * @param check The protobuf message definition of a check.
+   * @param launcherDir A directory where Mesos helper binaries are located.
+   *     Executor must have access to this directory for TCP checks.
+   * @param callback A callback `Checker` uses to send check status updates
+   *     to its owner (usually an executor).
+   * @param taskId The TaskID of the target task.
+   * @param runtime The runtime that launched the task.
+   * @return A `Checker` object or an error if `create` fails.
+   *
+   * @todo A better approach would be to return a stream of updates, e.g.,
+   * `process::Stream<CheckStatusInfo>` rather than invoking a callback.
+   */
+  static Try<process::Owned<Checker>> create(
+      const CheckInfo& check,
+      const std::string& launcherDir,
+      const lambda::function<void(const CheckStatusInfo&)>& callback,
+      const TaskID& taskId,
+      Variant<runtime::Plain, runtime::Docker, runtime::Nested> runtime);
+
+  ~Checker();
+
+  // Not copyable, not assignable.
+  Checker(const Checker&) = delete;
+  Checker& operator=(const Checker&) = delete;
+
+  // Idempotent helpers for pausing and resuming checking.
+  void pause();
+  void resume();
+
+private:
+  Checker(
+      const CheckInfo& _check,
+      const std::string& _launcherDir,
+      const lambda::function<void(const CheckStatusInfo&)>& _callback,
+      const TaskID& _taskId,
+      Variant<runtime::Plain, runtime::Docker, runtime::Nested> _runtime);
+
+  void processCheckResult(const Try<CheckStatusInfo>& result);
+
+  const CheckInfo check;
+  const lambda::function<void(const CheckStatusInfo&)> callback;
+  const TaskID taskId;
+  const std::string name;
+
+  CheckStatusInfo previousCheckStatus;
+  process::Owned<CheckerProcess> process;
+};
 
 } // namespace checks {
 } // namespace internal {

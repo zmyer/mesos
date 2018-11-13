@@ -37,28 +37,20 @@ public:
     CHECK(sizeof(FLAGS_v) == sizeof(int32_t));
   }
 
-  virtual ~Logging() {}
+  ~Logging() override {}
 
   Future<Nothing> set_level(int level, const Duration& duration);
 
 protected:
-  virtual void initialize()
+  void initialize() override
   {
-    if (authenticationRealm.isSome()) {
-      route("/toggle", authenticationRealm.get(), TOGGLE_HELP(), &This::toggle);
-    } else {
-      route("/toggle",
-            TOGGLE_HELP(),
-            [this](const http::Request& request) {
-              return This::toggle(request, None());
-            });
-    }
+    route("/toggle", authenticationRealm, TOGGLE_HELP(), &This::toggle);
   }
 
 private:
   Future<http::Response> toggle(
       const http::Request& request,
-      const Option<std::string>& /* principal */);
+      const Option<http::authentication::Principal>&);
 
   void set(int v)
   {

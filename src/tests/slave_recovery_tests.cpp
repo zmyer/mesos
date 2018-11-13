@@ -14,8 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <stdint.h>
+#ifndef __WINDOWS__
 #include <unistd.h>
+#endif // __WINDOWS__
 
 #include <string>
 
@@ -32,8 +33,10 @@
 
 #include <mesos/scheduler/scheduler.hpp>
 
+#include <process/collect.hpp>
 #include <process/dispatch.hpp>
 #include <process/gmock.hpp>
+#include <process/gtest.hpp>
 #include <process/http.hpp>
 #include <process/owned.hpp>
 #include <process/reap.hpp>
@@ -46,6 +49,8 @@
 #include <stout/path.hpp>
 #include <stout/uuid.hpp>
 
+#include <stout/os/killtree.hpp>
+
 #include "common/protobuf_utils.hpp"
 
 #include "master/master.hpp"
@@ -55,6 +60,7 @@
 #include "master/detector/standalone.hpp"
 
 #include "slave/gc.hpp"
+#include "slave/gc_process.hpp"
 #include "slave/paths.hpp"
 #include "slave/slave.hpp"
 #include "slave/state.hpp"
@@ -68,6 +74,7 @@
 #include "tests/containerizer.hpp"
 #include "tests/flags.hpp"
 #include "tests/mesos.hpp"
+#include "tests/resources_utils.hpp"
 #include "tests/utils.hpp"
 
 using namespace mesos::internal::slave;
@@ -114,7 +121,7 @@ TEST_F(SlaveStateTest, CheckpointString)
   const string file = "test-file";
   slave::state::checkpoint(file, expected);
 
-  EXPECT_SOME_EQ(expected, os::read(file));
+  EXPECT_SOME_EQ(expected, slave::state::read<string>(file));
 }
 
 
@@ -124,10 +131,10 @@ TEST_F(SlaveStateTest, CheckpointProtobufMessage)
   SlaveID expected;
   expected.set_value("agent1");
 
-  const string& file = "slave.id";
+  const string file = "slave.id";
   slave::state::checkpoint(file, expected);
 
-  const Result<SlaveID>& actual = ::protobuf::read<SlaveID>(file);
+  const Result<SlaveID> actual = slave::state::read<SlaveID>(file);
   ASSERT_SOME(actual);
 
   EXPECT_SOME_EQ(expected, actual);
@@ -143,9 +150,9 @@ TEST_F(SlaveStateTest, CheckpointRepeatedProtobufMessages)
   const string file = "resources-file";
   slave::state::checkpoint(file, expected);
 
-  Result<RepeatedPtrField<Resource>> actual =
-    ::protobuf::read<RepeatedPtrField<Resource>>(file);
+  const Result<Resources> actual = slave::state::read<Resources>(file);
 
+  ASSERT_SOME(actual);
   EXPECT_SOME_EQ(expected, actual);
 }
 
@@ -154,7 +161,7 @@ template <typename T>
 class SlaveRecoveryTest : public ContainerizerTest<T>
 {
 public:
-  virtual slave::Flags CreateSlaveFlags()
+  slave::Flags CreateSlaveFlags() override
   {
     return ContainerizerTest<T>::CreateSlaveFlags();
   }
@@ -175,7 +182,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -202,7 +209,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   Future<Message> subscribeMessage = FUTURE_CALL_MESSAGE(
       mesos::scheduler::Call(), mesos::scheduler::Call::SUBSCRIBE, _, _);
@@ -211,14 +218,14 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
 
   // Capture the framework pid.
   AWAIT_READY(subscribeMessage);
-  UPID frameworkPid = subscribeMessage.get().from;
+  UPID frameworkPid = subscribeMessage->from;
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   SlaveID slaveId = offers.get()[0].slave_id();
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   // Scheduler expectations.
   EXPECT_CALL(sched, statusUpdate(_, _))
@@ -234,7 +241,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
   Future<mesos::scheduler::Call> ack = FUTURE_CALL(
       mesos::scheduler::Call(), mesos::scheduler::Call::ACKNOWLEDGE, _, _);
 
-  Future<Nothing> _ack =
+  Future<Nothing> _statusUpdateAcknowledgement =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
@@ -243,25 +250,25 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
   AWAIT_READY(registerExecutorMessage);
 
   RegisterExecutorMessage registerExecutor;
-  registerExecutor.ParseFromString(registerExecutorMessage.get().body);
+  registerExecutor.ParseFromString(registerExecutorMessage->body);
   ExecutorID executorId = registerExecutor.executor_id();
-  UPID libprocessPid = registerExecutorMessage.get().from;
+  UPID libprocessPid = registerExecutorMessage->from;
 
   // Capture the update.
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_RUNNING, update.get().update().status().state());
+  EXPECT_EQ(TASK_STARTING, update->update().status().state());
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_ack);
+  AWAIT_READY(_statusUpdateAcknowledgement);
 
   // Recover the state.
   Result<slave::state::State> recover = slave::state::recover(
       paths::getMetaRootDir(flags.work_dir), true);
 
   ASSERT_SOME(recover);
-  ASSERT_SOME(recover.get().slave);
+  ASSERT_SOME(recover->slave);
 
-  slave::state::SlaveState state = recover.get().slave.get();
+  slave::state::SlaveState state = recover->slave.get();
 
   // Check slave id.
   ASSERT_EQ(slaveId, state.id);
@@ -311,7 +318,9 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
         .info);
 
   // Check status update and ack.
-  ASSERT_EQ(
+  // (the number might be bigger than 1 because we might have
+  // received any number of additional TASK_RUNNING updates)
+  ASSERT_LE(
       1U,
       state
         .frameworks[frameworkId]
@@ -321,7 +330,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
         .updates.size());
 
   ASSERT_EQ(
-      update.get().update().uuid(),
+      update->update().uuid(),
       state
         .frameworks[frameworkId]
         .executors[executorId]
@@ -329,7 +338,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
         .tasks[task.task_id()]
         .updates.front().uuid());
 
-  const UUID uuid = UUID::fromBytes(ack.get().acknowledge().uuid()).get();
+  const id::UUID uuid = id::UUID::fromBytes(ack->acknowledge().uuid()).get();
   ASSERT_TRUE(state
                 .frameworks[frameworkId]
                 .executors[executorId]
@@ -339,7 +348,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
 
   // Shut down the executor manually so that it doesn't hang around
   // after the test finishes.
-  process::post(libprocessPid, ShutdownExecutorMessage());
+  process::post(slave.get()->pid, libprocessPid, ShutdownExecutorMessage());
 
   driver.stop();
   driver.join();
@@ -348,14 +357,14 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
 
 // The slave is killed before the update reaches the scheduler.
 // When the slave comes back up it resends the unacknowledged update.
-TYPED_TEST(SlaveRecoveryTest, RecoverStatusUpdateManager)
+TYPED_TEST(SlaveRecoveryTest, RecoverTaskStatusUpdateManager)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
   ASSERT_SOME(master);
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -380,14 +389,14 @@ TYPED_TEST(SlaveRecoveryTest, RecoverStatusUpdateManager)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   // Message expectations.
   Future<Message> registerExecutor =
@@ -409,7 +418,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverStatusUpdateManager)
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());       // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   // Restart the slave (use same flags) with a new containerizer.
   _containerizer = TypeParam::create(flags, true, &fetcher);
@@ -420,7 +429,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverStatusUpdateManager)
   ASSERT_SOME(slave);
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_STARTING, status->state());
 
   driver.stop();
   driver.join();
@@ -430,6 +439,8 @@ TYPED_TEST(SlaveRecoveryTest, RecoverStatusUpdateManager)
 // The slave is stopped before the first update for a task is received from the
 // HTTP based command executor. When it comes back up with recovery=reconnect,
 // make sure the executor subscribes and the slave properly sends the update.
+//
+// TODO(alexr): Enable after MESOS-6623 is resolved.
 TYPED_TEST(SlaveRecoveryTest, DISABLED_ReconnectHTTPExecutor)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -438,7 +449,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ReconnectHTTPExecutor)
   slave::Flags flags = this->CreateSlaveFlags();
   flags.http_command_executor = true;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -467,15 +478,15 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ReconnectHTTPExecutor)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the HTTP based command executor.
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   Future<v1::executor::Call> updateCall =
     DROP_HTTP_CALL(Call(), Call::UPDATE, _, ContentType::PROTOBUF);
@@ -506,12 +517,12 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ReconnectHTTPExecutor)
   // Ensure that the executor subscribes again.
   AWAIT_READY(subscribeCall);
 
-  EXPECT_EQ(1, subscribeCall.get().subscribe().unacknowledged_updates().size());
-  EXPECT_EQ(1, subscribeCall.get().subscribe().unacknowledged_tasks().size());
+  EXPECT_EQ(1, subscribeCall->subscribe().unacknowledged_updates().size());
+  EXPECT_EQ(1, subscribeCall->subscribe().unacknowledged_tasks().size());
 
   // Scheduler should receive the recovered update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_STARTING, status->state());
 
   driver.stop();
   driver.join();
@@ -525,6 +536,8 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ReconnectHTTPExecutor)
 //
 // TODO(anand): Remove the `ROOT_CGROUPS` prefix once the posix isolator
 // is nested aware.
+//
+// TODO(alexr): Enable after MESOS-6623 is resolved.
 TYPED_TEST(SlaveRecoveryTest, DISABLED_ROOT_CGROUPS_ReconnectDefaultExecutor)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -536,7 +549,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ROOT_CGROUPS_ReconnectDefaultExecutor)
   slave::Flags flags = this->CreateSlaveFlags();
   flags.authenticate_http_readwrite = false;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -588,14 +601,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ROOT_CGROUPS_ReconnectDefaultExecutor)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  {
-    v1::scheduler::Call call;
-    call.set_type(v1::scheduler::Call::SUBSCRIBE);
-    v1::scheduler::Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(evolve(frameworkInfo));
-
-    mesos.send(call);
-  }
+  mesos.send(v1::createCallSubscribe(evolve(frameworkInfo)));
 
   AWAIT_READY(subscribed);
 
@@ -605,16 +611,16 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ROOT_CGROUPS_ReconnectDefaultExecutor)
   executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
 
   AWAIT_READY(offers);
-  EXPECT_NE(0, offers->offers().size());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const SlaveID slaveId = devolve(offer.agent_id());
 
   v1::TaskInfo taskInfo1 =
-    evolve(createTask(slaveId, resources, "sleep 1000"));
+    evolve(createTask(slaveId, resources, SLEEP_COMMAND(1000)));
 
   v1::TaskInfo taskInfo2 =
-    evolve(createTask(slaveId, resources, "sleep 1000"));
+    evolve(createTask(slaveId, resources, SLEEP_COMMAND(1000)));
 
   v1::TaskGroupInfo taskGroup;
   taskGroup.add_tasks()->CopyFrom(taskInfo1);
@@ -716,7 +722,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ROOT_CGROUPS_ReconnectDefaultExecutor)
 
 // The slave is stopped before the first update for a task is received
 // from the executor. When it comes back up with recovery=reconnect, make
-// sure the executor re-registers and the slave properly sends the update.
+// sure the executor reregisters and the slave properly sends the update.
 TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -724,7 +730,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -749,23 +755,30 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
-  // Drop the first update from the executor.
-  Future<StatusUpdateMessage> statusUpdate =
+  // Drop the status updates from the executor.
+  // We actually wait until we can drop the TASK_RUNNING update here
+  // because the window between the two is small enough that we could
+  // still successfully receive TASK_RUNNING after we drop TASK_STARTING.
+  Future<StatusUpdateMessage> runningUpdate =
+    DROP_PROTOBUF(StatusUpdateMessage(), _, _);
+
+  Future<StatusUpdateMessage> startingUpdate =
     DROP_PROTOBUF(StatusUpdateMessage(), _, _);
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   // Stop the slave before the status update is received.
-  AWAIT_READY(statusUpdate);
+  AWAIT_READY(startingUpdate);
+  AWAIT_READY(runningUpdate);
 
   slave.get()->terminate();
 
@@ -775,7 +788,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());       // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   // Restart the slave (use same flags) with a new containerizer.
   _containerizer = TypeParam::create(flags, true, &fetcher);
@@ -785,18 +798,287 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
-  // Ensure the executor re-registers.
+  // Ensure the executor reregisters.
   AWAIT_READY(reregister);
 
-  // Executor should inform about the unacknowledged update.
-  ASSERT_EQ(1, reregister->updates_size());
+  // Executor should inform about the unacknowledged updates.
+  ASSERT_LE(1, reregister->updates_size());
   const StatusUpdate& update = reregister->updates(0);
   EXPECT_EQ(task.task_id(), update.status().task_id());
-  EXPECT_EQ(TASK_RUNNING, update.status().state());
+  EXPECT_EQ(TASK_STARTING, update.status().state());
 
   // Scheduler should receive the recovered update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_EQ(TASK_STARTING, status->state());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This ensures that when the executor reconnect retry is enabled,
+// the agent will retry the reconnect messages until the executor
+// responds. We then ensure that any duplicate re-registration
+// messages coming from the executor are ignored.
+TYPED_TEST(SlaveRecoveryTest, ReconnectExecutorRetry)
+{
+  Try<Owned<cluster::Master>> master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = this->CreateSlaveFlags();
+
+  Fetcher fetcher(flags);
+
+  Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  Future<TaskStatus> statusUpdate;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusUpdate))
+    .WillRepeatedly(Return()); // Ignore subsequent TASK_RUNNING updates.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
+
+  // Pause the clock to ensure the agent does not retry the
+  // status update. We will ensure the acknowledgement is
+  // checkpointed before we terminate the agent.
+  Clock::pause();
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusUpdate);
+  EXPECT_EQ(TASK_STARTING, statusUpdate->state());
+
+  // Ensure the acknowledgement is checkpointed.
+  Clock::settle();
+
+  slave.get()->terminate();
+
+  // We drop the first re-registration message to emulate
+  // a half-open connection closing for "old" executors
+  // that do not have the fix for MESOS-7057.
+  Future<ReregisterExecutorMessage> reregisterExecutorMessage =
+    DROP_PROTOBUF(ReregisterExecutorMessage(), _, _);
+
+  // Restart the slave (use same flags) with a new containerizer.
+  _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  containerizer.reset(_containerizer.get());
+
+  flags.executor_reregistration_timeout = Seconds(5);
+  flags.executor_reregistration_retry_interval = Seconds(1);
+
+  slave = this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  // The first attempt by the executor to reregister is dropped
+  // so that the agent will retry the reconnect.
+  AWAIT_READY(reregisterExecutorMessage);
+
+  // Now trigger the retry and let the second response through.
+  reregisterExecutorMessage =
+    FUTURE_PROTOBUF(ReregisterExecutorMessage(), _, _);
+
+  Clock::advance(flags.executor_reregistration_retry_interval.get());
+
+  AWAIT_READY(reregisterExecutorMessage);
+
+  // Now ensure that further retries do not occur, since the
+  // executor is already reregistered.
+  EXPECT_NO_FUTURE_PROTOBUFS(ReregisterExecutorMessage(), _, _);
+
+  Clock::advance(flags.executor_reregistration_retry_interval.get());
+  Clock::settle();
+
+  // We have to resume the clock to ensure that the containerizer
+  // can reap the executor pid (i.e. the reaper requires a resumed
+  // clock).
+  Clock::resume();
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that the agent responds to pings from the master while the
+// agent is performing recovery. We do this by setting the executor
+// re-registration timeout to a duration longer than (agent_ping_timeout *
+// (max_agent_ping_timeouts + 1)), and then confirming that the agent is not
+// marked unreachable after the max ping timeout has elapsed, even if all
+// executors have reregistered. Agent recovery currently does not complete
+// until the executor re-registration timeout has elapsed (see MESOS-7539).
+TYPED_TEST(SlaveRecoveryTest, PingTimeoutDuringRecovery)
+{
+  master::Flags masterFlags = this->CreateMasterFlags();
+  masterFlags.agent_ping_timeout = Seconds(1);
+  masterFlags.max_agent_ping_timeouts = 2;
+
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Set the executor reregister timeout to a value greater than
+  // (agent_ping_timeout * (max_agent_ping_timeouts + 1)).
+  slave::Flags slaveFlags = this->CreateSlaveFlags();
+  slaveFlags.executor_reregistration_timeout = process::TEST_AWAIT_TIMEOUT;
+
+  Fetcher fetcher(slaveFlags);
+
+  Try<TypeParam*> _containerizer =
+    TypeParam::create(slaveFlags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  const string slavePid = "slave";
+
+  Try<Owned<cluster::Slave>> slave =
+    this->StartSlave(detector.get(), containerizer.get(), slavePid, slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, false, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
+
+  Future<TaskStatus> statusUpdate0;
+  Future<TaskStatus> statusUpdate1;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusUpdate0))
+    .WillOnce(FutureArg<1>(&statusUpdate1));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusUpdate0);
+  ASSERT_EQ(TASK_STARTING, statusUpdate0->state());
+
+  driver.acknowledgeStatusUpdate(statusUpdate0.get());
+
+  AWAIT_READY(statusUpdate1);
+  ASSERT_EQ(TASK_RUNNING, statusUpdate1->state());
+
+  Future<Nothing> _statusUpdateAcknowledgement =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  driver.acknowledgeStatusUpdate(statusUpdate1.get());
+
+  AWAIT_READY(_statusUpdateAcknowledgement);
+
+  slave.get()->terminate();
+
+  Future<ReregisterExecutorMessage> reregisterExecutor =
+    FUTURE_PROTOBUF(ReregisterExecutorMessage(), _, _);
+
+  Future<ReregisterSlaveMessage> reregisterSlave =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  // Restart the slave (use same flags) with a new containerizer.
+  _containerizer = TypeParam::create(slaveFlags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  containerizer.reset(_containerizer.get());
+
+  slave = this->StartSlave(
+      detector.get(),
+      containerizer.get(),
+      slavePid,
+      slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Ensure the executor reregisters.
+  AWAIT_READY(reregisterExecutor);
+
+  Clock::pause();
+
+  // Advance the clock enough to ensure that the agent would have been marked
+  // unreachable if it was not responding to pings.
+  for (unsigned int i = 0; i < masterFlags.max_agent_ping_timeouts + 2; i++) {
+    Future<PingSlaveMessage> ping = FUTURE_PROTOBUF(PingSlaveMessage(), _, _);
+    Future<PongSlaveMessage> pong = FUTURE_PROTOBUF(PongSlaveMessage(), _, _);
+
+    Clock::advance(masterFlags.agent_ping_timeout);
+
+    AWAIT_READY(ping);
+    AWAIT_READY(pong);
+  }
+
+  Clock::resume();
+
+  // Perform reconciliation to verify that the task has not been transitioned to
+  // TASK_LOST or TASK_UNREACHABLE, as would occur if the agent had been deemed
+  // unreachable.
+  vector<TaskStatus> statuses;
+
+  TaskStatus status;
+  status.mutable_task_id()->CopyFrom(task.task_id());
+  status.set_state(TASK_STAGING); // Dummy value.
+
+  statuses.push_back(status);
+
+  Future<TaskStatus> statusUpdate2;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusUpdate2))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
+
+  driver.reconcileTasks(statuses);
+
+  AWAIT_READY(statusUpdate2);
+  ASSERT_EQ(TASK_RUNNING, statusUpdate2->state());
+  ASSERT_EQ(TaskStatus::SOURCE_MASTER, statusUpdate2->source());
+  ASSERT_EQ(TaskStatus::REASON_RECONCILIATION, statusUpdate2->reason());
+
+  // Ensure that the agent has not reregistered yet.
+  ASSERT_TRUE(reregisterSlave.isPending());
+
+  // Advance the clock to prompt the agent to reregister.
+  Clock::pause();
+  Clock::advance(slaveFlags.executor_reregistration_timeout);
+  Clock::resume();
+
+  AWAIT_READY(reregisterSlave);
 
   driver.stop();
   driver.join();
@@ -806,6 +1088,8 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
 // The slave is stopped before the HTTP based command executor is
 // registered. When it comes back up with recovery=reconnect, make
 // sure the executor is killed and the task is transitioned to LOST.
+//
+// TODO(alexr): Enable after MESOS-6623 is resolved.
 TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoverUnregisteredHTTPExecutor)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -814,7 +1098,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoverUnregisteredHTTPExecutor)
   slave::Flags flags = this->CreateSlaveFlags();
   flags.http_command_executor = true;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -847,9 +1131,9 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoverUnregisteredHTTPExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   // Drop the executor subscribe message.
   Future<v1::executor::Call> subscribeCall =
@@ -865,7 +1149,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoverUnregisteredHTTPExecutor)
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());       // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
 
@@ -877,7 +1161,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoverUnregisteredHTTPExecutor)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), id, flags);
   ASSERT_SOME(slave);
@@ -889,13 +1173,9 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoverUnregisteredHTTPExecutor)
   Clock::settle(); // Wait for slave to schedule reregister timeout.
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
-
-  // Now advance time until the reaper reaps the executor.
-  while (status.isPending()) {
-    Clock::advance(process::MAX_REAP_INTERVAL());
-    Clock::settle();
-  }
+  Clock::advance(flags.executor_reregistration_timeout);
+  Clock::settle();
+  Clock::resume();
 
   // Scheduler should receive the TASK_LOST update.
   AWAIT_READY(status);
@@ -905,11 +1185,15 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoverUnregisteredHTTPExecutor)
   EXPECT_EQ(TaskStatus::REASON_EXECUTOR_REREGISTRATION_TIMEOUT,
             status->reason());
 
+  Clock::pause();
+
   // Master should subsequently reoffer the same resources.
   while (offers2.isPending()) {
     Clock::advance(Seconds(1));
     Clock::settle();
   }
+
+  Clock::resume();
 
   AWAIT_READY(offers2);
   EXPECT_EQ(Resources(offers1.get()[0].resources()),
@@ -930,7 +1214,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverUnregisteredExecutor)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -959,9 +1243,9 @@ TYPED_TEST(SlaveRecoveryTest, RecoverUnregisteredExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   // Drop the executor registration message.
   Future<Message> registerExecutor =
@@ -977,7 +1261,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverUnregisteredExecutor)
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());       // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
 
@@ -989,7 +1273,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverUnregisteredExecutor)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
@@ -1001,13 +1285,9 @@ TYPED_TEST(SlaveRecoveryTest, RecoverUnregisteredExecutor)
   Clock::settle(); // Wait for slave to schedule reregister timeout.
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
-
-  // Now advance time until the reaper reaps the executor.
-  while (status.isPending()) {
-    Clock::advance(process::MAX_REAP_INTERVAL());
-    Clock::settle();
-  }
+  Clock::advance(flags.executor_reregistration_timeout);
+  Clock::settle();
+  Clock::resume();
 
   // Scheduler should receive the TASK_LOST update.
   AWAIT_READY(status);
@@ -1017,11 +1297,15 @@ TYPED_TEST(SlaveRecoveryTest, RecoverUnregisteredExecutor)
   EXPECT_EQ(TaskStatus::REASON_EXECUTOR_REREGISTRATION_TIMEOUT,
             status->reason());
 
+  Clock::pause();
+
   // Master should subsequently reoffer the same resources.
   while (offers2.isPending()) {
     Clock::advance(Seconds(1));
     Clock::settle();
   }
+
+  Clock::resume();
 
   AWAIT_READY(offers2);
   EXPECT_EQ(Resources(offers1.get()[0].resources()),
@@ -1032,17 +1316,18 @@ TYPED_TEST(SlaveRecoveryTest, RecoverUnregisteredExecutor)
 }
 
 
-// This test verifies that when the agent gets a `killTask` message and restarts
-// before the executor registers, a TASK_KILLED update is sent and the executor
-// shuts down.
-TYPED_TEST(SlaveRecoveryTest, KillTaskUnregisteredExecutor)
+// This test verifies that when the agent gets a `killTask`
+// message for a queued task on a registering executor, a
+// restart of the agent will generate a TASK_KILLED and
+// will shut down the executor.
+TYPED_TEST(SlaveRecoveryTest, KillQueuedTaskDuringExecutorRegistration)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
   ASSERT_SOME(master);
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1067,14 +1352,14 @@ TYPED_TEST(SlaveRecoveryTest, KillTaskUnregisteredExecutor)
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers1))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   // Drop the executor registration message so that the task stays
   // queued on the agent
@@ -1088,14 +1373,14 @@ TYPED_TEST(SlaveRecoveryTest, KillTaskUnregisteredExecutor)
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());       // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   // Kill the task enqueued on the agent.
   driver.killTask(task.task_id());
 
   AWAIT_READY(status);
   EXPECT_EQ(TASK_KILLED, status->state());
-  EXPECT_EQ(TaskStatus::REASON_EXECUTOR_UNREGISTERED, status->reason());
+  EXPECT_EQ(TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH, status->reason());
 
   slave.get()->terminate();
 
@@ -1112,23 +1397,16 @@ TYPED_TEST(SlaveRecoveryTest, KillTaskUnregisteredExecutor)
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
-  Clock::pause();
-
   AWAIT_READY(_recover);
 
-  Clock::settle(); // Wait for the agent to schedule reregister timeout.
+  Clock::pause();
 
   // Ensure the agent considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
-
-  while(executorTerminated.isPending()) {
-    Clock::advance(process::MAX_REAP_INTERVAL());
-    Clock::settle();
-  }
+  Clock::advance(flags.executor_reregistration_timeout);
+  Clock::settle();
+  Clock::resume();
 
   AWAIT_READY(executorTerminated);
-
-  Clock::resume();
 
   driver.stop();
   driver.join();
@@ -1147,7 +1425,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedHTTPExecutor)
   slave::Flags flags = this->CreateSlaveFlags();
   flags.http_command_executor = true;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1177,24 +1455,29 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedHTTPExecutor)
 
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
-    .WillOnce(FutureArg<1>(&offers1));
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillRepeatedly(Return()); // Allow any number of subsequent status updates.
 
-  Future<Nothing> ack =
+  Future<Nothing> ackRunning =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+  Future<Nothing> ackStarting =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(ack);
+  AWAIT_READY(ackStarting);
+  AWAIT_READY(ackRunning);
 
   slave.get()->terminate();
 
@@ -1210,11 +1493,11 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedHTTPExecutor)
     slave::state::recover(slave::paths::getMetaRootDir(flags.work_dir), true);
 
   ASSERT_SOME(state);
-  ASSERT_SOME(state.get().slave);
-  ASSERT_TRUE(state.get().slave.get().frameworks.contains(frameworkId.get()));
+  ASSERT_SOME(state->slave);
+  ASSERT_TRUE(state->slave->frameworks.contains(frameworkId.get()));
 
   slave::state::FrameworkState frameworkState =
-    state.get().slave.get().frameworks.get(frameworkId.get()).get();
+    state->slave->frameworks.get(frameworkId.get()).get();
 
   ASSERT_EQ(1u, frameworkState.executors.size());
 
@@ -1244,7 +1527,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedHTTPExecutor)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), id, flags);
   ASSERT_SOME(slave);
@@ -1256,22 +1539,22 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedHTTPExecutor)
   Clock::settle(); // Wait for slave to schedule reregister timeout.
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
-
-  // Now advance time until the reaper reaps the executor.
-  while (status.isPending()) {
-    Clock::advance(process::MAX_REAP_INTERVAL());
-    Clock::settle();
-  }
+  Clock::advance(flags.executor_reregistration_timeout);
+  Clock::settle();
+  Clock::resume();
 
   // Scheduler should receive the TASK_FAILED update.
   AWAIT_READY(status);
   EXPECT_EQ(TASK_FAILED, status->state());
 
+  Clock::pause();
+
   while (offers2.isPending()) {
     Clock::advance(Seconds(1));
     Clock::settle();
   }
+
+  Clock::resume();
 
   // Master should subsequently reoffer the same resources.
   AWAIT_READY(offers2);
@@ -1294,7 +1577,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedExecutor)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1318,37 +1601,55 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedExecutor)
 
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
-    .WillOnce(FutureArg<1>(&offers1));
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   Future<Message> registerExecutor =
     FUTURE_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
 
-  Future<Nothing> ack =
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(Return()); // Ignore subsequent status updates.
+
+  Future<Nothing> ackRunning =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+  Future<Nothing> ackStarting =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
+  // Wait for the TASK_STARTING update from the executor
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  // Wait for the TASK_RUNNING update from the executor
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
   // Capture the executor pid.
   AWAIT_READY(registerExecutor);
-  UPID executorPid = registerExecutor.get().from;
+  UPID executorPid = registerExecutor->from;
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(ack);
+  AWAIT_READY(ackStarting);
+  AWAIT_READY(ackRunning);
 
   slave.get()->terminate();
 
-  Future<TaskStatus> status;
+  Future<TaskStatus> statusLost;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status))
+    .WillOnce(FutureArg<1>(&statusLost))
     .WillRepeatedly(Return()); // Ignore subsequent status updates.
 
   // Now shut down the executor, when the slave is down.
@@ -1364,7 +1665,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedExecutor)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
@@ -1376,26 +1677,26 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedExecutor)
   Clock::settle(); // Wait for slave to schedule reregister timeout.
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
-
-  // Now advance time until the reaper reaps the executor.
-  while (status.isPending()) {
-    Clock::advance(process::MAX_REAP_INTERVAL());
-    Clock::settle();
-  }
+  Clock::advance(flags.executor_reregistration_timeout);
+  Clock::settle();
+  Clock::resume();
 
   // Scheduler should receive the TASK_LOST update.
-  AWAIT_READY(status);
+  AWAIT_READY(statusLost);
 
-  EXPECT_EQ(TASK_LOST, status->state());
-  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status->source());
+  EXPECT_EQ(TASK_LOST, statusLost->state());
+  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, statusLost->source());
   EXPECT_EQ(TaskStatus::REASON_EXECUTOR_REREGISTRATION_TIMEOUT,
-            status->reason());
+            statusLost->reason());
+
+  Clock::pause();
 
   while (offers2.isPending()) {
     Clock::advance(Seconds(1));
     Clock::settle();
   }
+
+  Clock::resume();
 
   // Master should subsequently reoffer the same resources.
   AWAIT_READY(offers2);
@@ -1424,7 +1725,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoveryTimeout)
   slave::Flags flags = this->CreateSlaveFlags();
   flags.recovery_timeout = Milliseconds(1);
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1449,14 +1750,14 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoveryTimeout)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   EXPECT_CALL(sched, statusUpdate(_, _));
 
@@ -1493,22 +1794,23 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoveryTimeout)
   AWAIT_READY(_recover);
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(flags.executor_reregistration_timeout);
   Clock::resume();
 
   // Scheduler should receive the TASK_FAILED update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_FAILED, status.get().state());
+  EXPECT_EQ(TASK_FAILED, status->state());
 
   driver.stop();
   driver.join();
 }
 
 
-// The slave is stopped after an executor is completed (i.e., it has
-// terminated and all its updates have been acknowledged).
-// When it comes back up with recovery=reconnect, make
-// sure the recovery successfully completes.
+// The slave is stopped after an executor is completed (i.e., it
+// has terminated and all its updates have been acknowledged).
+// When it comes back up with recovery=reconnect, make sure the
+// recovery successfully completes and the executor's work and
+// meta directories successfully gc'ed.
 TYPED_TEST(SlaveRecoveryTest, RecoverCompletedExecutor)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -1516,7 +1818,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverCompletedExecutor)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1541,33 +1843,50 @@ TYPED_TEST(SlaveRecoveryTest, RecoverCompletedExecutor)
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers1))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "exit 0");
 
+  // Capture the slave and framework ids.
+  SlaveID slaveId = offers1.get()[0].slave_id();
+  FrameworkID frameworkId = offers1.get()[0].framework_id();
+
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .Times(2); // TASK_RUNNING and TASK_FINISHED updates.
+    .Times(3); // TASK_STARTING, TASK_RUNNING and TASK_FINISHED updates.
 
   EXPECT_CALL(sched, offerRescinded(_, _))
     .Times(AtMost(1));
 
-  Future<Nothing> schedule = FUTURE_DISPATCH(
-      _, &GarbageCollectorProcess::schedule);
+  Future<RegisterExecutorMessage> registerExecutor =
+    FUTURE_PROTOBUF(RegisterExecutorMessage(), _, _);
+
+  // We use 'gc.schedule' as a proxy for the cleanup of the executor.
+  // The first event will correspond with the finished task, whereas
+  // the second is associated with the exited executor.
+  vector<Future<Nothing>> schedules = {
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule),
+    FUTURE_DISPATCH(_, &GarbageCollectorProcess::schedule)
+  };
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
-  // We use 'gc.schedule' as a proxy for the cleanup of the executor.
-  AWAIT_READY(schedule);
+  // Capture the executor id.
+  AWAIT_READY(registerExecutor);
+  ExecutorID executorId = registerExecutor->executor_id();
+
+  AWAIT_READY(collect(schedules));
 
   slave.get()->terminate();
 
-  Future<Nothing> schedule2 = FUTURE_DISPATCH(
-      _, &GarbageCollectorProcess::schedule);
+  Future<Nothing> _recover = FUTURE_DISPATCH(_, &Slave::_recover);
+
+  Future<SlaveReregisteredMessage> slaveReregisteredMessage =
+    FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
 
   // Restart the slave (use same flags) with a new containerizer.
   _containerizer = TypeParam::create(flags, true, &fetcher);
@@ -1577,18 +1896,42 @@ TYPED_TEST(SlaveRecoveryTest, RecoverCompletedExecutor)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
-  // We use 'gc.schedule' as a proxy for the cleanup of the executor.
-  AWAIT_READY(schedule2);
+  Clock::pause();
+
+  AWAIT_READY(_recover);
+
+  Clock::settle(); // Wait for slave to schedule reregister timeout.
+
+  // Ensure the slave considers itself recovered.
+  Clock::advance(flags.executor_reregistration_timeout);
+
+  AWAIT_READY(slaveReregisteredMessage);
+
+  Clock::advance(flags.gc_delay);
+
+  Clock::settle();
+
+  // Executor's work and meta directories should be gc'ed by now.
+  ASSERT_FALSE(os::exists(paths::getExecutorPath(
+      flags.work_dir, slaveId, frameworkId, executorId)));
+
+  ASSERT_FALSE(os::exists(paths::getExecutorPath(
+      paths::getMetaRootDir(flags.work_dir),
+      slaveId,
+      frameworkId,
+      executorId)));
 
   // Make sure all slave resources are reoffered.
   AWAIT_READY(offers2);
   EXPECT_EQ(Resources(offers1.get()[0].resources()),
             Resources(offers2.get()[0].resources()));
+
+  Clock::resume();
 
   driver.stop();
   driver.join();
@@ -1598,15 +1941,19 @@ TYPED_TEST(SlaveRecoveryTest, RecoverCompletedExecutor)
 // The slave is stopped before a terminal update is received from the HTTP
 // based command executor. The slave is then restarted in recovery=cleanup mode.
 // It kills the executor, and terminates. Master should then send TASK_LOST.
+//
+// TODO(alexr): Enable after MESOS-6623 is resolved.
 TYPED_TEST(SlaveRecoveryTest, DISABLED_CleanupHTTPExecutor)
 {
-  Try<Owned<cluster::Master>> master = this->StartMaster();
+  master::Flags masterFlags = this->CreateMasterFlags();
+
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   slave::Flags flags = this->CreateSlaveFlags();
   flags.http_command_executor = true;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1635,15 +1982,15 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_CleanupHTTPExecutor)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the HTTP based command executor.
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   Future<v1::executor::Call> updateCall =
     DROP_HTTP_CALL(Call(), Call::UPDATE, _, ContentType::PROTOBUF);
@@ -1653,9 +2000,15 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_CleanupHTTPExecutor)
   // Stop the slave before the status updates are received.
   AWAIT_READY(updateCall);
 
+  Future<hashset<ContainerID>> containerIds = containerizer->containers();
+  AWAIT_READY(containerIds);
+
+  ASSERT_EQ(1u, containerIds->size());
+  auto containerId = *(containerIds->begin());
+
   slave.get()->terminate();
 
-  // Slave in cleanup mode shouldn't re-register with the master and
+  // Slave in cleanup mode shouldn't reregister with the master and
   // hence no offers should be made by the master.
   EXPECT_CALL(sched, resourceOffers(_, _))
     .Times(0);
@@ -1678,23 +2031,30 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_CleanupHTTPExecutor)
   slave = this->StartSlave(detector.get(), containerizer.get(), id, flags);
   ASSERT_SOME(slave);
 
+  // Wait for recovery to complete.
+  AWAIT_READY(__recover);
+
+  // Wait for destruction of the container before advancing the clock, otherwise
+  // a containerizer timeout might be triggered causing failure of container
+  // destruction, which leads to orphan containers.
+  AWAIT_READY(containerizer->wait(containerId));
+
   Clock::pause();
 
-  // Now advance time until the reaper reaps the executor.
+  // Now advance time until the master marks agent unreachable.
   while (status.isPending()) {
-    Clock::advance(process::MAX_REAP_INTERVAL());
+    Clock::advance(masterFlags.agent_ping_timeout);
     Clock::settle();
   }
 
-  // Wait for recovery to complete.
-  AWAIT_READY(__recover);
+  Clock::resume();
 
   // Scheduler should receive the TASK_LOST update.
   AWAIT_READY(status);
 
-  EXPECT_EQ(TASK_LOST, status.get().state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status.get().source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status.get().reason());
+  EXPECT_EQ(TASK_LOST, status->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status->reason());
 
   driver.stop();
   driver.join();
@@ -1706,12 +2066,14 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_CleanupHTTPExecutor)
 // executor, and terminates. Master should then send TASK_LOST.
 TYPED_TEST(SlaveRecoveryTest, CleanupExecutor)
 {
-  Try<Owned<cluster::Master>> master = this->StartMaster();
+  master::Flags masterFlags = this->CreateMasterFlags();
+
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1736,28 +2098,41 @@ TYPED_TEST(SlaveRecoveryTest, CleanupExecutor)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  // Expect TASK_STARTING and TASK_RUNNING updates
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2)
+    .WillRepeatedly(Return()); // Ignore subsequent updates
 
-  Future<Nothing> ack =
+  Future<Nothing> ackRunning =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> ackStarting =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(ack);
+  AWAIT_READY(ackStarting);
+  AWAIT_READY(ackRunning);
+
+  Future<hashset<ContainerID>> containerIds = containerizer->containers();
+  AWAIT_READY(containerIds);
+
+  ASSERT_EQ(1u, containerIds->size());
+  auto containerId = *(containerIds->begin());
 
   slave.get()->terminate();
 
-  // Slave in cleanup mode shouldn't re-register with the master and
+  // Slave in cleanup mode shouldn't reregister with the master and
   // hence no offers should be made by the master.
   EXPECT_CALL(sched, resourceOffers(_, _))
     .Times(0);
@@ -1780,23 +2155,30 @@ TYPED_TEST(SlaveRecoveryTest, CleanupExecutor)
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
+  // Wait for recovery to complete.
+  AWAIT_READY(__recover);
+
+  // Wait for destruction of the container before advancing the clock, otherwise
+  // a containerizer timeout might be triggered causing failure of container
+  // destruction, which leads to orphan containers.
+  AWAIT_READY(containerizer->wait(containerId));
+
   Clock::pause();
 
-  // Now advance time until the reaper reaps the executor.
+  // Now advance time until the master marks agent unreachable.
   while (status.isPending()) {
-    Clock::advance(process::MAX_REAP_INTERVAL());
+    Clock::advance(masterFlags.agent_ping_timeout);
     Clock::settle();
   }
 
-  // Wait for recovery to complete.
-  AWAIT_READY(__recover);
+  Clock::resume();
 
   // Scheduler should receive the TASK_LOST update.
   AWAIT_READY(status);
 
-  EXPECT_EQ(TASK_LOST, status.get().state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status.get().source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status.get().reason());
+  EXPECT_EQ(TASK_LOST, status->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status->reason());
 
   driver.stop();
   driver.join();
@@ -1812,7 +2194,7 @@ TYPED_TEST(SlaveRecoveryTest, RemoveNonCheckpointingFramework)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1837,42 +2219,52 @@ TYPED_TEST(SlaveRecoveryTest, RemoveNonCheckpointingFramework)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Launch 2 tasks from this offer.
   vector<TaskInfo> tasks;
   Offer offer = offers.get()[0];
 
   Offer offer1 = offer;
-  offer1.mutable_resources()->CopyFrom(
-      Resources::parse("cpus:1;mem:512").get());
-  tasks.push_back(createTask(offer1, "sleep 1000")); // Long-running task.
+  Resources resources1 = allocatedResources(
+      Resources::parse("cpus:1;mem:512").get(), frameworkInfo.roles(0));
+  offer1.mutable_resources()->CopyFrom(resources1);
+  // Long-running task.
+  tasks.push_back(createTask(offer1, SLEEP_COMMAND(1000)));
 
   Offer offer2 = offer;
-  offer2.mutable_resources()->CopyFrom(
-      Resources::parse("cpus:1;mem:512").get());
-  tasks.push_back(createTask(offer2, "sleep 1000")); // Long-running task,
+  Resources resources2 = allocatedResources(
+      Resources::parse("cpus:1;mem:512").get(), frameworkInfo.roles(0));
+  offer2.mutable_resources()->CopyFrom(resources2);
+  // Long-running task.
+  tasks.push_back(createTask(offer2, SLEEP_COMMAND(1000)));
 
   ASSERT_TRUE(Resources(offer.resources()).contains(
         Resources(offer1.resources()) +
         Resources(offer2.resources())));
 
+  Future<Nothing> update0;
   Future<Nothing> update1;
   Future<Nothing> update2;
+  Future<Nothing> update3;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureSatisfy(&update0))
     .WillOnce(FutureSatisfy(&update1))
-    .WillOnce(FutureSatisfy(&update2));
+    .WillOnce(FutureSatisfy(&update2))
+    .WillOnce(FutureSatisfy(&update3));
 
   driver.launchTasks(offers.get()[0].id(), tasks);
 
-  // Wait for TASK_RUNNING updates from the tasks.
+  // Wait for TASK_STARTING and TASK_RUNNING updates from the tasks.
+  AWAIT_READY(update0);
   AWAIT_READY(update1);
   AWAIT_READY(update2);
+  AWAIT_READY(update3);
 
   // The master should generate TASK_LOST updates once the slave is stopped.
   Future<TaskStatus> status1;
@@ -1885,31 +2277,29 @@ TYPED_TEST(SlaveRecoveryTest, RemoveNonCheckpointingFramework)
 
   // Scheduler should receive the TASK_LOST updates.
   AWAIT_READY(status1);
-  EXPECT_EQ(TASK_LOST, status1.get().state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status1.get().source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_DISCONNECTED, status1.get().reason());
+  EXPECT_EQ(TASK_LOST, status1->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status1->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_DISCONNECTED, status1->reason());
 
   AWAIT_READY(status2);
-  EXPECT_EQ(TASK_LOST, status2.get().state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status2.get().source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_DISCONNECTED, status2.get().reason());
+  EXPECT_EQ(TASK_LOST, status2->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status2->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_DISCONNECTED, status2->reason());
 
   driver.stop();
   driver.join();
 
   // Destroy all the containers before we destroy the containerizer. We need to
   // do this manually because there are no slaves left in the cluster.
-  Future<hashset<ContainerID>> containers = containerizer.get()->containers();
+  Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
 
   foreach (const ContainerID& containerId, containers.get()) {
-    Future<Option<ContainerTermination>> wait =
-      containerizer.get()->wait(containerId);
+    Future<Option<ContainerTermination>> termination =
+      containerizer->destroy(containerId);
 
-    containerizer.get()->destroy(containerId);
-
-    AWAIT_READY(wait);
-    EXPECT_SOME(wait.get());
+    AWAIT_READY(termination);
+    EXPECT_SOME(termination.get());
   }
 }
 
@@ -1923,7 +2313,7 @@ TYPED_TEST(SlaveRecoveryTest, NonCheckpointingFramework)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -1950,19 +2340,19 @@ TYPED_TEST(SlaveRecoveryTest, NonCheckpointingFramework)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   Future<Nothing> update;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureSatisfy(&update))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
@@ -1973,9 +2363,20 @@ TYPED_TEST(SlaveRecoveryTest, NonCheckpointingFramework)
 
   Future<Nothing> updateFramework = FUTURE_DISPATCH(_, &Slave::updateFramework);
 
+  // Set the `FrameworkID` in `FrameworkInfo`.
+  frameworkInfo.mutable_id()->CopyFrom(frameworkId);
+
+  UpdateFrameworkMessage updateFrameworkMessage;
+  updateFrameworkMessage.mutable_framework_id()->CopyFrom(frameworkId);
+  updateFrameworkMessage.set_pid("");
+  updateFrameworkMessage.mutable_framework_info()->CopyFrom(frameworkInfo);
+
   // Simulate a 'UpdateFrameworkMessage' to ensure framework pid is
   // not being checkpointed.
-  process::dispatch(slave.get()->pid, &Slave::updateFramework, frameworkId, "");
+  process::dispatch(
+      slave.get()->pid,
+      &Slave::updateFramework,
+      updateFrameworkMessage);
 
   AWAIT_READY(updateFramework);
 
@@ -2000,6 +2401,8 @@ TYPED_TEST(SlaveRecoveryTest, NonCheckpointingFramework)
 // command executor that has been running before the slave restarted.
 // This test ensures that a restarted slave is able to communicate
 // with all components (scheduler, master, executor).
+//
+// TODO(alexr): Enable after MESOS-6623 is resolved.
 TYPED_TEST(SlaveRecoveryTest, DISABLED_KillTaskWithHTTPExecutor)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -2008,7 +2411,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_KillTaskWithHTTPExecutor)
   slave::Flags flags = this->CreateSlaveFlags();
   flags.http_command_executor = true;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -2037,14 +2440,14 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_KillTaskWithHTTPExecutor)
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers1))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   EXPECT_CALL(sched, statusUpdate(_, _));
 
@@ -2075,25 +2478,25 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_KillTaskWithHTTPExecutor)
   // Wait for the executor to subscribe again.
   AWAIT_READY(subscribeCall);
 
-  // Wait for the slave to re-register.
+  // Wait for the slave to reregister.
   AWAIT_READY(slaveReregisteredMessage);
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Kill the task.
   driver.killTask(task.task_id());
 
   // Wait for TASK_KILLED update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_KILLED, status.get().state());
+  EXPECT_EQ(TASK_KILLED, status->state());
 
   Clock::pause();
 
@@ -2127,7 +2530,7 @@ TYPED_TEST(SlaveRecoveryTest, KillTask)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -2152,24 +2555,30 @@ TYPED_TEST(SlaveRecoveryTest, KillTask)
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers1))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  // Expect a TASK_STARTING and a TASK_RUNNING update
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> ack =
+  Future<Nothing> ack1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> ack2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(ack);
+  AWAIT_READY(ack1);
+  AWAIT_READY(ack2);
 
   slave.get()->terminate();
 
@@ -2189,32 +2598,32 @@ TYPED_TEST(SlaveRecoveryTest, KillTask)
 
   Clock::pause();
 
-  // Wait for the executor to re-register.
+  // Wait for the executor to reregister.
   AWAIT_READY(reregisterExecutorMessage);
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(flags.executor_reregistration_timeout);
   Clock::resume();
 
-  // Wait for the slave to re-register.
+  // Wait for the slave to reregister.
   AWAIT_READY(slaveReregisteredMessage);
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Kill the task.
   driver.killTask(task.task_id());
 
   // Wait for TASK_KILLED update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_KILLED, status.get().state());
+  EXPECT_EQ(TASK_KILLED, status->state());
 
   Clock::pause();
 
@@ -2238,16 +2647,15 @@ TYPED_TEST(SlaveRecoveryTest, KillTask)
 
 
 // When the slave is down we modify the BOOT_ID_FILE to simulate a
-// reboot. The subsequent run of the slave should not recover.
+// reboot. The subsequent run of the slave should recover.
 TYPED_TEST(SlaveRecoveryTest, Reboot)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
   ASSERT_SOME(master);
 
   slave::Flags flags = this->CreateSlaveFlags();
-  flags.strict = false;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -2276,9 +2684,9 @@ TYPED_TEST(SlaveRecoveryTest, Reboot)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   // Capture the slave and framework ids.
   SlaveID slaveId1 = offers1.get()[0].slave_id();
@@ -2298,9 +2706,9 @@ TYPED_TEST(SlaveRecoveryTest, Reboot)
   AWAIT_READY(registerExecutorMessage);
 
   RegisterExecutorMessage registerExecutor;
-  registerExecutor.ParseFromString(registerExecutorMessage.get().body);
+  registerExecutor.ParseFromString(registerExecutorMessage->body);
   ExecutorID executorId = registerExecutor.executor_id();
-  UPID executorPid = registerExecutorMessage.get().from;
+  UPID executorPid = registerExecutorMessage->from;
 
   // Wait for TASK_RUNNING update.
   AWAIT_READY(runningStatus);
@@ -2309,20 +2717,20 @@ TYPED_TEST(SlaveRecoveryTest, Reboot)
   Future<hashset<ContainerID>> containers = containerizer->containers();
 
   AWAIT_READY(containers);
-  ASSERT_EQ(1u, containers.get().size());
+  ASSERT_EQ(1u, containers->size());
 
-  ContainerID containerId = *containers.get().begin();
+  ContainerID containerId1 = *containers->begin();
 
   slave.get()->terminate();
 
   // Get the executor's pid so we can reap it to properly simulate a
   // reboot.
   string pidPath = paths::getForkedPidPath(
-        paths::getMetaRootDir(flags.work_dir),
-        slaveId1,
-        frameworkId,
-        executorId,
-        containerId);
+      paths::getMetaRootDir(flags.work_dir),
+      slaveId1,
+      frameworkId,
+      executorId,
+      containerId1);
 
   Try<string> read = os::read(pidPath);
   ASSERT_SOME(read);
@@ -2333,7 +2741,7 @@ TYPED_TEST(SlaveRecoveryTest, Reboot)
   Future<Option<int>> executorStatus = process::reap(pid.get());
 
   // Shut down the executor manually and wait until it's been reaped.
-  process::post(executorPid, ShutdownExecutorMessage());
+  process::post(slave.get()->pid, executorPid, ShutdownExecutorMessage());
 
   AWAIT_READY(executorStatus);
 
@@ -2342,8 +2750,8 @@ TYPED_TEST(SlaveRecoveryTest, Reboot)
       paths::getBootIdPath(paths::getMetaRootDir(flags.work_dir)),
       "rebooted! ;)"));
 
-  Future<SlaveRegisteredMessage> slaveRegistered =
-    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
 
   // Restart the slave (use same flags) with a new containerizer.
   _containerizer = TypeParam::create(flags, true, &fetcher);
@@ -2353,29 +2761,256 @@ TYPED_TEST(SlaveRecoveryTest, Reboot)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  // Recover the state.
+  Result<slave::state::State> recoverState =
+    slave::state::recover(paths::getMetaRootDir(flags.work_dir), true);
+
+  ASSERT_SOME(recoverState);
+  ASSERT_SOME(recoverState->slave);
+
+  slave::state::SlaveState state = recoverState->slave.get();
 
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
+  EXPECT_EQ(slaveId1, state.id);
 
-  AWAIT_READY(slaveRegistered);
-
-  SlaveID slaveId2 = slaveRegistered.get().slave_id();
-
-  EXPECT_NE(slaveId1, slaveId2);
+  AWAIT_READY(reregisterSlaveMessage);
 
   // Make sure all slave resources are reoffered.
   AWAIT_READY(offers2);
   EXPECT_EQ(Resources(offers1.get()[0].resources()),
             Resources(offers2.get()[0].resources()));
 
-  // The old agent ID is not removed (MESOS-5396).
-  JSON::Object stats = Metrics();
-  EXPECT_EQ(0, stats.values["master/tasks_lost"]);
-  EXPECT_EQ(0, stats.values["master/slave_unreachable_scheduled"]);
-  EXPECT_EQ(0, stats.values["master/slave_unreachable_completed"]);
-  EXPECT_EQ(0, stats.values["master/slave_removals"]);
-  EXPECT_EQ(0, stats.values["master/slave_removals/reason_registered"]);
+  SlaveID slaveId2 = offers2.get()[0].slave_id();
+  EXPECT_EQ(slaveId1, slaveId2);
+
+  ASSERT_TRUE(state.frameworks.contains(frameworkId));
+
+  EXPECT_TRUE(state.frameworks[frameworkId].executors.contains(executorId));
+
+  slave::state::ExecutorState executorState =
+    state.frameworks[frameworkId].executors[executorId];
+
+  const Option<ContainerID>& containerId2 = executorState.latest;
+  EXPECT_SOME_EQ(containerId1, containerId2);
+
+  EXPECT_TRUE(executorState.runs.contains(containerId2.get()));
+
+  EXPECT_SOME_EQ(
+      executorPid,
+      executorState
+        .runs[containerId2.get()]
+        .libprocessPid);
+
+  EXPECT_TRUE(executorState
+                .runs[containerId2.get()]
+                .tasks.contains(task.task_id()));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// When the agent is down we modify the BOOT_ID_FILE to simulate a
+// reboot and change the resources flag to cause a mismatch
+// between the recovered agent's agent info and the one of the new agent
+// to ensure it registers as a new agent.
+TYPED_TEST(SlaveRecoveryTest, RebootWithSlaveInfoMismatch)
+{
+  Try<Owned<cluster::Master>> master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = this->CreateSlaveFlags();
+  flags.resources = "cpus:8;mem:4096;disk:2048";
+
+  Fetcher fetcher(flags);
+
+  Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  // Enable checkpointing for the framework.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  // Capture offer in order to get the agent ID.
+  Future<vector<Offer>> offers1;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers1);
+
+  SlaveID slaveId1 = offers1.get()[0].slave_id();
+
+  EXPECT_CALL(sched, offerRescinded(_, _))
+    .Times(AtMost(1));
+
+  slave.get()->terminate();
+
+  // Modify the boot ID to simulate a reboot.
+  ASSERT_SOME(os::write(
+      paths::getBootIdPath(paths::getMetaRootDir(flags.work_dir)),
+      "rebooted! ;)"));
+
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
+
+  // Change agent's resources to cause agent Info mismatch.
+  flags.resources = "cpus:4;mem:2048;disk:2048";
+
+  _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  containerizer.reset(_containerizer.get());
+
+  // Recover the state.
+  Result<slave::state::State> recoverState =
+    slave::state::recover(paths::getMetaRootDir(flags.work_dir), true);
+
+  // Capture offer in order to get the new agent ID.
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  ASSERT_SOME(recoverState);
+  EXPECT_SOME(recoverState->slave);
+
+  slave = this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(registerSlaveMessage);
+
+  AWAIT_READY(offers2);
+
+  ASSERT_EQ(1u, offers2->size());
+  Offer offer2 = offers2.get()[0];
+
+  SlaveID slaveId2 = offers2.get()[0].slave_id();
+
+  EXPECT_NE(slaveId1, slaveId2);
+
+  driver.stop();
+  driver.join();
+}
+
+
+// When the agent is down we modify the BOOT_ID_FILE to simulate a
+// reboot and change the resources flag to cause a mismatch between
+// the recovered agent's info and the one of the new agent to make it
+// recover as a new one. We restart the recovered agent before it
+// registers with the master to ensure it still recovers as a new
+// agent after that.
+TYPED_TEST(SlaveRecoveryTest, RebootWithSlaveInfoMismatchAndRestart)
+{
+  Try<Owned<cluster::Master>> master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = this->CreateSlaveFlags();
+  flags.resources = "cpus:8;mem:4096;disk:2048";
+
+  Fetcher fetcher(flags);
+
+  Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  // Capture offer in order to get the agent ID.
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_EQ(1u, offers->size());
+  SlaveID slaveId1 = offers.get()[0].slave_id();
+
+  EXPECT_CALL(sched, offerRescinded(_, _))
+    .Times(AtMost(1));
+
+  slave.get()->terminate();
+
+  // Modify the boot ID to simulate a reboot.
+  ASSERT_SOME(os::write(
+      paths::getBootIdPath(paths::getMetaRootDir(flags.work_dir)),
+      "rebooted! ;)"));
+
+  // Change agent's resources to cause agent info mismatch.
+  flags.resources = "cpus:4;mem:2048;disk:2048";
+
+  _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  containerizer.reset(_containerizer.get());
+
+  // Capture offer in order to get the new agent ID.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  Clock::pause();
+  Clock::settle();
+
+  // Simulate an agent restart before reregistration completes.
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    DROP_PROTOBUF(RegisterSlaveMessage(), _, master.get()->pid);
+
+  slave = this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(flags.registration_backoff_factor);
+  Clock::settle();
+
+  AWAIT_READY(registerSlaveMessage);
+
+  slave.get()->terminate();
+
+  Clock::resume();
+
+  // Verify that the last agent instance removed the "latest" symlink
+  // when it detected agent info discrepancy.
+  const string latest =
+    paths::getLatestSlavePath(paths::getMetaRootDir(flags.work_dir));
+  ASSERT_FALSE(os::exists(latest));
+
+  // Start the agent again to verify that it still successfully
+  // recovers as a new one.
+  slave = this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  // Verify that the agent registered as a new one.
+  AWAIT_READY(offers);
+  ASSERT_EQ(1u, offers->size());
+  EXPECT_NE(slaveId1, offers->at(0).slave_id());
 
   driver.stop();
   driver.join();
@@ -2394,7 +3029,7 @@ TYPED_TEST(SlaveRecoveryTest, GCExecutor)
   slave::Flags flags = this->CreateSlaveFlags();
   flags.strict = false;
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -2423,9 +3058,9 @@ TYPED_TEST(SlaveRecoveryTest, GCExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   // Capture the slave and framework ids.
   SlaveID slaveId = offers1.get()[0].slave_id();
@@ -2472,7 +3107,7 @@ TYPED_TEST(SlaveRecoveryTest, GCExecutor)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
@@ -2484,7 +3119,7 @@ TYPED_TEST(SlaveRecoveryTest, GCExecutor)
   Clock::settle(); // Wait for slave to schedule reregister timeout.
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(flags.executor_reregistration_timeout);
 
   AWAIT_READY(slaveReregisteredMessage);
 
@@ -2520,7 +3155,7 @@ TYPED_TEST(SlaveRecoveryTest, GCExecutor)
 
 
 // The slave is asked to shutdown. When it comes back up, it should
-// register as a new slave.
+// reregister as the same agent.
 TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -2528,7 +3163,7 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -2560,13 +3195,14 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
 
   AWAIT_READY(offers1);
 
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
-  Future<Nothing> statusUpdate1;
+  Future<Nothing> statusUpdate1, statusUpdate2;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureSatisfy(&statusUpdate1))
+    .WillOnce(FutureSatisfy(&statusUpdate1)) // TASK_STARTING
+    .WillOnce(FutureSatisfy(&statusUpdate2)) // TASK_RUNNING
     .WillOnce(Return());  // Ignore TASK_FAILED update.
 
   Future<Message> registerExecutor =
@@ -2576,9 +3212,9 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
 
   // Capture the executor pid.
   AWAIT_READY(registerExecutor);
-  UPID executorPid = registerExecutor.get().from;
+  UPID executorPid = registerExecutor->from;
 
-  AWAIT_READY(statusUpdate1); // Wait for TASK_RUNNING update.
+  AWAIT_READY(statusUpdate2); // Wait for TASK_RUNNING update.
 
   EXPECT_CALL(sched, offerRescinded(_, _))
     .Times(AtMost(1));
@@ -2588,20 +3224,10 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
 
   // We shut down the executor here so that a shutting down slave
   // does not spend too much time waiting for the executor to exit.
-  process::post(executorPid, ShutdownExecutorMessage());
-
-  Clock::pause();
-
-  // Now advance time until the reaper reaps the executor.
-  while (executorTerminated.isPending()) {
-    Clock::advance(process::MAX_REAP_INTERVAL());
-    Clock::settle();
-  }
+  process::post(slave.get()->pid, executorPid, ShutdownExecutorMessage());
 
   AWAIT_READY(executorTerminated);
   AWAIT_READY(offers2);
-
-  Clock::resume();
 
   EXPECT_CALL(sched, slaveLost(_, _))
     .Times(AtMost(1));
@@ -2613,7 +3239,7 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
   Future<vector<Offer>> offers3;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers3))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Now restart the slave (use same flags) with a new containerizer.
   Try<TypeParam*> containerizer2 = TypeParam::create(flags, true, &fetcher);
@@ -2625,13 +3251,13 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
   // Ensure that the slave registered with a new id.
   AWAIT_READY(offers3);
 
-  EXPECT_NE(0u, offers3.get().size());
+  ASSERT_FALSE(offers3->empty());
   // Make sure all slave resources are reoffered.
   EXPECT_EQ(Resources(offers1.get()[0].resources()),
             Resources(offers3.get()[0].resources()));
 
-  // Ensure the slave id is different.
-  EXPECT_NE(
+  // Ensure the slave id is same.
+  EXPECT_EQ(
       offers1.get()[0].slave_id().value(), offers3.get()[0].slave_id().value());
 
   driver.stop();
@@ -2639,7 +3265,12 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
 }
 
 
+#ifndef __WINDOWS__
 // The slave should shutdown when it receives a SIGUSR1 signal.
+//
+// TODO(andschwa): The Windows agent shuts down with SIGUSR1, but it does so
+// through a custom signal-handler for Ctrl-C, not through `kill`, so this test
+// can be implemented later. See MESOS-8505.
 TYPED_TEST(SlaveRecoveryTest, ShutdownSlaveSIGUSR1)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -2647,7 +3278,7 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlaveSIGUSR1)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -2678,22 +3309,26 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlaveSIGUSR1)
 
   AWAIT_READY(offers);
 
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
-  Future<TaskStatus> status;
+  Future<TaskStatus> statusStarting, statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning));
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
-  Future<TaskStatus> status2;
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  Future<TaskStatus> statusLost;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status2));
+    .WillOnce(FutureArg<1>(&statusLost));
 
   Future<Nothing> slaveLost;
   EXPECT_CALL(sched, slaveLost(_, _))
@@ -2719,11 +3354,11 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlaveSIGUSR1)
   AWAIT_READY(executorTerminated);
 
   // The master should send a TASK_LOST and slaveLost.
-  AWAIT_READY(status2);
+  AWAIT_READY(statusLost);
 
-  EXPECT_EQ(TASK_LOST, status2.get().state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status2.get().source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status2.get().reason());
+  EXPECT_EQ(TASK_LOST, statusLost->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, statusLost->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, statusLost->reason());
 
   AWAIT_READY(slaveLost);
 
@@ -2733,6 +3368,7 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlaveSIGUSR1)
   driver.stop();
   driver.join();
 }
+#endif // __WINDOWS__
 
 
 // The slave fails to do recovery and tries to register as a new slave. The
@@ -2753,7 +3389,7 @@ TYPED_TEST(SlaveRecoveryTest, RegisterDisconnectedSlave)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -2787,7 +3423,7 @@ TYPED_TEST(SlaveRecoveryTest, RegisterDisconnectedSlave)
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   // Capture the slave and framework ids.
   SlaveID slaveId = offers.get()[0].slave_id();
@@ -2796,16 +3432,28 @@ TYPED_TEST(SlaveRecoveryTest, RegisterDisconnectedSlave)
   Future<Message> registerExecutorMessage =
     FUTURE_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
 
+  Future<Nothing> startingStatus;
   Future<Nothing> runningStatus;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureSatisfy(&startingStatus))
     .WillOnce(FutureSatisfy(&runningStatus));
+
+  Future<Nothing> startingAck =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+  Future<Nothing> runningAck =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(registerExecutorMessage);
 
-  // Wait for TASK_RUNNING update.
+  // Wait for the acknowledgement of the TASK_RUNNING update
+  // to make sure the next sent status update is not a repeat
+  // of the unacknowledged TASK_RUNNING.
+  AWAIT_READY(startingStatus);
+  AWAIT_READY(startingAck);
   AWAIT_READY(runningStatus);
+  AWAIT_READY(runningAck);
 
   EXPECT_CALL(sched, slaveLost(_, _))
     .Times(AtMost(1));
@@ -2845,17 +3493,15 @@ TYPED_TEST(SlaveRecoveryTest, RegisterDisconnectedSlave)
 
   // Destroy all the containers before we destroy the containerizer. We need to
   // do this manually because there are no slaves left in the cluster.
-  Future<hashset<ContainerID>> containers = containerizer.get()->containers();
+  Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
 
   foreach (const ContainerID& containerId, containers.get()) {
-    Future<Option<ContainerTermination>> wait =
-      containerizer.get()->wait(containerId);
+    Future<Option<ContainerTermination>> termination =
+      containerizer->destroy(containerId);
 
-    containerizer.get()->destroy(containerId);
-
-    AWAIT_READY(wait);
-    EXPECT_SOME(wait.get());
+    AWAIT_READY(termination);
+    EXPECT_SOME(termination.get());
   }
 }
 
@@ -2872,7 +3518,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileKillTask)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -2903,24 +3549,29 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileKillTask)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   // Capture the slave and framework ids.
   SlaveID slaveId = offers1.get()[0].slave_id();
   FrameworkID frameworkId = offers1.get()[0].framework_id();
 
-  // Expecting TASK_RUNNING status.
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  // Expecting TASK_STARTING and TASK_RUNNING status.
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for TASK_RUNNING update to be acknowledged.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -2940,14 +3591,14 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileKillTask)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
   // Scheduler should get a TASK_KILLED message.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_KILLED, status.get().state());
+  EXPECT_EQ(TASK_KILLED, status->state());
 
   // Make sure all slave resources are reoffered.
   AWAIT_READY(offers2);
@@ -2959,7 +3610,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileKillTask)
 }
 
 
-// This test verifies that when the slave recovers and re-registers
+// This test verifies that when the slave recovers and reregisters
 // with a framework that was shutdown when the slave was down, it gets
 // a ShutdownFramework message.
 TYPED_TEST(SlaveRecoveryTest, ReconcileShutdownFramework)
@@ -2972,7 +3623,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileShutdownFramework)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -3004,23 +3655,29 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileShutdownFramework)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
   // Capture the framework id.
   FrameworkID frameworkId = offers.get()[0].framework_id();
 
-  // Expecting TASK_RUNNING status.
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  // Expecting a TASK_STARTING and a TASK_RUNNING status.
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2)
+    .WillRepeatedly(Return());
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  Future<Nothing> _statusUpdateAcknowledgement2 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  // Wait for TASK_RUNNING update to be acknowledged.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  // Wait for the updates to be acknowledged.
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -3105,16 +3762,16 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
 {
   TestAllocator<master::allocator::HierarchicalDRFAllocator> allocator;
 
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _));
 
   Try<Owned<cluster::Master>> master = this->StartMaster(&allocator);
   ASSERT_SOME(master);
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  EXPECT_CALL(allocator, addSlave(_, _, _, _, _));
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _, _));
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -3136,7 +3793,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
   MesosSchedulerDriver driver(
       &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(allocator, addFramework(_, _, _, _));
+  EXPECT_CALL(allocator, addFramework(_, _, _, _, _));
 
   Future<FrameworkID> frameworkId;
   EXPECT_CALL(sched, registered(_, _, _))
@@ -3145,31 +3802,51 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers1))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
   // Start a task on the slave so that the master has knowledge of it.
   // We'll ensure the slave does not have this task when it
-  // re-registers by wiping the relevant meta directory.
-  TaskInfo task = createTask(offers1.get()[0], "sleep 10");
+  // reregisters by wiping the relevant meta directory.
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(10));
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  Future<TaskStatus> starting;
+  Future<TaskStatus> running;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&starting))
+    .WillOnce(FutureArg<1>(&running))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> startingAck =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> runningAck =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  AWAIT_READY(starting);
+  AWAIT_READY(startingAck);
+
+  AWAIT_READY(running);
+  AWAIT_READY(runningAck);
+
+  EXPECT_EQ(TASK_STARTING, starting->state());
+  EXPECT_EQ(TASK_RUNNING, running->state());
 
   EXPECT_CALL(allocator, deactivateSlave(_));
 
   slave.get()->terminate();
+
+  // Reset the slave so that the task status update stream destructors are
+  // called. This is necessary so that file handles are closed before we remove
+  // the framework meta directory (specifically for `task.updates`).
+  slave->reset();
 
   // Construct the framework meta directory that needs wiping.
   string frameworkPath = paths::getFrameworkPath(
@@ -3184,11 +3861,11 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
     slave::state::recover(slave::paths::getMetaRootDir(flags.work_dir), true);
 
   ASSERT_SOME(state);
-  ASSERT_SOME(state.get().slave);
-  ASSERT_TRUE(state.get().slave.get().frameworks.contains(frameworkId.get()));
+  ASSERT_SOME(state->slave);
+  ASSERT_TRUE(state->slave->frameworks.contains(frameworkId.get()));
 
   slave::state::FrameworkState frameworkState =
-    state.get().slave.get().frameworks.get(frameworkId.get()).get();
+    state->slave->frameworks.get(frameworkId.get()).get();
 
   ASSERT_EQ(1u, frameworkState.executors.size());
 
@@ -3218,12 +3895,12 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Restart the slave (use same flags) with a new containerizer.
   _containerizer = TypeParam::create(flags, true, &fetcher);
@@ -3235,16 +3912,16 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
 
   AWAIT_READY(_recover);
 
-  // Wait for the slave to re-register.
+  // Wait for the slave to reregister.
   AWAIT_READY(slaveReregisteredMessage);
 
   // Wait for TASK_DROPPED update.
   AWAIT_READY(status);
 
-  EXPECT_EQ(task.task_id(), status.get().task_id());
-  EXPECT_EQ(TASK_DROPPED, status.get().state());
-  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status.get().source());
-  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, status.get().reason());
+  EXPECT_EQ(task.task_id(), status->task_id());
+  EXPECT_EQ(TASK_DROPPED, status->state());
+  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status->source());
+  EXPECT_EQ(TaskStatus::REASON_RECONCILIATION, status->reason());
 
   Clock::pause();
 
@@ -3283,7 +3960,7 @@ TYPED_TEST(SlaveRecoveryTest, SchedulerFailover)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -3315,20 +3992,26 @@ TYPED_TEST(SlaveRecoveryTest, SchedulerFailover)
 
   AWAIT_READY(frameworkId);
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
   // Create a long running task.
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
-  EXPECT_CALL(sched1, statusUpdate(_, _));
+  // Expecting TASK_STARTING and TASK_RUNNING updates
+  EXPECT_CALL(sched1, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver1.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -3371,32 +4054,32 @@ TYPED_TEST(SlaveRecoveryTest, SchedulerFailover)
 
   Clock::pause();
 
-  // Wait for the executor to re-register.
+  // Wait for the executor to reregister.
   AWAIT_READY(reregisterExecutorMessage);
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(flags.executor_reregistration_timeout);
   Clock::resume();
 
-  // Wait for the slave to re-register.
+  // Wait for the slave to reregister.
   AWAIT_READY(slaveReregisteredMessage);
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched2, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched2, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Kill the task.
   driver2.killTask(task.task_id());
 
   // Wait for TASK_KILLED update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_KILLED, status.get().state());
+  EXPECT_EQ(TASK_KILLED, status->state());
 
   Clock::pause();
 
@@ -3425,15 +4108,19 @@ TYPED_TEST(SlaveRecoveryTest, SchedulerFailover)
 // This test verifies that if the master changes when the slave is
 // down, the slave can still recover the task when it restarts. We
 // verify its correctness by killing the task from the scheduler.
-TYPED_TEST(SlaveRecoveryTest, MasterFailover)
+//
+// TODO(andschwa): Enable when replicated log is supported (MESOS-5932).
+TYPED_TEST_TEMP_DISABLED_ON_WINDOWS(SlaveRecoveryTest, MasterFailover)
 {
   // Step 1. Run a task.
-  Try<Owned<cluster::Master>> master = this->StartMaster();
+  master::Flags masterFlags = this->CreateMasterFlags();
+  masterFlags.registry = "replicated_log";
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -3467,19 +4154,24 @@ TYPED_TEST(SlaveRecoveryTest, MasterFailover)
 
   AWAIT_READY(frameworkRegisteredMessage);
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
-  TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2); // TASK_STARTING and TASK_RUNNING
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
-  // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  // Wait for both ACKs to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -3487,7 +4179,7 @@ TYPED_TEST(SlaveRecoveryTest, MasterFailover)
   EXPECT_CALL(sched, disconnected(&driver));
 
   master->reset();
-  master = this->StartMaster();
+  master = this->StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   Future<Nothing> registered;
@@ -3517,25 +4209,25 @@ TYPED_TEST(SlaveRecoveryTest, MasterFailover)
 
   Clock::pause();
 
-  // Wait for the executor to re-register.
+  // Wait for the executor to reregister.
   AWAIT_READY(reregisterExecutorMessage);
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(flags.executor_reregistration_timeout);
   Clock::resume();
 
-  // Wait for the slave to re-register.
+  // Wait for the slave to reregister.
   AWAIT_READY(slaveReregisteredMessage);
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Wait for the executor to terminate before shutting down the
   // slave in order to give cgroups (if applicable) time to clean up.
@@ -3547,7 +4239,7 @@ TYPED_TEST(SlaveRecoveryTest, MasterFailover)
 
   // Wait for TASK_KILLED update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_KILLED, status.get().state());
+  EXPECT_EQ(TASK_KILLED, status->state());
 
   // Make sure all slave resources are reoffered.
   AWAIT_READY(offers2);
@@ -3572,7 +4264,7 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
   ASSERT_SOME(_containerizer);
@@ -3602,7 +4294,7 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
   driver1.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
   // Use part of the resources in the offer so that the rest can be
   // offered to framework 2.
@@ -3611,17 +4303,22 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
       Resources::parse("cpus:1;mem:512").get());
 
   // Framework 1 launches a task.
-  TaskInfo task1 = createTask(offer1, "sleep 1000");
+  TaskInfo task1 = createTask(offer1, SLEEP_COMMAND(1000));
 
-  EXPECT_CALL(sched1, statusUpdate(_, _));
+  EXPECT_CALL(sched1, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement1 =
+  Future<Nothing> _startingStatusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _runningStatusUpdateAcknowledgement1 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver1.launchTasks(offer1.id(), {task1});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_startingStatusUpdateAcknowledgement1);
+  AWAIT_READY(_runningStatusUpdateAcknowledgement1);
 
   // Framework 2. Enable checkpointing.
   FrameworkInfo frameworkInfo2 = DEFAULT_FRAMEWORK_INFO;
@@ -3641,19 +4338,25 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
   driver2.start();
 
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2.get().size());
+  ASSERT_FALSE(offers2->empty());
 
   // Framework 2 launches a task.
-  TaskInfo task2 = createTask(offers2.get()[0], "sleep 1000");
+  TaskInfo task2 = createTask(offers2.get()[0], SLEEP_COMMAND(1000));
 
-  EXPECT_CALL(sched2, statusUpdate(_, _));
+  EXPECT_CALL(sched2, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement2 =
+  Future<Nothing> _startingStatusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _runningStatusUpdateAcknowledgement2 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
   driver2.launchTasks(offers2.get()[0].id(), {task2});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement2);
+  AWAIT_READY(_startingStatusUpdateAcknowledgement2);
+  AWAIT_READY(_runningStatusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -3675,15 +4378,15 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
 
   Clock::pause();
 
-  // Wait for the executors to re-register.
+  // Wait for the executors to reregister.
   AWAIT_READY(reregisterExecutorMessage1);
   AWAIT_READY(reregisterExecutorMessage2);
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(flags.executor_reregistration_timeout);
   Clock::resume();
 
-  // Wait for the slave to re-register.
+  // Wait for the slave to reregister.
   AWAIT_READY(slaveReregisteredMessage);
 
   // Expectations for the status changes as a result of killing the
@@ -3691,12 +4394,12 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
   Future<TaskStatus> status1;
   EXPECT_CALL(sched1, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status1))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<TaskStatus> status2;
   EXPECT_CALL(sched2, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status2))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   // Wait for the executors to terminate before shutting down the
   // slave in order to give cgroups (if applicable) time to clean up.
@@ -3710,14 +4413,14 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
 
   // Wait for TASK_KILLED update.
   AWAIT_READY(status1);
-  EXPECT_EQ(TASK_KILLED, status1.get().state());
+  EXPECT_EQ(TASK_KILLED, status1->state());
 
   // Kill task 2.
   driver2.killTask(task2.task_id());
 
   // Wait for TASK_KILLED update.
   AWAIT_READY(status2);
-  EXPECT_EQ(TASK_KILLED, status2.get().state());
+  EXPECT_EQ(TASK_KILLED, status2->state());
 
   AWAIT_READY(executorTerminated1);
   AWAIT_READY(executorTerminated2);
@@ -3755,16 +4458,14 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
   // Start the first slave.
   slave::Flags flags1 = this->CreateSlaveFlags();
 
-  // NOTE: We cannot run multiple slaves simultaneously on a host if
-  // cgroups isolation is involved.
+#ifndef __WINDOWS__
+  // NOTE: We cannot run multiple slaves simultaneously on a host if cgroups
+  // isolation is involved. Since this does not apply to Windows, we use the
+  // default flags from `CreateSlaveFlags()` above.
   flags1.isolation = "filesystem/posix,posix/mem,posix/cpu";
+#endif // __WINDOWS__
 
-#ifdef __linux__
-  // Disable putting slave into cgroup(s) because this is a multi-slave test.
-  flags1.agent_subsystems = None();
-#endif
-
-  Fetcher fetcher;
+  Fetcher fetcher(flags1);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -3780,18 +4481,22 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
   ASSERT_FALSE(offers1->empty());
 
   // Launch a long running task in the first slave.
-  TaskInfo task1 = createTask(offers1.get()[0], "sleep 1000");
+  TaskInfo task1 = createTask(offers1.get()[0], SLEEP_COMMAND(1000));
 
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .Times(1);
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement1 =
+  Future<Nothing> _startingStatusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(slave1.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _runningStatusUpdateAcknowledgement1 =
     FUTURE_DISPATCH(slave1.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task1});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_startingStatusUpdateAcknowledgement1);
+  AWAIT_READY(_runningStatusUpdateAcknowledgement1);
 
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -3800,14 +4505,12 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
   // Start the second slave.
   slave::Flags flags2 = this->CreateSlaveFlags();
 
-  // NOTE: We cannot run multiple slaves simultaneously on a host if
-  // cgroups isolation is involved.
+#ifndef __WINDOWS__
+  // NOTE: We cannot run multiple slaves simultaneously on a host if cgroups
+  // isolation is involved. Since this does not apply to Windows, we use the
+  // default flags from `CreateSlaveFlags()` above.
   flags2.isolation = "filesystem/posix,posix/mem,posix/cpu";
-
-#ifdef __linux__
-  // Disable putting slave into cgroup(s) because this is a multi-slave test.
-  flags2.agent_subsystems = None();
-#endif
+#endif // __WINDOWS__
 
   Try<TypeParam*> _containerizer2 = TypeParam::create(flags2, true, &fetcher);
   ASSERT_SOME(_containerizer2);
@@ -3821,18 +4524,22 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
   ASSERT_FALSE(offers2->empty());
 
   // Launch a long running task in each slave.
-  TaskInfo task2 = createTask(offers2.get()[0], "sleep 1000");
+  TaskInfo task2 = createTask(offers2.get()[0], SLEEP_COMMAND(1000));
 
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .Times(1);
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement2 =
+  Future<Nothing> _startingStatusUpdateAcknowledgement2 =
+    FUTURE_DISPATCH(slave2.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _runningStatusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(slave2.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers2.get()[0].id(), {task2});
 
   // Wait for the ACKs to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement2);
+  AWAIT_READY(_startingStatusUpdateAcknowledgement2);
+  AWAIT_READY(_runningStatusUpdateAcknowledgement2);
 
   slave1.get()->terminate();
   slave2.get()->terminate();
@@ -3868,10 +4575,10 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
   AWAIT_READY(reregisterExecutorMessage2);
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(flags1.executor_reregistration_timeout);
   Clock::resume();
 
-  // Wait for the slaves to re-register.
+  // Wait for the slaves to reregister.
   AWAIT_READY(slaveReregisteredMessage1);
   AWAIT_READY(slaveReregisteredMessage2);
 
@@ -3880,7 +4587,7 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
   EXPECT_CALL(sched, statusUpdate(_, _))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2))
-    .WillRepeatedly(Return());        // Ignore subsequent updates.
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<Nothing> executorTerminated2 =
     FUTURE_DISPATCH(_, &Slave::executorTerminated);
@@ -3889,17 +4596,17 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Kill both tasks.
   driver.killTask(task1.task_id());
   driver.killTask(task2.task_id());
 
   AWAIT_READY(status1);
-  EXPECT_EQ(TASK_KILLED, status1.get().state());
+  EXPECT_EQ(TASK_KILLED, status1->state());
 
   AWAIT_READY(status2);
-  EXPECT_EQ(TASK_KILLED, status2.get().state());
+  EXPECT_EQ(TASK_KILLED, status2->state());
 
   AWAIT_READY(executorTerminated1);
   AWAIT_READY(executorTerminated2);
@@ -3927,6 +4634,7 @@ TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
 
   Try<Owned<cluster::Slave>> slave =
     this->StartSlave(detector.get(), &containerizer1, flags);
+
   ASSERT_SOME(slave);
 
   // Enable checkpointing for the framework.
@@ -3942,20 +4650,20 @@ TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
   // Expect the launch but don't do anything.
   Future<Nothing> launch;
-  EXPECT_CALL(containerizer1, launch(_, _, _, _, _, _, _, _))
+  EXPECT_CALL(containerizer1, launch(_, _, _, _))
     .WillOnce(DoAll(FutureSatisfy(&launch),
-                    Return(Future<bool>())));
+                    Return(Future<Containerizer::LaunchResult>())));
 
   // No status update should be sent for now.
   EXPECT_CALL(sched, statusUpdate(_, _))
@@ -3969,8 +4677,9 @@ TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
   slave.get()->terminate();
 
   Future<TaskStatus> status;
+
   // There is a race here where the Slave may reregister before we
-  // shut down. If it does, it causes the StatusUpdateManager to
+  // shut down. If it does, it causes the TaskStatusUpdateManager to
   // flush which will cause a duplicate status update to be sent. As
   // such, we ignore any subsequent updates.
   EXPECT_CALL(sched, statusUpdate(_, _))
@@ -3989,7 +4698,7 @@ TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
   Clock::settle(); // Wait for slave to schedule reregister timeout.
 
   // Ensure the slave considers itself recovered.
-  Clock::advance(EXECUTOR_REREGISTER_TIMEOUT);
+  Clock::advance(flags.executor_reregistration_timeout);
   Clock::resume();
 
   // Scheduler should receive the TASK_FAILED update.
@@ -4004,12 +4713,364 @@ TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
 }
 
 
+// This test starts a task, restarts the slave with increased
+// resources while the task is still running, and then stops
+// the task, verifying that all resources are seen in subsequent
+// offers.
+TYPED_TEST(SlaveRecoveryTest, AgentReconfigurationWithRunningTask)
+{
+  // Start a master.
+  Try<Owned<cluster::Master>> master = this->StartMaster();
+  ASSERT_SOME(master);
+
+  // Start a framework.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_checkpoint(true);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers1;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  // Start a slave.
+  slave::Flags flags = this->CreateSlaveFlags();
+
+  // NOTE: These tests will start with "zero" memory, and the default Windows
+  // isolators will enforce this, causing the task to crash. The default POSIX
+  // isolators don't actually perform isolation, and so this does not occur.
+  // However, these tests are not testing isolation, they're testing resource
+  // accounting, so we can just use "no" isolators.
+  flags.isolation = "";
+  flags.resources = "cpus:5;mem:0;disk:0;ports:0";
+
+  Fetcher fetcher(flags);
+
+  Try<TypeParam*> _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave =
+    this->StartSlave(detector.get(), containerizer.get(), flags);
+
+  ASSERT_SOME(slave);
+
+  // Start a long-running task on the slave.
+  AWAIT_READY(offers1);
+  ASSERT_FALSE(offers1->empty());
+
+  EXPECT_EQ(
+      offers1.get()[0].resources(),
+      allocatedResources(Resources::parse("cpus:5").get(), "*"));
+
+  SlaveID slaveId = offers1.get()[0].slave_id();
+  TaskInfo task = createTask(
+      slaveId, Resources::parse("cpus:3").get(), SLEEP_COMMAND(1000));
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusKilled;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusKilled));
+
+  driver.launchTasks(offers1.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  AWAIT_READY(statusRunning);
+
+  // Grab one of the offers while the task is running.
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  AWAIT_READY(offers2);
+  ASSERT_FALSE(offers2->empty());
+
+  EXPECT_EQ(
+      offers2.get()[0].resources(),
+      allocatedResources(Resources::parse("cpus:2").get(), "*"));
+
+  driver.declineOffer(offers2.get()[0].id());
+
+  // Restart the slave with increased resources.
+  slave.get()->terminate();
+  flags.reconfiguration_policy = "additive";
+  flags.resources = "cpus:10;mem:512;disk:0;ports:0";
+
+  // Restart the slave with a new containerizer.
+  _containerizer = TypeParam::create(flags, true, &fetcher);
+  ASSERT_SOME(_containerizer);
+  containerizer.reset(_containerizer.get());
+
+  Future<SlaveReregisteredMessage> slaveReregistered =
+    FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
+
+  // Grab one of the offers after the slave was restarted.
+  Future<vector<Offer>> offers3;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers3))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  slave = this->StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+  AWAIT_READY(slaveReregistered);
+
+  AWAIT_READY(offers3);
+  EXPECT_EQ(
+      offers3.get()[0].resources(),
+      allocatedResources(Resources::parse("cpus:7;mem:512").get(), "*"));
+
+  // Decline so we get the resources offered again with the next offer.
+  driver.declineOffer(offers3.get()[0].id());
+
+  // Kill the task
+  driver.killTask(task.task_id());
+  AWAIT_READY(statusKilled);
+  ASSERT_EQ(TASK_KILLED, statusKilled->state());
+
+  // Grab one of the offers after the task was killed.
+  Future<vector<Offer>> offers4;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers4))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_EQ(
+      offers4.get()[0].resources(),
+      allocatedResources(Resources::parse("cpus:10;mem:512").get(), "*"));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that checkpointed resources sent by a non resource
+// provider-capable agent during agent reregistration are ignored by
+// the master and that the master reattempts the checkpointing.
+TYPED_TEST(SlaveRecoveryTest, CheckpointedResources)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = this->CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+
+  slave::Flags slaveFlags = this->CreateSlaveFlags();
+
+  // The master only sends `CheckpointResourcesMessage` to
+  // agents which are not resource provider-capable.
+  slaveFlags.agent_features = SlaveCapabilities();
+
+  foreach (
+      const SlaveInfo::Capability& slaveCapability,
+      slave::AGENT_CAPABILITIES()) {
+    if (slaveCapability.type() != SlaveInfo::Capability::RESOURCE_PROVIDER) {
+      slaveFlags.agent_features->add_capabilities()->CopyFrom(slaveCapability);
+    }
+  }
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = this->StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger the agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, "foo");
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers1;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  // Advance the clock to trigger a batch allocation.
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers1);
+  ASSERT_FALSE(offers1->empty());
+
+  // Below we send a reserve operation which is applied in the master
+  // speculatively. We drop the operation on its way to the agent so
+  // that the master's and the agent's view of the agent's
+  // checkpointed resources diverge.
+  Future<CheckpointResourcesMessage> checkpointResourcesMessage =
+    DROP_PROTOBUF(CheckpointResourcesMessage(), _, _);
+
+  // We use the filter explicitly here so that the resources will not
+  // be filtered for 5 seconds (the default).
+  Filters filters;
+  filters.set_refuse_seconds(0);
+
+  const Offer& offer1 = offers1->at(0);
+
+  const Resources offeredResources = offer1.resources();
+  const Resources dynamicallyReserved =
+    offeredResources.pushReservation(createDynamicReservationInfo(
+        frameworkInfo.roles(0), frameworkInfo.principal()));
+
+  driver.acceptOffers({offer1.id()}, {RESERVE(dynamicallyReserved)}, filters);
+
+  AWAIT_READY(checkpointResourcesMessage);
+
+  // Restart and reregister the agent.
+  slave.get()->terminate();
+
+  slave = this->StartSlave(&detector, slaveFlags);
+
+  // Advance the clock to trigger an agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  // Advance the clock to trigger a batch allocation.
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers2);
+  ASSERT_FALSE(offers2->empty());
+
+  const Offer& offer2 = offers2->at(0);
+
+  // The second offer will be identical to the first
+  // one as our operations never made it to the agent.
+  const Resources offeredResources2 = offer2.resources();
+
+  EXPECT_EQ(dynamicallyReserved, offeredResources2);
+}
+
+
+// This test verifies that checkpointed resources sent by resource
+// provider-capable agents during agent reregistration overwrite the
+// master's view of that agent's checkpointed resources.
+TYPED_TEST(SlaveRecoveryTest, CheckpointedResourcesResourceProviderCapable)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = this->CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+
+  slave::Flags slaveFlags = this->CreateSlaveFlags();
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = this->StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger the agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  AWAIT_READY(updateSlaveMessage);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, "foo");
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers1;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  // Advance the clock to trigger a batch allocation.
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers1);
+  ASSERT_FALSE(offers1->empty());
+
+  // Below we send a reserve operation which is applied in the master
+  // speculatively. We drop the operation on its way to the agent so
+  // that the master's and the agent's view of the agent's
+  // checkpointed resources diverge.
+  Future<ApplyOperationMessage> applyOperationMessage =
+    DROP_PROTOBUF(ApplyOperationMessage(), _, _);
+
+  // We use the filter explicitly here so that the resources will not
+  // be filtered for 5 seconds (the default).
+  Filters filters;
+  filters.set_refuse_seconds(0);
+
+  const Offer& offer1 = offers1->at(0);
+
+  const Resources offeredResources = offer1.resources();
+  const Resources dynamicallyReserved =
+    offeredResources.pushReservation(createDynamicReservationInfo(
+        frameworkInfo.roles(0), frameworkInfo.principal()));
+
+  driver.acceptOffers({offer1.id()}, {RESERVE(dynamicallyReserved)}, filters);
+
+  AWAIT_READY(applyOperationMessage);
+
+  // Restart and reregister the agent.
+  slave.get()->terminate();
+  slave = this->StartSlave(&detector, slaveFlags);
+
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched, resourceOffers(_, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  // Advance the clock to trigger an agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  Clock::settle();
+
+  // Advance the clock to trigger a batch allocation.
+  AWAIT_READY(updateSlaveMessage);
+
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers2);
+  ASSERT_FALSE(offers2->empty());
+
+  const Offer& offer2 = offers2->at(0);
+
+  // The second offer will be identical to the first
+  // one as our operations never made it to the agent.
+  const Resources offeredResources1 = offer1.resources();
+  const Resources offeredResources2 = offer2.resources();
+
+  EXPECT_EQ(offeredResources1, offeredResources2);
+}
+
+
 // We explicitly instantiate a SlaveRecoveryTest for test cases where
 // we assume we'll only have the MesosContainerizer.
 class MesosContainerizerSlaveRecoveryTest
   : public SlaveRecoveryTest<MesosContainerizer> {};
 
 
+// Tests that the containerizer will properly report resource limits
+// after an agent failover.
 TEST_F(MesosContainerizerSlaveRecoveryTest, ResourceStatistics)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -4017,7 +5078,7 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, ResourceStatistics)
 
   slave::Flags flags = this->CreateSlaveFlags();
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, true, &fetcher);
@@ -4044,28 +5105,32 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, ResourceStatistics)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
-  TaskInfo task = createTask(offers.get()[0], "sleep 1000");
+  TaskInfo task = createTask(offers.get()[0], SLEEP_COMMAND(1000));
 
-  // Message expectations.
+  // Wait until the executor registered and task resource updated.
   Future<Message> registerExecutor =
     FUTURE_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
+  Future<Nothing> update1 =
+    FUTURE_DISPATCH(_, &MesosContainerizerProcess::update);
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(registerExecutor);
+  AWAIT_READY(update1);
 
   slave.get()->terminate();
 
-  // Set up so we can wait until the new slave updates the container's
-  // resources (this occurs after the executor has re-registered).
-  Future<Nothing> update =
+  // Wait until the executor re-registered and task resource updated.
+  Future<Message> reregisterExecutor =
+    FUTURE_MESSAGE(Eq(ReregisterExecutorMessage().GetTypeName()), _, _);
+  Future<Nothing> update2 =
     FUTURE_DISPATCH(_, &MesosContainerizerProcess::update);
 
   // Restart the slave (use same flags) with a new containerizer.
@@ -4076,29 +5141,28 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, ResourceStatistics)
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
-  // Wait until the containerizer is updated.
-  AWAIT_READY(update);
+  AWAIT_READY(reregisterExecutor);
+  AWAIT_READY(update2);
 
   Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
-  ASSERT_EQ(1u, containers.get().size());
+  ASSERT_EQ(1u, containers->size());
 
-  ContainerID containerId = *(containers.get().begin());
+  ContainerID containerId = *(containers->begin());
 
   Future<ResourceStatistics> usage = containerizer->usage(containerId);
   AWAIT_READY(usage);
 
   // Check the resource limits are set.
-  EXPECT_TRUE(usage.get().has_cpus_limit());
-  EXPECT_TRUE(usage.get().has_mem_limit_bytes());
+  EXPECT_TRUE(usage->has_cpus_limit());
+  EXPECT_TRUE(usage->has_mem_limit_bytes());
 
-  Future<Option<ContainerTermination>> wait =
-    containerizer->wait(containerId);
+  // Destroy the container.
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
-  containerizer->destroy(containerId);
-
-  AWAIT_READY(wait);
-  EXPECT_SOME(wait.get());
+  AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
 
   driver.stop();
   driver.join();
@@ -4117,9 +5181,8 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceForward)
   // isolation.
   slave::Flags flags = this->CreateSlaveFlags();
   flags.isolation = "cgroups/cpu,cgroups/mem";
-  flags.agent_subsystems = "";
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, true, &fetcher);
@@ -4144,23 +5207,27 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceForward)
   // Scheduler expectations.
   EXPECT_CALL(sched, registered(_, _, _));
 
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
     .WillRepeatedly(Return());
 
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers1))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
   SlaveID slaveId = offers1.get()[0].slave_id();
 
   TaskInfo task1 = createTask(
-      slaveId, Resources::parse("cpus:0.5;mem:128").get(), "sleep 1000");
+      slaveId, Resources::parse("cpus:0.5;mem:128").get(), SLEEP_COMMAND(1000));
 
   // Message expectations.
   Future<Message> registerExecutorMessage =
@@ -4172,9 +5239,16 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceForward)
 
   Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
-  ASSERT_EQ(1u, containers.get().size());
+  ASSERT_EQ(1u, containers->size());
 
-  ContainerID containerId = *(containers.get().begin());
+  ContainerID containerId = *(containers->begin());
+
+  // Wait until task is running.
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   // Stop the slave.
   slave.get()->terminate();
@@ -4189,20 +5263,17 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceForward)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2.get().size());
-
-  // Set up to wait on the container's termination.
-  Future<Option<ContainerTermination>> termination =
-    containerizer->wait(containerId);
+  EXPECT_FALSE(offers2->empty());
 
   // Destroy the container.
-  containerizer->destroy(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
   AWAIT_READY(termination);
   EXPECT_SOME(termination.get());
@@ -4222,9 +5293,8 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceBackward)
   // Start a slave using a containerizer with pid namespace isolation.
   slave::Flags flags = this->CreateSlaveFlags();
   flags.isolation = "cgroups/cpu,cgroups/mem,filesystem/linux,namespaces/pid";
-  flags.agent_subsystems = "";
 
-  Fetcher fetcher;
+  Fetcher fetcher(flags);
 
   Try<MesosContainerizer*> _containerizer =
     MesosContainerizer::create(flags, true, &fetcher);
@@ -4249,23 +5319,27 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceBackward)
   // Scheduler expectations.
   EXPECT_CALL(sched, registered(_, _, _));
 
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
     .WillRepeatedly(Return());
 
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers1))
-    .WillRepeatedly(Return());      // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
+  ASSERT_FALSE(offers1->empty());
 
   SlaveID slaveId = offers1.get()[0].slave_id();
 
   TaskInfo task1 = createTask(
-      slaveId, Resources::parse("cpus:0.5;mem:128").get(), "sleep 1000");
+      slaveId, Resources::parse("cpus:0.5;mem:128").get(), SLEEP_COMMAND(1000));
 
   // Message expectations.
   Future<Message> registerExecutorMessage =
@@ -4277,9 +5351,16 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceBackward)
 
   Future<hashset<ContainerID>> containers = containerizer->containers();
   AWAIT_READY(containers);
-  ASSERT_EQ(1u, containers.get().size());
+  ASSERT_EQ(1u, containers->size());
 
-  ContainerID containerId = *(containers.get().begin());
+  ContainerID containerId = *(containers->begin());
+
+  // Wait until task is running.
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   // Stop the slave.
   slave.get()->terminate();
@@ -4295,20 +5376,17 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceBackward)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   slave = this->StartSlave(detector.get(), containerizer.get(), flags);
   ASSERT_SOME(slave);
 
   AWAIT_READY(offers2);
-  EXPECT_NE(0u, offers2.get().size());
-
-  // Set up to wait on the container's termination.
-  Future<Option<ContainerTermination>> termination =
-    containerizer->wait(containerId);
+  EXPECT_FALSE(offers2->empty());
 
   // Destroy the container.
-  containerizer->destroy(containerId);
+  Future<Option<ContainerTermination>> termination =
+    containerizer->destroy(containerId);
 
   AWAIT_READY(termination);
   EXPECT_SOME(termination.get());

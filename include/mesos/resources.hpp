@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include <boost/iterator/indirect_iterator.hpp>
+
 #include <google/protobuf/repeated_field.h>
 
 #include <mesos/mesos.hpp>
@@ -36,6 +38,7 @@
 #include <stout/hashmap.hpp>
 #include <stout/json.hpp>
 #include <stout/lambda.hpp>
+#include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/try.hpp>
 
@@ -53,13 +56,28 @@
 
 namespace mesos {
 
-// NOTE: Resource objects stored in the class are always valid and
-// kept combined if possible. It is the caller's responsibility to
-// validate any Resource object or repeated Resource protobufs before
-// constructing a Resources object. Otherwise, invalid Resource
-// objects will be silently stripped. Invalid Resource objects will
-// also be silently ignored when used in arithmetic operations (e.g.,
-// +=, -=, etc.).
+// Forward declaration.
+class ResourceConversion;
+
+
+// Helper functions.
+bool operator==(
+    const Resource::ReservationInfo& left,
+    const Resource::ReservationInfo& right);
+
+
+bool operator!=(
+    const Resource::ReservationInfo& left,
+    const Resource::ReservationInfo& right);
+
+
+// NOTE: Resource objects stored in the class are always valid, are in
+// the "post-reservation-refinement" format, and kept combined if possible.
+// It is the caller's responsibility to validate any Resource object or
+// repeated Resource protobufs before constructing a Resources object.
+// Otherwise, invalid Resource objects will be silently stripped.
+// Invalid Resource objects will also be silently ignored when used in
+// arithmetic operations (e.g., +=, -=, etc.).
 class Resources
 {
 private:
@@ -83,6 +101,22 @@ private:
         sharedCount = 1;
       }
     }
+
+    /*implicit*/ Resource_(Resource&& _resource)
+      : resource(std::move(_resource)),
+        sharedCount(None())
+    {
+      // Setting the counter to 1 to denote "one copy" of the shared resource.
+      if (resource.has_shared()) {
+        sharedCount = 1;
+      }
+    }
+
+    Resource_(const Resource_& resource_) = default;
+    Resource_(Resource_&& resource_) = default;
+
+    Resource_& operator=(const Resource_&) = default;
+    Resource_& operator=(Resource_&&) = default;
 
     // By implicitly converting to Resource we are able to keep Resource_
     // logic internal and expose only the protobuf object.
@@ -134,6 +168,11 @@ private:
   };
 
 public:
+  // We rename the type here to alert people about the fact that with
+  // `shared_ptr`, no mutation should be made without obtaining exclusive
+  // ownership. See `resourcesNoMutationWithoutExclusiveOwnership`.
+  using Resource_Unsafe = std::shared_ptr<Resource_>;
+
   /**
    * Returns a Resource with the given name, value, and role.
    *
@@ -263,15 +302,12 @@ public:
   static Option<Error> validate(
       const google::protobuf::RepeatedPtrField<Resource>& resources);
 
-  // NOTE: The following predicate functions assume that the given
-  // resource is validated.
+  // NOTE: The following predicate functions assume that the given resource is
+  // validated, and is in the "post-reservation-refinement" format. That is,
+  // the reservation state is represented by `Resource.reservations` field,
+  // and `Resource.role` and `Resource.reservation` fields are not set.
   //
-  // Valid states of (role, reservation) pair in the Resource object.
-  //   Unreserved         : ("*", None)
-  //   Static reservation : (R, None)
-  //   Dynamic reservation: (R, { principal: <framework_principal> })
-  //
-  // NOTE: ("*", { principal: <framework_principal> }) is invalid.
+  // See 'Resource Format' section in `mesos.proto` for more details.
 
   // Tests if the given Resource object is empty.
   static bool isEmpty(const Resource& resource);
@@ -279,11 +315,25 @@ public:
   // Tests if the given Resource object is a persistent volume.
   static bool isPersistentVolume(const Resource& resource);
 
+  // Tests if the given Resource object is a disk of the specified type.
+  static bool isDisk(
+      const Resource& resource,
+      const Resource::DiskInfo::Source::Type& type);
+
   // Tests if the given Resource object is reserved. If the role is
   // specified, tests that it's reserved for the given role.
   static bool isReserved(
       const Resource& resource,
       const Option<std::string>& role = None());
+
+  // Tests if the given Resource object is allocatable to the given role.
+  // A resource object is allocatable to 'role' if:
+  //   * it is reserved to an ancestor of that role in the hierarchy, OR
+  //   * it is reserved to 'role' itself, OR
+  //   * it is unreserved.
+  static bool isAllocatableTo(
+      const Resource& resource,
+      const std::string& role);
 
   // Tests if the given Resource object is unreserved.
   static bool isUnreserved(const Resource& resource);
@@ -296,6 +346,28 @@ public:
 
   // Tests if the given Resource object is shared.
   static bool isShared(const Resource& resource);
+
+  // Tests if the given Resources object is a "pure" scalar quantity which
+  // consists of resource objects with ONLY name, type (set to "Scalar")
+  // and scalar fields set.
+  static bool isScalarQuantity(const Resources& resources);
+
+  // Tests if the given Resource object has refined reservations.
+  static bool hasRefinedReservations(const Resource& resource);
+
+  // Tests if the given Resource object is provided by a resource provider.
+  static bool hasResourceProvider(const Resource& resource);
+
+  // Returns the role to which the given Resource object is reserved for.
+  // This must be called only when the resource is reserved!
+  static const std::string& reservationRole(const Resource& resource);
+
+  // Shrinks a scalar type `resource` to the target size.
+  // Returns true if the resource was shrunk to the target size,
+  // or the resource is already within the target size.
+  // Returns false otherwise (i.e. the resource is indivisible.
+  // E.g. MOUNT volume).
+  static bool shrink(Resource* resource, const Value::Scalar& target);
 
   // Returns the summed up Resources given a hashmap<Key, Resources>.
   //
@@ -324,34 +396,46 @@ public:
 
   // TODO(jieyu): Consider using C++11 initializer list.
   /*implicit*/ Resources(const Resource& resource);
+  /*implicit*/ Resources(Resource&& resource);
 
   /*implicit*/
   Resources(const std::vector<Resource>& _resources);
+  Resources(std::vector<Resource>&& _resources);
 
   /*implicit*/
   Resources(const google::protobuf::RepeatedPtrField<Resource>& _resources);
+  Resources(google::protobuf::RepeatedPtrField<Resource>&& _resources);
 
-  Resources(const Resources& that) : resources(that.resources) {}
+  Resources(const Resources& that) = default;
+  Resources(Resources&& that) = default;
 
   Resources& operator=(const Resources& that)
   {
     if (this != &that) {
-      resources = that.resources;
+      resourcesNoMutationWithoutExclusiveOwnership =
+        that.resourcesNoMutationWithoutExclusiveOwnership;
     }
     return *this;
   }
 
-  bool empty() const { return resources.size() == 0; }
+  Resources& operator=(Resources&& that)
+  {
+    if (this != &that) {
+      resourcesNoMutationWithoutExclusiveOwnership =
+        std::move(that.resourcesNoMutationWithoutExclusiveOwnership);
+    }
+    return *this;
+  }
 
-  size_t size() const { return resources.size(); }
+  bool empty() const
+  {
+    return resourcesNoMutationWithoutExclusiveOwnership.size() == 0;
+  }
 
-  // Allocates the resources to the given role (by setting the
-  // `AllocationInfo.role`). Any existing allocation will be
-  // over-written.
-  void allocate(const std::string& role);
-
-  // Unallocates the resources.
-  void unallocate();
+  size_t size() const
+  {
+    return resourcesNoMutationWithoutExclusiveOwnership.size();
+  }
 
   // Checks if this Resources is a superset of the given Resources.
   bool contains(const Resources& that) const;
@@ -368,6 +452,14 @@ public:
   // - If the resource is not in the Resources object, the count is 0.
   size_t count(const Resource& that) const;
 
+  // Allocates the resources to the given role (by setting the
+  // `AllocationInfo.role`). Any existing allocation will be
+  // over-written.
+  void allocate(const std::string& role);
+
+  // Unallocates the resources.
+  void unallocate();
+
   // Filter resources based on the given predicate.
   Resources filter(
       const lambda::function<bool(const Resource&)>& predicate) const;
@@ -379,6 +471,10 @@ public:
   // Note that the "*" role represents unreserved resources,
   // and will be ignored.
   Resources reserved(const Option<std::string>& role = None()) const;
+
+  // Returns resources allocatable to role. See `isAllocatableTo` for the
+  // definition of 'allocatableTo'.
+  Resources allocatableTo(const std::string& role) const;
 
   // Returns the unreserved resources.
   Resources unreserved() const;
@@ -402,29 +498,21 @@ public:
   // This must be called only when the resources are allocated!
   hashmap<std::string, Resources> allocations() const;
 
-  // Returns a Resources object with the same amount of each resource
-  // type as these Resources, but with all Resource objects marked as
-  // the specified (role, reservation) pair. This is used to cross
-  // reservation boundaries without affecting the actual resources.
-  // If the optional ReservationInfo is given, the resource's
-  // 'reservation' field is set. Otherwise, the resource's
-  // 'reservation' field is cleared.
-  // Returns an Error when the role is invalid or the reservation
-  // is set when the role is '*'.
-  Try<Resources> flatten(
-      const std::string& role,
-      const Option<Resource::ReservationInfo>& reservation = None()) const;
+  // Returns a `Resources` object with the new reservation added to the back.
+  // The new reservation must be a valid refinement of the current reservation.
+  Resources pushReservation(const Resource::ReservationInfo& reservation) const;
 
-  // Equivalent to `flatten("*")` except it returns a Resources directly
-  // because the result is always a valid in this case.
-  Resources flatten() const;
+  // Returns a `Resources` object with the last reservation removed.
+  // Every resource in `Resources` must have `resource.reservations_size() > 0`.
+  Resources popReservation() const;
+
+  // Returns a `Resources` object with all of the reservations removed.
+  Resources toUnreserved() const;
 
   // Returns a Resources object that contains all the scalar resources
-  // in this object, but with their ReservationInfo, AllocationInfo,
-  // and DiskInfo omitted. Note that the `role` and RevocableInfo,
-  // if any, are preserved. Because we clear ReservationInfo but
-  // preserve `role`, this means that stripping a dynamically
-  // reserved resource makes it effectively statically reserved.
+  // but with all the meta-data fields, such as AllocationInfo,
+  // ReservationInfo and etc. cleared. Only scalar resources' name,
+  // type (SCALAR) and value are preserved.
   //
   // This is intended for code that would like to aggregate together
   // Resource values without regard for metadata like whether the
@@ -445,25 +533,35 @@ public:
   // example frameworks to leverage.
   Option<Resources> find(const Resources& targets) const;
 
-  // Certain offer operations (e.g., RESERVE, UNRESERVE, CREATE or
-  // DESTROY) alter the offered resources. The following methods
-  // provide a convenient way to get the transformed resources by
-  // applying the given offer operation(s). Returns an Error if the
-  // offer operation(s) cannot be applied.
+  // Applies a resource conversion by taking out the `consumed`
+  // resources and adding back the `converted` resources. Returns an
+  // Error if the conversion cannot be applied.
+  Try<Resources> apply(const ResourceConversion& conversion) const;
+
+  // Finds a resource object with the same metadata (i.e. AllocationInfo,
+  // ReservationInfo, etc.) as the given one, ignoring the actual value.
+  // If multiple matching resources exist, the first match is returned.
+  Option<Resource> match(const Resource& resource) const;
+
+  // Obtains the conversion from the given operation and applies the
+  // conversion. This method serves a syntax sugar for applying a
+  // resource conversion.
+  // TODO(jieyu): Consider remove this method once we updated all the
+  // call sites.
   Try<Resources> apply(const Offer::Operation& operation) const;
 
   template <typename Iterable>
-  Try<Resources> apply(const Iterable& operations) const
+  Try<Resources> apply(const Iterable& iterable) const
   {
     Resources result = *this;
 
-    foreach (const Offer::Operation& operation, operations) {
-      Try<Resources> transformed = result.apply(operation);
-      if (transformed.isError()) {
-        return Error(transformed.error());
+    foreach (const auto& t, iterable) {
+      Try<Resources> converted = result.apply(t);
+      if (converted.isError()) {
+        return Error(converted.error());
       }
 
-      result = transformed.get();
+      result = converted.get();
     }
 
     return result;
@@ -502,30 +600,46 @@ public:
   // which holds the ephemeral ports allocation logic.
   Option<Value::Ranges> ephemeral_ports() const;
 
-  // NOTE: Non-`const` `iterator`, `begin()` and `end()` are __intentionally__
-  // defined with `const` semantics in order to prevent mutable access to the
-  // `Resource` objects within `resources`.
-  typedef std::vector<Resource_>::const_iterator iterator;
-  typedef std::vector<Resource_>::const_iterator const_iterator;
+  // We use `boost::indirect_iterator` to expose `Resource` (implicitly
+  // converted from `Resource_`) iteration, while actually storing
+  // `Resource_Unsafe`.
+  //
+  // NOTE: Non-const `begin()` and `end()` intentionally return const
+  // iterators to prevent mutable access to the `Resource` objects.
+
+  typedef boost::indirect_iterator<
+      std::vector<Resource_Unsafe>::const_iterator>
+    const_iterator;
 
   const_iterator begin()
   {
-    return static_cast<const std::vector<Resource_>&>(resources).begin();
+    return static_cast<const std::vector<Resource_Unsafe>&>(
+               resourcesNoMutationWithoutExclusiveOwnership)
+      .begin();
   }
 
   const_iterator end()
   {
-    return static_cast<const std::vector<Resource_>&>(resources).end();
+    return static_cast<const std::vector<Resource_Unsafe>&>(
+               resourcesNoMutationWithoutExclusiveOwnership)
+      .end();
   }
 
-  const_iterator begin() const { return resources.begin(); }
-  const_iterator end() const { return resources.end(); }
+  const_iterator begin() const
+  {
+    return resourcesNoMutationWithoutExclusiveOwnership.begin();
+  }
+
+  const_iterator end() const
+  {
+    return resourcesNoMutationWithoutExclusiveOwnership.end();
+  }
 
   // Using this operator makes it easy to copy a resources object into
   // a protocol buffer field.
   // Note that the google::protobuf::RepeatedPtrField<Resource> is
   // generated at runtime.
-  operator const google::protobuf::RepeatedPtrField<Resource>() const;
+  operator google::protobuf::RepeatedPtrField<Resource>() const;
 
   bool operator==(const Resources& that) const;
   bool operator!=(const Resources& that) const;
@@ -535,10 +649,23 @@ public:
   // doing subtraction), the semantics is as though the second operand
   // was actually just an empty resource (as though you didn't do the
   // operation at all).
-  Resources operator+(const Resource& that) const;
-  Resources operator+(const Resources& that) const;
+  Resources operator+(const Resource& that) const &;
+  Resources operator+(const Resource& that) &&;
+
+  Resources operator+(Resource&& that) const &;
+  Resources operator+(Resource&& that) &&;
+
   Resources& operator+=(const Resource& that);
+  Resources& operator+=(Resource&& that);
+
+  Resources operator+(const Resources& that) const &;
+  Resources operator+(const Resources& that) &&;
+
+  Resources operator+(Resources&& that) const &;
+  Resources operator+(Resources&& that) &&;
+
   Resources& operator+=(const Resources& that);
+  Resources& operator+=(Resources&& that);
 
   Resources operator-(const Resource& that) const;
   Resources operator-(const Resources& that) const;
@@ -569,15 +696,43 @@ private:
   // NOTE: `Resource` objects are implicitly converted to `Resource_`
   // objects, so here the API can also accept a `Resource` object.
   void add(const Resource_& r);
+  void add(Resource_&& r);
+
+  // TODO(mzhu): Add move support.
+  void add(const Resource_Unsafe& that);
+
   void subtract(const Resource_& r);
 
-  Resources operator+(const Resource_& that) const;
   Resources& operator+=(const Resource_& that);
+  Resources& operator+=(Resource_&& that);
 
-  Resources operator-(const Resource_& that) const;
   Resources& operator-=(const Resource_& that);
 
-  std::vector<Resource_> resources;
+  // Resources are stored using copy-on-write:
+  //
+  //   (1) Copies are done by copying the `shared_ptr`. This
+  //       makes read-only filtering (e.g. `unreserved()`)
+  //       inexpensive as we do not have to perform copies
+  //       of the resource objects.
+  //
+  //   (2) When a write occurs:
+  //      (a) If there's a single reference to the resource
+  //          object, we mutate directly.
+  //      (b) If there's more than a single reference to the
+  //          resource object, we copy first, then mutate the copy.
+  //
+  // We name the `vector` field `resourcesNoMutationWithoutExclusiveOwnership`
+  // and typedef its item type to `Resource_Unsafe` to alert people
+  // regarding (2).
+  //
+  // TODO(mzhu): While naming the vector and its item type may help, this is
+  // still brittle and certainly not ideal. Explore more robust designs such as
+  // introducing a customized copy-on-write abstraction that hides direct
+  // setters and only allow mutations in a controlled fashion.
+  //
+  // TODO(mzhu): Consider using `boost::intrusive_ptr` for
+  // possibly better performance.
+  std::vector<Resource_Unsafe> resourcesNoMutationWithoutExclusiveOwnership;
 };
 
 
@@ -642,6 +797,31 @@ hashmap<Key, Resources> operator+(
   result += right;
   return result;
 }
+
+
+/**
+ * Represents a resource conversion, usually as a result of an offer
+ * operation. See more details in `Resources::apply` method.
+ */
+class ResourceConversion
+{
+public:
+  typedef lambda::function<Try<Nothing>(const Resources&)> PostValidation;
+
+  ResourceConversion(
+      const Resources& _consumed,
+      const Resources& _converted,
+      const Option<PostValidation>& _postValidation = None())
+    : consumed(_consumed),
+      converted(_converted),
+      postValidation(_postValidation) {}
+
+  Try<Resources> apply(const Resources& resources) const;
+
+  Resources consumed;
+  Resources converted;
+  Option<PostValidation> postValidation;
+};
 
 } // namespace mesos {
 

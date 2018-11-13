@@ -9,8 +9,8 @@
   <description>The Apache Mesos Java API jar.</description>
   <url>http://mesos.apache.org</url>
   <scm>
-    <connection>scm:git:https://git-wip-us.apache.org/repos/asf/mesos.git</connection>
-    <url>https://git-wip-us.apache.org/repos/asf/mesos.git</url>
+    <connection>scm:git:https://gitbox.apache.org/repos/asf/mesos.git</connection>
+    <url>https://gitbox.apache.org/repos/asf/mesos.git</url>
   </scm>
   <!-- We inherit from the apache parent pom to use its repositories
        but since we don't use Maven as the primary build system for
@@ -32,58 +32,11 @@
       </otherArchives>
     </mailingList>
   </mailingLists>
-  <developers>
-    <developer>
-      <id>alig</id>
-      <name>Ali Ghodis</name>
-      <email>alig@apache.org</email>
-    </developer>
-    <developer>
-      <id>andyk</id>
-      <name>Andy Konwinski</name>
-      <email>andrew@apache.org</email>
-    </developer>
-    <developer>
-      <id>benh</id>
-      <name>Benjamin Hindman</name>
-      <email>benh@apache.org</email>
-    </developer>
-    <developer>
-      <id>bmahler</id>
-      <name>Benjamin Mahler</name>
-      <email>bmahler@apache.org</email>
-    </developer>
-    <developer>
-      <id>brenden</id>
-      <name>Brenden Matthews</name>
-      <email>brenden@apache.org</email>
-    </developer>
-    <developer>
-      <id>matei</id>
-      <name>Matei Zaharia</name>
-      <email>matei@apache.org</email>
-    </developer>
-    <developer>
-      <id>tmarshall</id>
-      <name>Thomas Marshall</name>
-      <email>tmarshall@apache.org</email>
-    </developer>
-    <developer>
-      <id>vinodkone</id>
-      <name>Vinod Kone</name>
-      <email>vinodkone@apache.org</email>
-    </developer>
-    <developer>
-      <id>woggle</id>
-      <name>Charles Reiss</name>
-      <email>woggle@apache.org</email>
-    </developer>
-  </developers>
   <dependencies>
     <dependency>
       <artifactId>protobuf-java</artifactId>
       <groupId>com.google.protobuf</groupId>
-      <version>2.6.1</version>
+      <version>3.5.0</version>
     </dependency>
   </dependencies>
   <build>

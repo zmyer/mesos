@@ -226,10 +226,7 @@ TEST(FlagsTest, Flags)
 }
 
 
-// TODO(hausdorff): Enable this test on Windows. Currently setting an
-// environment variable to the blank string will cause the environment variable
-// to be deleted on Windows. See MESOS-5880.
-TEST_TEMP_DISABLED_ON_WINDOWS(FlagsTest, LoadFromEnvironment)
+TEST(FlagsTest, LoadFromEnvironment)
 {
   TestFlagsBase flags;
 
@@ -241,7 +238,7 @@ TEST_TEMP_DISABLED_ON_WINDOWS(FlagsTest, LoadFromEnvironment)
 
   Try<Warnings> load = flags.load("FLAGSTEST_");
   EXPECT_SOME(load);
-  EXPECT_EQ(0u, load->warnings.size());
+  EXPECT_TRUE(load->warnings.empty());
 
   EXPECT_EQ("billy joel", flags.name1);
   EXPECT_EQ(43, flags.name2);
@@ -271,10 +268,11 @@ TEST(FlagsTest, LoadFromCommandLine)
     "--no-name4",
     "--name5"
   };
+  const int argc = static_cast<int>(arraySize(argv));
 
-  Try<Warnings> load = flags.load("FLAGSTEST_", arraySize(argv), argv);
+  Try<Warnings> load = flags.load("FLAGSTEST_", argc, argv);
   EXPECT_SOME(load);
-  EXPECT_EQ(0u, load->warnings.size());
+  EXPECT_TRUE(load->warnings.empty());
 
   EXPECT_EQ("billy joel", flags.name1);
   EXPECT_EQ(43, flags.name2);
@@ -303,10 +301,11 @@ TEST(FlagsTest, LoadFromCommandLineWithNonFlags)
     "the",
     "end"
   };
+  const int argc = static_cast<int>(arraySize(argv));
 
-  Try<Warnings> load = flags.load("FLAGSTEST_", arraySize(argv), argv);
+  Try<Warnings> load = flags.load("FLAGSTEST_", argc, argv);
   EXPECT_SOME(load);
-  EXPECT_EQ(0u, load->warnings.size());
+  EXPECT_TRUE(load->warnings.empty());
 
   EXPECT_EQ("billy joel", flags.name1);
   EXPECT_EQ(43, flags.name2);
@@ -335,10 +334,11 @@ TEST(FlagsTest, LoadFromCommandLineWithDashDash)
     "--name5",
     "the"
   };
+  const int argc = static_cast<int>(arraySize(argv));
 
-  Try<Warnings> load = flags.load("FLAGSTEST_", arraySize(argv), argv);
+  Try<Warnings> load = flags.load("FLAGSTEST_", argc, argv);
   EXPECT_SOME(load);
-  EXPECT_EQ(0u, load->warnings.size());
+  EXPECT_TRUE(load->warnings.empty());
 
   EXPECT_EQ("billy joel", flags.name1);
   EXPECT_EQ(43, flags.name2);
@@ -365,7 +365,7 @@ TEST(FlagsTest, LoadFromCommandLineAndUpdateArgcArgv)
     (char*)"--name5",
     (char*)"the"
   };
-  int argc = arraySize(argv);
+  int argc = static_cast<int>(arraySize(argv));
 
   // Need a temporary since some compilers want to treat the type of
   // 'argv' as 'char *(*)[argc]' since the size of the array is known.
@@ -373,7 +373,7 @@ TEST(FlagsTest, LoadFromCommandLineAndUpdateArgcArgv)
 
   Try<Warnings> load = flags.load("FLAGSTEST_", &argc, &_argv);
   EXPECT_SOME(load);
-  EXPECT_EQ(0u, load->warnings.size());
+  EXPECT_TRUE(load->warnings.empty());
 
   EXPECT_EQ("billy joel", flags.name1);
   EXPECT_EQ(43, flags.name2);
@@ -524,9 +524,7 @@ TEST(FlagsTest, DeprecationWarning)
 }
 
 
-// TODO(hausdorff): Enable this test on Windows. Currently `flags::parse`
-// assumes filesystems are rooted at '/'. See MESOS-5937.
-TEST_TEMP_DISABLED_ON_WINDOWS(FlagsTest, DuplicatesFromEnvironment)
+TEST(FlagsTest, DuplicatesFromEnvironment)
 {
   TestFlagsBase flags;
 
@@ -537,11 +535,12 @@ TEST_TEMP_DISABLED_ON_WINDOWS(FlagsTest, DuplicatesFromEnvironment)
     "/path/to/program",
     "--name1=billy joel"
   };
+  const int argc = static_cast<int>(arraySize(argv));
 
   // `load(prefix, argc, argv)`.
-  Try<Warnings> load = flags.load("FLAGSTEST_", arraySize(argv), argv);
+  Try<Warnings> load = flags.load("FLAGSTEST_", argc, argv);
   EXPECT_SOME(load);
-  EXPECT_EQ(0u, load->warnings.size());
+  EXPECT_TRUE(load->warnings.empty());
 
   // The environment variables are overwritten by command line flags.
   EXPECT_EQ(flags.name1, "billy joel");
@@ -555,7 +554,7 @@ TEST_TEMP_DISABLED_ON_WINDOWS(FlagsTest, DuplicatesFromEnvironment)
     // `load(map<string, string>, unknowns, prefix)`.
     load = flags.load(values, false, "FLAGSTEST_");
     EXPECT_SOME(load);
-    EXPECT_EQ(0u, load->warnings.size());
+    EXPECT_TRUE(load->warnings.empty());
 
     EXPECT_EQ(flags.name1, "billy joel");
     EXPECT_EQ(flags.name2, 50);
@@ -571,7 +570,7 @@ TEST_TEMP_DISABLED_ON_WINDOWS(FlagsTest, DuplicatesFromEnvironment)
     load = flags.load(values, false, "FLAGSTEST_");
 
     EXPECT_SOME(load);
-    EXPECT_EQ(0u, load->warnings.size());
+    EXPECT_TRUE(load->warnings.empty());
 
     EXPECT_EQ(flags.name1, "billy joel");
     EXPECT_EQ(flags.name2, 51);
@@ -591,10 +590,11 @@ TEST(FlagsTest, DuplicatesFromCommandLine)
     "--name1=billy joel",
     "--name1=ben folds"
   };
+  const int argc = static_cast<int>(arraySize(argv));
 
   // TODO(klaus1982): Simply checking for the error. Once typed errors are
   // introduced, capture it within the type system.
-  Try<Warnings> load = flags.load("FLAGSTEST_", arraySize(argv), argv);
+  Try<Warnings> load = flags.load("FLAGSTEST_", argc, argv);
   EXPECT_ERROR(load);
 }
 
@@ -619,9 +619,10 @@ TEST(FlagsTest, AliasDuplicateFromCommandLine)
     "--name=billy joel",
     "--alias=ben folds"
   };
+  const int argc = static_cast<int>(arraySize(argv));
 
   // Loading the same flag with the name and alias should be an error.
-  Try<Warnings> load = flags.load("FLAGSTEST_", arraySize(argv), argv);
+  Try<Warnings> load = flags.load("FLAGSTEST_", argc, argv);
   EXPECT_ERROR(load);
 }
 
@@ -779,8 +780,9 @@ TEST(FlagsTest, Validate)
     "/path/to/program",
     "--duration=2hrs"
   };
+  const int argc = static_cast<int>(arraySize(argv));
 
-  Try<Warnings> load = flags.load("FLAGSTEST_", arraySize(argv), argv);
+  Try<Warnings> load = flags.load("FLAGSTEST_", argc, argv);
   EXPECT_ERROR(load);
 
   EXPECT_EQ("Expected --duration to be less than 1 hour", load.error());
@@ -978,9 +980,10 @@ TEST(FlagsTest, JSON)
 class FlagsFileTest : public TemporaryDirectoryTest {};
 
 
-// TODO(hausdorff): Enable this test on Windows. Currently `flags::parse`
-// assumes filesystems are rooted at '/'. See MESOS-5937.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(FlagsFileTest, JSONFile)
+#ifndef __WINDOWS__
+// This tests deprecated code that pre-dates Windows support for Mesos.
+// Hence, we should not build or enable this test on Windows.
+TEST_F(FlagsFileTest, JSONFile)
 {
   class TestFlags : public virtual FlagsBase
   {
@@ -1015,6 +1018,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FlagsFileTest, JSONFile)
 
   ASSERT_SOME_EQ(object, flags.json);
 }
+#endif // __WINDOWS__
 
 
 TEST_F(FlagsFileTest, FilePrefix)

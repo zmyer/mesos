@@ -53,7 +53,7 @@ class VolumeImageIsolatorTest :
   public ::testing::WithParamInterface<bool>
 {
 protected:
-  virtual void SetUp()
+  void SetUp() override
   {
     nesting = GetParam();
 
@@ -61,7 +61,6 @@ protected:
   }
 
   bool nesting;
-  Fetcher fetcher;
 };
 
 
@@ -85,6 +84,8 @@ TEST_P(VolumeImageIsolatorTest, ROOT_ImageInVolumeWithoutRootFilesystem)
   flags.docker_store_dir = path::join(sandbox.get(), "store");
   flags.image_providers = "docker";
 
+  Fetcher fetcher(flags);
+
   Try<MesosContainerizer*> create =
     MesosContainerizer::create(flags, true, &fetcher);
 
@@ -93,7 +94,7 @@ TEST_P(VolumeImageIsolatorTest, ROOT_ImageInVolumeWithoutRootFilesystem)
   Owned<Containerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   ContainerInfo container = createContainerInfo(
       None(),
@@ -112,33 +113,28 @@ TEST_P(VolumeImageIsolatorTest, ROOT_ImageInVolumeWithoutRootFilesystem)
   string directory = path::join(flags.work_dir, "sandbox");
   ASSERT_SOME(os::mkdir(directory));
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      executor,
-      directory,
-      None(),
-      SlaveID(),
+      createContainerConfig(None(), executor, directory),
       map<string, string>(),
-      false);
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
 
   if (nesting) {
     ContainerID nestedContainerId;
     nestedContainerId.mutable_parent()->CopyFrom(containerId);
-    nestedContainerId.set_value(UUID::random().toString());
+    nestedContainerId.set_value(id::UUID::random().toString());
 
     launch = containerizer->launch(
         nestedContainerId,
-        command,
-        container,
-        None(),
-        SlaveID());
+        createContainerConfig(command, container),
+        map<string, string>(),
+        None());
 
-    AWAIT_ASSERT_TRUE(launch);
+    AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
     wait = containerizer->wait(nestedContainerId);
   }
@@ -149,14 +145,13 @@ TEST_P(VolumeImageIsolatorTest, ROOT_ImageInVolumeWithoutRootFilesystem)
   EXPECT_WEXITSTATUS_EQ(0, wait->get().status());
 
   if (nesting) {
-    wait = containerizer->wait(containerId);
+    Future<Option<ContainerTermination>> termination =
+      containerizer->destroy(containerId);
 
-    containerizer->destroy(containerId);
-
-    AWAIT_READY(wait);
-    ASSERT_SOME(wait.get());
-    ASSERT_TRUE(wait->get().has_status());
-    EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+    AWAIT_READY(termination);
+    ASSERT_SOME(termination.get());
+    ASSERT_TRUE(termination->get().has_status());
+    EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
   }
 }
 
@@ -176,6 +171,8 @@ TEST_P(VolumeImageIsolatorTest, ROOT_ImageInVolumeWithRootFilesystem)
   flags.docker_store_dir = path::join(sandbox.get(), "store");
   flags.image_providers = "docker";
 
+  Fetcher fetcher(flags);
+
   Try<MesosContainerizer*> create =
     MesosContainerizer::create(flags, true, &fetcher);
 
@@ -184,7 +181,7 @@ TEST_P(VolumeImageIsolatorTest, ROOT_ImageInVolumeWithRootFilesystem)
   Owned<Containerizer> containerizer(create.get());
 
   ContainerID containerId;
-  containerId.set_value(UUID::random().toString());
+  containerId.set_value(id::UUID::random().toString());
 
   ContainerInfo container = createContainerInfo(
       "test_image_rootfs",
@@ -205,33 +202,28 @@ TEST_P(VolumeImageIsolatorTest, ROOT_ImageInVolumeWithRootFilesystem)
   string directory = path::join(flags.work_dir, "sandbox");
   ASSERT_SOME(os::mkdir(directory));
 
-  Future<bool> launch = containerizer->launch(
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
       containerId,
-      None(),
-      executor,
-      directory,
-      None(),
-      SlaveID(),
+      createContainerConfig(None(), executor, directory),
       map<string, string>(),
-      false);
+      None());
 
-  AWAIT_ASSERT_TRUE(launch);
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
   Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
 
   if (nesting) {
     ContainerID nestedContainerId;
     nestedContainerId.mutable_parent()->CopyFrom(containerId);
-    nestedContainerId.set_value(UUID::random().toString());
+    nestedContainerId.set_value(id::UUID::random().toString());
 
     launch = containerizer->launch(
         nestedContainerId,
-        command,
-        container,
-        None(),
-        SlaveID());
+        createContainerConfig(command, container),
+        map<string, string>(),
+        None());
 
-    AWAIT_ASSERT_TRUE(launch);
+    AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
 
     wait = containerizer->wait(nestedContainerId);
   }
@@ -242,14 +234,98 @@ TEST_P(VolumeImageIsolatorTest, ROOT_ImageInVolumeWithRootFilesystem)
   EXPECT_WEXITSTATUS_EQ(0, wait->get().status());
 
   if (nesting) {
-    wait = containerizer->wait(containerId);
+    Future<Option<ContainerTermination>> termination =
+      containerizer->destroy(containerId);
 
-    containerizer->destroy(containerId);
+    AWAIT_READY(termination);
+    ASSERT_SOME(termination.get());
+    ASSERT_TRUE(termination->get().has_status());
+    EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
+  }
+}
 
-    AWAIT_READY(wait);
-    ASSERT_SOME(wait.get());
-    ASSERT_TRUE(wait->get().has_status());
-    EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
+
+// This test verifies that a container launched without
+// a rootfs cannot write to a read-only IMAGE volume.
+TEST_P(VolumeImageIsolatorTest, ROOT_ImageInReadOnlyVolumeWithoutRootFilesystem)
+{
+  string registry = path::join(sandbox.get(), "registry");
+  AWAIT_READY(DockerArchive::create(registry, "test_image"));
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "filesystem/linux,volume/image,docker/runtime";
+  flags.docker_registry = registry;
+  flags.docker_store_dir = path::join(sandbox.get(), "store");
+  flags.image_providers = "docker";
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> create =
+    MesosContainerizer::create(flags, true, &fetcher);
+
+  ASSERT_SOME(create);
+
+  Owned<Containerizer> containerizer(create.get());
+
+  ContainerID containerId;
+  containerId.set_value(id::UUID::random().toString());
+
+  ContainerInfo container = createContainerInfo(
+      None(),
+      {createVolumeFromDockerImage("rootfs", "test_image", Volume::RO)});
+
+  CommandInfo command = createCommandInfo("echo abc > rootfs/file");
+
+  ExecutorInfo executor = createExecutorInfo(
+      "test_executor",
+      nesting ? createCommandInfo("sleep 1000") : command);
+
+  if (!nesting) {
+    executor.mutable_container()->CopyFrom(container);
+  }
+
+  string directory = path::join(flags.work_dir, "sandbox");
+  ASSERT_SOME(os::mkdir(directory));
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(None(), executor, directory),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Option<ContainerTermination>> wait = containerizer->wait(containerId);
+
+  if (nesting) {
+    ContainerID nestedContainerId;
+    nestedContainerId.mutable_parent()->CopyFrom(containerId);
+    nestedContainerId.set_value(id::UUID::random().toString());
+
+    launch = containerizer->launch(
+        nestedContainerId,
+        createContainerConfig(command, container),
+        map<string, string>(),
+        None());
+
+    AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+    wait = containerizer->wait(nestedContainerId);
+  }
+
+  AWAIT_READY(wait);
+  ASSERT_SOME(wait.get());
+  ASSERT_TRUE(wait->get().has_status());
+  EXPECT_WEXITSTATUS_NE(0, wait->get().status());
+
+  if (nesting) {
+    Future<Option<ContainerTermination>> termination =
+      containerizer->destroy(containerId);
+
+    AWAIT_READY(termination);
+    ASSERT_SOME(termination.get());
+    ASSERT_TRUE(termination->get().has_status());
+    EXPECT_WTERMSIG_EQ(SIGKILL, termination.get()->status());
   }
 }
 

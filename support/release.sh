@@ -43,7 +43,7 @@ echo "${GREEN}Checking out svn release repo ...${NORMAL}"
 svn co --depth=empty ${SVN_RELEASE_REPO} ${SVN_RELEASE_LOCAL}
 
 echo "${GREEN}Uploading the artifacts (the distribution," \
-  "signature, and MD5) to the release repo ${NORMAL}"
+  "signature, and checksum) to the release repo ${NORMAL}"
 
 mv ${TAG} ${SVN_RELEASE_LOCAL}/${VERSION}
 
@@ -58,11 +58,11 @@ popd # ${WORK_DIR}
 
 echo "${GREEN}Tagging ${TAG} as ${VERSION} ${NORMAL}"
 
-git tag ${VERSION} ${TAG}
+git tag -a ${VERSION} ${TAG} -m "Tagging Mesos ${VERSION}"
 
 echo "${GREEN}Pushing the git tag to the repository...${NORMAL}"
 
-MESOS_GIT_URL="https://git-wip-us.apache.org/repos/asf/mesos.git"
+MESOS_GIT_URL="https://gitbox.apache.org/repos/asf/mesos.git"
 
 git push ${MESOS_GIT_URL} ${VERSION}
 
@@ -109,7 +109,7 @@ It is recommended to use a mirror to download the release:
 http://www.apache.org/dyn/closer.cgi
 
 The CHANGELOG for the release is available at:
-https://git-wip-us.apache.org/repos/asf?p=mesos.git;a=blob_plain;f=CHANGELOG;hb=${VERSION}
+https://gitbox.apache.org/repos/asf?p=mesos.git;a=blob_plain;f=CHANGELOG;hb=${VERSION}
 
 The mesos-${VERSION}.jar has been released to:
 https://repository.apache.org

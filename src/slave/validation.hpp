@@ -19,8 +19,6 @@
 
 #include <mesos/agent/agent.hpp>
 
-#include <mesos/executor/executor.hpp>
-
 #include <stout/error.hpp>
 #include <stout/option.hpp>
 
@@ -38,7 +36,7 @@ Option<Error> validateContainerId(const ContainerID& containerId);
 namespace agent {
 namespace call {
 
-// Validates that a agent:Call is well-formed.
+// Validates that an agent::Call is well-formed.
 // TODO(bmahler): Add unit tests.
 Option<Error> validate(
     const mesos::agent::Call& call,
@@ -47,15 +45,6 @@ Option<Error> validate(
 } // namespace call {
 } // namespace agent {
 
-namespace executor {
-namespace call {
-
-// Validates that an executor call is well-formed.
-// TODO(ijimenez): Add unit tests.
-Option<Error> validate(const mesos::executor::Call& call);
-
-} // namespace call {
-} // namespace executor {
 } // namespace validation {
 } // namespace slave {
 } // namespace internal {

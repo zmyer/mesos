@@ -20,6 +20,8 @@
 #include <stout/gtest.hpp>
 #include <stout/uuid.hpp>
 
+using id::UUID;
+
 using std::string;
 
 
@@ -52,6 +54,16 @@ TEST(UUIDTest, Test)
   EXPECT_SOME_EQ(uuid1, UUID::fromString(string1));
   EXPECT_SOME_EQ(uuid2, UUID::fromString(string2));
   EXPECT_SOME_EQ(uuid3, UUID::fromString(string3));
+}
+
+
+TEST(UUIDTest, Metadata)
+{
+  UUID uuid = UUID::random();
+
+  EXPECT_EQ(16u, uuid.size());
+  EXPECT_EQ(UUID::variant_rfc_4122, uuid.variant());
+  EXPECT_EQ(UUID::version_random_number_based, uuid.version());
 }
 
 

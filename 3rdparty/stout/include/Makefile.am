@@ -14,13 +14,18 @@
 nobase_include_HEADERS =			\
   stout/abort.hpp				\
   stout/adaptor.hpp				\
+  stout/archiver.hpp				\
+  stout/assert.hpp				\
   stout/attributes.hpp				\
   stout/base64.hpp				\
   stout/boundedhashmap.hpp			\
   stout/bits.hpp				\
   stout/bytes.hpp				\
+  stout/cpp14.hpp				\
+  stout/cpp17.hpp				\
   stout/cache.hpp				\
   stout/check.hpp				\
+  stout/circular_buffer.hpp			\
   stout/duration.hpp				\
   stout/dynamiclibrary.hpp			\
   stout/elf.hpp					\
@@ -39,8 +44,10 @@ nobase_include_HEADERS =			\
   stout/gzip.hpp				\
   stout/hashmap.hpp				\
   stout/hashset.hpp				\
-  stout/internal/windows/dirent.hpp		\
+  stout/internal/windows/attributes.hpp		\
   stout/internal/windows/grp.hpp		\
+  stout/internal/windows/longpath.hpp		\
+  stout/internal/windows/overlapped.hpp		\
   stout/internal/windows/pwd.hpp		\
   stout/internal/windows/reparsepoint.hpp	\
   stout/internal/windows/symlink.hpp		\
@@ -65,6 +72,8 @@ nobase_include_HEADERS =			\
   stout/os/chroot.hpp				\
   stout/os/close.hpp				\
   stout/os/constants.hpp			\
+  stout/os/copyfile.hpp				\
+  stout/os/dup.hpp				\
   stout/os/environment.hpp			\
   stout/os/exists.hpp				\
   stout/os/fcntl.hpp				\
@@ -75,10 +84,13 @@ nobase_include_HEADERS =			\
   stout/os/fsync.hpp				\
   stout/os/ftruncate.hpp			\
   stout/os/getcwd.hpp				\
+  stout/os/int_fd.hpp				\
   stout/os/kill.hpp				\
   stout/os/killtree.hpp				\
   stout/os/linux.hpp				\
   stout/os/ls.hpp				\
+  stout/os/lseek.hpp				\
+  stout/os/lsof.hpp				\
   stout/os/mkdir.hpp				\
   stout/os/mkdtemp.hpp				\
   stout/os/mktemp.hpp				\
@@ -87,6 +99,7 @@ nobase_include_HEADERS =			\
   stout/os/osx.hpp				\
   stout/os/pagesize.hpp				\
   stout/os/permissions.hpp			\
+  stout/os/pipe.hpp				\
   stout/os/process.hpp				\
   stout/os/pstree.hpp				\
   stout/os/read.hpp				\
@@ -106,23 +119,37 @@ nobase_include_HEADERS =			\
   stout/os/touch.hpp				\
   stout/os/utime.hpp				\
   stout/os/wait.hpp				\
+  stout/os/which.hpp				\
   stout/os/write.hpp				\
   stout/os/xattr.hpp				\
   stout/os/posix/bootid.hpp			\
+  stout/os/posix/chdir.hpp			\
   stout/os/posix/chown.hpp			\
   stout/os/posix/chroot.hpp			\
   stout/os/posix/close.hpp			\
+  stout/os/posix/copyfile.hpp			\
+  stout/os/posix/dup.hpp			\
+  stout/os/posix/environment.hpp		\
   stout/os/posix/exists.hpp			\
   stout/os/posix/fcntl.hpp			\
   stout/os/posix/fork.hpp			\
   stout/os/posix/fsync.hpp			\
   stout/os/posix/ftruncate.hpp			\
+  stout/os/posix/getcwd.hpp			\
   stout/os/posix/getenv.hpp			\
   stout/os/posix/kill.hpp			\
   stout/os/posix/killtree.hpp			\
+  stout/os/posix/ls.hpp				\
+  stout/os/posix/lseek.hpp			\
+  stout/os/posix/lsof.hpp			\
+  stout/os/posix/mkdir.hpp			\
   stout/os/posix/mkdtemp.hpp			\
+  stout/os/posix/mktemp.hpp			\
+  stout/os/posix/open.hpp			\
   stout/os/posix/pagesize.hpp			\
+  stout/os/posix/pipe.hpp			\
   stout/os/posix/read.hpp			\
+  stout/os/posix/realpath.hpp			\
   stout/os/posix/rename.hpp			\
   stout/os/posix/rm.hpp				\
   stout/os/posix/rmdir.hpp			\
@@ -133,42 +160,61 @@ nobase_include_HEADERS =			\
   stout/os/posix/stat.hpp			\
   stout/os/posix/su.hpp				\
   stout/os/posix/temp.hpp			\
+  stout/os/posix/which.hpp			\
   stout/os/posix/write.hpp			\
   stout/os/posix/xattr.hpp			\
   stout/os/raw/argv.hpp				\
   stout/os/raw/environment.hpp			\
   stout/os/windows/bootid.hpp			\
+  stout/os/windows/chdir.hpp			\
   stout/os/windows/chroot.hpp			\
   stout/os/windows/close.hpp			\
+  stout/os/windows/copyfile.hpp			\
+  stout/os/windows/dup.hpp			\
+  stout/os/windows/environment.hpp		\
   stout/os/windows/exists.hpp			\
   stout/os/windows/fcntl.hpp			\
+  stout/os/windows/fd.hpp			\
   stout/os/windows/fork.hpp			\
   stout/os/windows/fsync.hpp			\
   stout/os/windows/ftruncate.hpp		\
+  stout/os/windows/getcwd.hpp			\
   stout/os/windows/getenv.hpp			\
+  stout/os/windows/jobobject.hpp		\
   stout/os/windows/kill.hpp			\
   stout/os/windows/killtree.hpp			\
+  stout/os/windows/ls.hpp			\
+  stout/os/windows/lseek.hpp			\
+  stout/os/windows/lsof.hpp			\
+  stout/os/windows/mkdir.hpp			\
+  stout/os/windows/mktemp.hpp			\
   stout/os/windows/mkdtemp.hpp			\
+  stout/os/windows/open.hpp			\
   stout/os/windows/pagesize.hpp			\
+  stout/os/windows/pipe.hpp			\
   stout/os/windows/read.hpp			\
+  stout/os/windows/realpath.hpp			\
   stout/os/windows/rename.hpp			\
   stout/os/windows/rm.hpp			\
   stout/os/windows/rmdir.hpp			\
   stout/os/windows/sendfile.hpp			\
   stout/os/windows/shell.hpp			\
-  stout/os/windows/signals.hpp			\
   stout/os/windows/socket.hpp			\
   stout/os/windows/stat.hpp			\
   stout/os/windows/su.hpp			\
   stout/os/windows/temp.hpp			\
+  stout/os/windows/which.hpp			\
   stout/os/windows/write.hpp			\
   stout/os/windows/xattr.hpp			\
   stout/path.hpp				\
+  stout/overload.hpp				\
   stout/preprocessor.hpp			\
   stout/proc.hpp				\
   stout/protobuf.hpp				\
   stout/posix/dynamiclibrary.hpp		\
   stout/posix/fs.hpp				\
+  stout/posix/ip.hpp				\
+  stout/posix/mac.hpp				\
   stout/posix/net.hpp				\
   stout/posix/os.hpp				\
   stout/recordio.hpp				\
@@ -183,18 +229,23 @@ nobase_include_HEADERS =			\
   stout/subcommand.hpp				\
   stout/svn.hpp					\
   stout/synchronized.hpp			\
-  stout/thread_local.hpp			\
-  stout/try.hpp					\
+  stout/tests/environment.hpp			\
   stout/tests/utils.hpp				\
+  stout/try.hpp					\
+  stout/traits.hpp				\
   stout/unimplemented.hpp			\
   stout/unreachable.hpp				\
+  stout/uri.hpp				\
   stout/utils.hpp				\
   stout/uuid.hpp				\
+  stout/variant.hpp				\
   stout/version.hpp				\
   stout/windows.hpp				\
   stout/windows/dynamiclibrary.hpp		\
   stout/windows/error.hpp			\
   stout/windows/format.hpp			\
   stout/windows/fs.hpp				\
+  stout/windows/ip.hpp				\
+  stout/windows/mac.hpp				\
   stout/windows/net.hpp				\
   stout/windows/os.hpp

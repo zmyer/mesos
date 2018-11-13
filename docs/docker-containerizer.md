@@ -22,7 +22,7 @@ the agent with "docker" as one of the containerizers option.
 Example: `mesos-agent --containerizers=docker,mesos`
 
 Each agent that has the Docker containerizer should have Docker CLI
-client installed (version >= 1.0.0).
+client installed (version >= 1.8.0).
 
 If you enable iptables on agent, make sure the iptables allow all
 traffic from docker bridge interface through add below rule:
@@ -102,7 +102,7 @@ config file for pulling images from private registries. We allow
 operators to specify a shared docker config file using an agent flag.
 This docker config file will be used to pull images from private
 registries for all containers. See [configuration
-documentation](configuration.md) for detail. Operators can either
+documentation](configuration/agent.md) for detail. Operators can either
 specify the flag as an absolute path pointing to the docker config
 file (need to manually configure `.docker/config.json` or `.dockercfg`
 on each agent), or specify the flag as a JSON-formatted string.  For

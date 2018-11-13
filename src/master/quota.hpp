@@ -58,13 +58,13 @@ namespace quota {
  * However, even if we return `false` (i.e. no mutation), the current
  * implementation of the registrar will still save the object again.
  */
-class UpdateQuota : public Operation
+class UpdateQuota : public RegistryOperation
 {
 public:
   explicit UpdateQuota(const mesos::quota::QuotaInfo& quotaInfo);
 
 protected:
-  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs);
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
 
 private:
   const mesos::quota::QuotaInfo info;
@@ -77,13 +77,13 @@ private:
  *
  * TODO(alexr): Consider uniting this operation with `UpdateQuota`.
  */
-class RemoveQuota : public Operation
+class RemoveQuota : public RegistryOperation
 {
 public:
   explicit RemoveQuota(const std::string& _role);
 
 protected:
-  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs);
+  Try<bool> perform(Registry* registry, hashset<SlaveID>* slaveIDs) override;
 
 private:
   const std::string role;
@@ -93,16 +93,8 @@ private:
 /**
  * Creates a `QuotaInfo` protobuf from the `QuotaRequest` protobuf.
  */
-Try<mesos::quota::QuotaInfo> createQuotaInfo(
+mesos::quota::QuotaInfo createQuotaInfo(
     const mesos::quota::QuotaRequest& request);
-
-/**
- * Creates a `QuotaInfo` protobuf from its components.
- */
-Try<mesos::quota::QuotaInfo> createQuotaInfo(
-    const std::string& role,
-    const google::protobuf::RepeatedPtrField<Resource>& resources);
-
 
 namespace validation {
 
@@ -111,9 +103,35 @@ namespace validation {
 //   - Irrelevant fields in `Resources` are not set
 //     (e.g. `ReservationInfo`).
 //   - Request only contains scalar `Resources`.
+//
+// TODO(bmahler): Remove this in favor of `validate` below. This
+// requires some new logic outside of this function to prevent
+// users from setting `limit` explicitly in the old API and
+// setting the `limit` implicitly for users of the old API before
+// calling into this.
 Option<Error> quotaInfo(const mesos::quota::QuotaInfo& quotaInfo);
 
 } // namespace validation {
+
+/**
+ * A `QuotaRequest` is valid if the following conditions are met:
+ *
+ *   (1) The request has a valid non-"*" role.
+ *
+ *   (2) The guarantee and limit contain only valid non-revocable
+ *       scalar resources without reservations, disk info, and
+ *       only 1 entry for each resource name.
+ *
+ *   (3) If both guarantee and limit are set for a particular
+ *       resource, then guarantee <= limit for that resource.
+ *
+ * TODO(bmahler): Remove the old validation function in favor of
+ * this one. This requires some new logic outside of this function
+ * to prevent users from setting `limit` explicitly in the old API
+ * and setting the `limit` implicitly for users of the old API before
+ * calling into this.
+ */
+Option<Error> validate(const mesos::quota::QuotaRequest& request);
 
 } // namespace quota {
 } // namespace master {

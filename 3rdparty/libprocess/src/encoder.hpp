@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <time.h>
 
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -32,9 +33,6 @@
 namespace process {
 
 const uint32_t GZIP_MINIMUM_BODY_LENGTH = 1024;
-
-// Forward declarations.
-class Encoder;
 
 
 class Encoder
@@ -64,9 +62,12 @@ public:
   DataEncoder(const std::string& _data)
     : data(_data), index(0) {}
 
-  virtual ~DataEncoder() {}
+  DataEncoder(std::string&& _data)
+    : data(std::move(_data)), index(0) {}
 
-  virtual Kind kind() const
+  ~DataEncoder() override {}
+
+  Kind kind() const override
   {
     return Encoder::DATA;
   }
@@ -79,14 +80,14 @@ public:
     return data.data() + temp;
   }
 
-  virtual void backup(size_t length)
+  void backup(size_t length) override
   {
     if (index >= length) {
       index -= length;
     }
   }
 
-  virtual size_t remaining() const
+  size_t remaining() const override
   {
     return data.size() - index;
   }
@@ -100,54 +101,42 @@ private:
 class MessageEncoder : public DataEncoder
 {
 public:
-  MessageEncoder(Message* _message)
-    : DataEncoder(encode(_message)), message(_message) {}
+  MessageEncoder(const Message& message)
+    : DataEncoder(encode(message)) {}
 
-  virtual ~MessageEncoder()
-  {
-    if (message != nullptr) {
-      delete message;
-    }
-  }
-
-  static std::string encode(Message* message)
+  static std::string encode(const Message& message)
   {
     std::ostringstream out;
 
-    if (message != nullptr) {
-      out << "POST ";
-      // Nothing keeps the 'id' component of a PID from being an empty
-      // string which would create a malformed path that has two
-      // '//' unless we check for it explicitly.
-      // TODO(benh): Make the 'id' part of a PID optional so when it's
-      // missing it's clear that we're simply addressing an ip:port.
-      if (message->to.id != "") {
-        out << "/" << message->to.id;
-      }
+    out << "POST ";
+    // Nothing keeps the 'id' component of a PID from being an empty
+    // string which would create a malformed path that has two
+    // '//' unless we check for it explicitly.
+    // TODO(benh): Make the 'id' part of a PID optional so when it's
+    // missing it's clear that we're simply addressing an ip:port.
+    if (message.to.id != "") {
+      out << "/" << message.to.id;
+    }
 
-      out << "/" << message->name << " HTTP/1.1\r\n"
-          << "User-Agent: libprocess/" << message->from << "\r\n"
-          << "Libprocess-From: " << message->from << "\r\n"
-          << "Connection: Keep-Alive\r\n"
-          << "Host: \r\n";
+    out << "/" << message.name << " HTTP/1.1\r\n"
+        << "User-Agent: libprocess/" << message.from << "\r\n"
+        << "Libprocess-From: " << message.from << "\r\n"
+        << "Connection: Keep-Alive\r\n"
+        << "Host: \r\n";
 
-      if (message->body.size() > 0) {
-        out << "Transfer-Encoding: chunked\r\n\r\n"
-            << std::hex << message->body.size() << "\r\n";
-        out.write(message->body.data(), message->body.size());
-        out << "\r\n"
-            << "0\r\n"
-            << "\r\n";
-      } else {
-        out << "\r\n";
-      }
+    if (message.body.size() > 0) {
+      out << "Transfer-Encoding: chunked\r\n\r\n"
+          << std::hex << message.body.size() << "\r\n";
+      out.write(message.body.data(), message.body.size());
+      out << "\r\n"
+          << "0\r\n"
+          << "\r\n";
+    } else {
+      out << "\r\n";
     }
 
     return out.str();
   }
-
-private:
-  Message* message;
 };
 
 
@@ -200,7 +189,8 @@ public:
       if (compressed.isError()) {
         LOG(WARNING) << "Failed to gzip response body: " << compressed.error();
       } else {
-        body = compressed.get();
+        body = std::move(compressed.get());
+
         headers["Content-Length"] = stringify(body.length());
         headers["Content-Encoding"] = "gzip";
       }
@@ -243,20 +233,27 @@ public:
 class FileEncoder : public Encoder
 {
 public:
-  FileEncoder(int _fd, size_t _size)
-    : fd(_fd), size(_size), index(0) {}
+  FileEncoder(int_fd _fd, size_t _size)
+    : fd(_fd), size(static_cast<off_t>(_size)), index(0)
+  {
+    // NOTE: For files, we expect the size to be derived from `stat`-ing
+    // the file.  The `struct stat` returns the size in `off_t` form,
+    // meaning that it is a programmer error to construct the `FileEncoder`
+    // with a size greater the max value of `off_t`.
+    CHECK_LE(_size, static_cast<size_t>(std::numeric_limits<off_t>::max()));
+  }
 
-  virtual ~FileEncoder()
+  ~FileEncoder() override
   {
     CHECK_SOME(os::close(fd)) << "Failed to close file descriptor";
   }
 
-  virtual Kind kind() const
+  Kind kind() const override
   {
     return Encoder::FILE;
   }
 
-  virtual int next(off_t* offset, size_t* length)
+  virtual int_fd next(off_t* offset, size_t* length)
   {
     off_t temp = index;
     index = size;
@@ -265,20 +262,20 @@ public:
     return fd;
   }
 
-  virtual void backup(size_t length)
+  void backup(size_t length) override
   {
     if (index >= static_cast<off_t>(length)) {
-      index -= length;
+      index -= static_cast<off_t>(length);
     }
   }
 
-  virtual size_t remaining() const
+  size_t remaining() const override
   {
     return static_cast<size_t>(size - index);
   }
 
 private:
-  int fd;
+  int_fd fd;
   off_t size;
   off_t index;
 };

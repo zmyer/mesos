@@ -18,6 +18,10 @@
 
 #include "slave/constants.hpp"
 
+#include <vector>
+
+using std::vector;
+
 namespace mesos {
 namespace internal {
 namespace slave {
@@ -26,6 +30,26 @@ Duration DEFAULT_MASTER_PING_TIMEOUT()
 {
   return master::DEFAULT_AGENT_PING_TIMEOUT *
     master::DEFAULT_MAX_AGENT_PING_TIMEOUTS;
+}
+
+
+vector<SlaveInfo::Capability> AGENT_CAPABILITIES()
+{
+  SlaveInfo::Capability::Type types[] = {
+    SlaveInfo::Capability::HIERARCHICAL_ROLE,
+    SlaveInfo::Capability::MULTI_ROLE,
+    SlaveInfo::Capability::RESERVATION_REFINEMENT,
+    SlaveInfo::Capability::RESOURCE_PROVIDER,
+    SlaveInfo::Capability::RESIZE_VOLUME};
+
+  vector<SlaveInfo::Capability> result;
+  foreach (SlaveInfo::Capability::Type type, types) {
+    SlaveInfo::Capability capability;
+    capability.set_type(type);
+    result.push_back(capability);
+  }
+
+  return result;
 }
 
 } // namespace slave {

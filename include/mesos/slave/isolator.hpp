@@ -17,8 +17,8 @@
 #ifndef __MESOS_SLAVE_ISOLATOR_HPP__
 #define __MESOS_SLAVE_ISOLATOR_HPP__
 
-#include <list>
 #include <string>
+#include <vector>
 
 #include <mesos/resources.hpp>
 
@@ -49,11 +49,16 @@ public:
     return false;
   }
 
+  virtual bool supportsStandalone()
+  {
+    return false;
+  }
+
   // Recover containers from the run states and the orphan containers
   // (known to the launcher but not known to the slave) detected by
   // the launcher.
   virtual process::Future<Nothing> recover(
-      const std::list<ContainerState>& states,
+      const std::vector<ContainerState>& states,
       const hashset<ContainerID>& orphans)
   {
     return Nothing();
